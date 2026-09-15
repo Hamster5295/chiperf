@@ -39,7 +39,7 @@ export interface AppOptions {
   domains: string[];
   /** 时间轴是否用真实时间轴（需要域声明 period/freq） */
   useTimeAxis: boolean;
-  /** 时间轴缩放：周期/像素 */
+  /** 时间轴缩放：每周期像素；0 = 尚未设置（自动铺满），否则为用户显式选择的缩放 */
   zoom: number;
 }
 

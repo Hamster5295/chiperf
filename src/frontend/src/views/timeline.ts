@@ -87,8 +87,10 @@ function inkOn(color: string, alpha = 1): string {
 /** 每周期像素范围 */
 /** 自动铺满时每周期的最小像素（默认视图别太挤） */
 const PX_DEFAULT = 8;
-/** 画布总宽保险（不是缩放上限）：几十万像素的 SVG 浏览器渲染会明显吃力 */
+/** 画布总宽上限（不是缩放上限）：几十万像素的 SVG 浏览器渲染会明显吃力 */
 const MAX_PLOT_WIDTH = 200000;
+/** 画布总宽下限（px）：缩到一根线就没法看了 */
+const MIN_PLOT_WIDTH = 24;
 /** 每个泳道的条目 / 标记 / 文本上限 */
 const MAX_ITEMS = 4000;
 const MAX_MARKS = 2000;
@@ -1689,19 +1691,20 @@ function placeBox(box: SVGRectElement, sel: Selection, reg: Registry, solid: boo
 // ------------------------------------------------------------------ 缩放 / 重建
 
 /**
- * 每周期像素：`fitWidth` = 适应宽度；`options.zoom ≥ 2` = 用户显式选择；默认（1）= 自动铺满但至少 8px/周期。
- * 缩放本身不设上限（滚轮/± 按钮可以一直放大），只保留画布总宽的保险。
+ * 每周期像素：`fitWidth` = 适应宽度；`options.zoom > 0` = 用户显式选择；`0` = 自动铺满但至少 8px/周期。
+ * 缩放本身不设上下限（滚轮/± 按钮可以一直放大缩小），只保留画布总宽的保险。
  */
 function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
   // 重建时旧滚动容器已从文档摘掉（clientWidth = 0），此时用上一次量到的宽度或容器宽度估算
   const live = scrollEl?.isConnected ? scrollEl.clientWidth : chartAvail > 0 ? chartAvail : host.clientWidth;
   const avail = Math.max(200, live - GUTTER - SIDE * 2 - 2);
   const ceiling = MAX_PLOT_WIDTH / Math.max(1, span);
+  const floor = MIN_PLOT_WIDTH / Math.max(1, span);
   // 「适应宽度」要正好铺满，所以不受手动缩放的像素上限约束
-  if (fitWidth) return Math.min(avail / span, ceiling);
+  if (fitWidth) return clamp(avail / span, floor, ceiling);
   const zoom = ctx.options.zoom;
-  const explicit = Number.isFinite(zoom) && zoom >= 2;
-  return Math.min(explicit ? zoom : Math.max(avail / span, PX_DEFAULT), ceiling);
+  const explicit = Number.isFinite(zoom) && zoom > 0;
+  return clamp(explicit ? zoom : Math.max(avail / span, PX_DEFAULT), floor, ceiling);
 }
 
 /** 清空并重画；「适应宽度」下首帧量宽不准时再补一帧，保证正好铺满 */

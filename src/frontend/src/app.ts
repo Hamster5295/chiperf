@@ -22,7 +22,7 @@ const state: AppState = {
   currentId: '',
   trace: null,
   source: { name: '', bytes: 0, gzip: false },
-  options: { domains: [], useTimeAxis: true, zoom: 1 },
+  options: { domains: [], useTimeAxis: true, zoom: 0 },
   error: null,
   retryableText: null,
 };
