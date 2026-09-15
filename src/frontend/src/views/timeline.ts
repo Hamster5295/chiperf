@@ -1409,10 +1409,24 @@ function openRowMenu(clientX: number, clientY: number, sections: MenuSection[]):
       root.append(node);
     }
   }
-  const width = 190;
-  root.style.left = `${Math.min(clientX, window.innerWidth - width - 8)}px`;
-  root.style.top = `${Math.min(clientY, window.innerHeight - 220)}px`;
+  // 先挂上去再量真实尺寸：菜单高度取决于条目数（数值行有 9 项，接近 300px），
+  // 用常量估算必然在靠下的行上把菜单顶出屏幕，底下的条目就点不到了
+  root.style.visibility = 'hidden';
+  root.style.left = '0px';
+  root.style.top = '0px';
   document.body.append(root);
+  const box = root.getBoundingClientRect();
+  const gap = 8;
+  const maxTop = window.innerHeight - box.height - gap;
+  const maxLeft = window.innerWidth - box.width - gap;
+  // 光标下方放不下就翻到上方；上下都放不下（菜单比视口还高）就贴顶并允许滚动
+  const top =
+    clientY + box.height <= window.innerHeight - gap ? clientY : clientY - box.height >= gap ? clientY - box.height : Math.max(gap, maxTop);
+  root.style.left = `${clamp(clientX, gap, Math.max(gap, maxLeft))}px`;
+  root.style.top = `${top}px`;
+  root.style.maxHeight = `${Math.max(120, window.innerHeight - gap * 2)}px`;
+  root.style.overflowY = 'auto';
+  root.style.visibility = '';
   openMenuNode = root;
 }
 
@@ -1463,6 +1477,8 @@ function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
 }
 
 document.addEventListener('click', () => closeRowMenu());
+// 菜单是 fixed 定位，画布滚动后位置就对不上那一行了；捕获阶段才能收到内层滚动容器的 scroll
+window.addEventListener('scroll', () => closeRowMenu(), true);
 document.addEventListener('keydown', (event) => {
   if ((event as KeyboardEvent).key === 'Escape') closeRowMenu();
 });
