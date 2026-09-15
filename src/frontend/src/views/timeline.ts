@@ -118,6 +118,10 @@ const TAG_BUDGET = 1200;
 /** 低于这个像素密度就不画每周期柱（改用聚合折线） */
 const BAR_MIN_PX = 2;
 
+/** 时钟泳道的颜色：默认域用绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
+const CLOCK_COLOR = '#22c55e';
+const clockColor = (domain: string): string => (domain === 'default' ? CLOCK_COLOR : colorFor(domain));
+
 const COLOR = {
   abort: '#dc2626',
   bubble: '#f97316',
@@ -226,7 +230,7 @@ const GROUP_NAME: Record<LaneGroup, string> = {
 };
 
 const GROUP_TINT: Record<LaneGroup, string> = {
-  clock: 'color-mix(in srgb, var(--accent) 16%, transparent)',
+  clock: 'color-mix(in srgb, #22c55e 16%, transparent)',
   fsm: 'color-mix(in srgb, #0d9488 15%, transparent)',
   pipeline: 'var(--surface-2)',
   counter: 'color-mix(in srgb, #0891b2 14%, transparent)',
@@ -1108,7 +1112,7 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
       const hit = laneCanvas(g, reg, y, h);
       const high = y + 4;
       const low = y + h - 4;
-      g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low), fill: 'none', stroke: colorFor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
+      g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low), fill: 'none', stroke: clockColor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
       if (!edges.hasClk) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: `域 ${d.name} 没有 [clk] 记录` }));
       cycleSurface(hit, reg, d.name, ctx, (probe) => {
         const c = probe.cycle;
