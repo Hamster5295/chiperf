@@ -362,6 +362,8 @@ let lastHostW = 0;
 let resizeObs: ResizeObserver | null = null;
 /** 「适应宽度」模式：重画时按容器宽度重算 px/周期 */
 let fitWidth = false;
+/** 正在做"拖拽缩放"：拖拽期间不画整列悬停高光，避免两套指示互相打架 */
+let dragZooming = false;
 
 // ------------------------------------------------------------------ 小工具
 
@@ -553,6 +555,10 @@ function cycleSurface(
 function showHoverCycle(domain: string, cycle: number, rowAt: { key: string; y: number; h: number; color: string } | null, ctx: ViewContext): void {
   const reg = registry;
   if (!reg) return;
+  if (dragZooming) {
+    hideHoverCycle();
+    return;
+  }
   const plot = reg.plot;
   const target = rowAt ?? reg.lanes.find((lane) => lane.key === `clk:${domain}`) ?? null;
   if (target === null || cycle < plot.from || cycle > plot.to) {
@@ -757,6 +763,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   host.append(cardNode.root);
 
   installWheelZoom(scroll);
+  installDragZoom(svg);
   scrollEl = scroll;
   registry = reg;
   chartAvail = scroll.clientWidth;
@@ -840,6 +847,7 @@ function installCanvasItemHover(svg: SVGSVGElement, ctx: ViewContext): void {
     return null;
   };
   const onMove = (event: MouseEvent): void => {
+    if (dragZooming) return;
     const found = pick(event);
     if (found === null) {
       if (current !== null) {
@@ -2475,6 +2483,116 @@ function installWheelZoom(scroll: HTMLElement): void {
 
 function rebuildAnchored(center: number | null): void {
   rebuild(false, center);
+}
+
+/**
+ * 拖拽缩放：在波形上横向拖出一段，松手后**这一段就是新的可见区间**。
+ *
+ * 只动"每周期多少像素"（与滚轮/± 按钮同一套状态），不改数据、不改行高；
+ * 起点与终点都吸附到周期边界之外的连续位置，所以拖一半也能精确落在半拍上。
+ * 画布总宽仍有保险上限（§缩放），拖得比它更窄时会停在允许的最细处并居中到这段区间。
+ */
+function zoomToCycleRange(from: number, to: number): void {
+  const ctx = ctxRef;
+  const reg = registry;
+  if (!ctx || !reg || !scrollEl) return;
+  const span = Math.max(1, to - from);
+  fitWidth = false;
+  ctx.options.zoom = Number((availablePlotWidth() / span).toFixed(6));
+  rebuildAnchored((from + to) / 2);
+}
+
+/** 在波形上拖拽选一段 ⇒ 缩放过去；没怎么动就交给原来的点击（选中周期） */
+function installDragZoom(svg: SVGSVGElement): void {
+  // 拖拽结束浏览器还会补一次 click（会顺手选中周期或条目）：在捕获阶段吞掉一次，
+  // 比在每个条目/泳道的 click 里各判一次更不容易漏
+  svg.addEventListener(
+    'click',
+    (event) => {
+      if (!swallowDragClick) return;
+      swallowDragClick = false;
+      event.stopPropagation();
+      event.preventDefault();
+    },
+    true,
+  );
+  const rect = svgEl('rect', { fill: 'var(--accent)', 'fill-opacity': 0.12, stroke: 'var(--accent)', 'stroke-width': 1, rx: 2, display: 'none', 'pointer-events': 'none' });
+  const tag = svgEl('text', { class: 'axis-label', 'text-anchor': 'middle', y: AXIS_H - 9, display: 'none', 'pointer-events': 'none' });
+  svg.append(rect, tag);
+  let from = 0;
+  let to = 0;
+  let startClientX = 0;
+  let moved = false;
+
+  const cycleAt = (event: MouseEvent): number => {
+    const reg = registry;
+    if (!reg) return 0;
+    const box = svg.getBoundingClientRect();
+    const userX = box.width > 0 ? (event.clientX - box.left) * (reg.plot.width / box.width) : reg.plot.x0;
+    return clamp(reg.plot.scale.invert(clamp(userX, reg.plot.x0, reg.plot.x1)), reg.plot.from, reg.plot.to + 1);
+  };
+  const paint = (): void => {
+    const reg = registry;
+    if (!reg) return;
+    const a = reg.plot.scale(Math.min(from, to));
+    const b = reg.plot.scale(Math.max(from, to));
+    rect.setAttribute('x', String(a));
+    rect.setAttribute('width', String(Math.max(1, b - a)));
+    rect.setAttribute('y', String(reg.plot.top));
+    rect.setAttribute('height', String(reg.plot.bottom - reg.plot.top));
+    rect.setAttribute('display', '');
+    tag.setAttribute('x', String((a + b) / 2));
+    tag.setAttribute('fill', 'var(--text)');
+    tag.textContent = `周期 ${fmtCycleRange(Math.min(from, to), Math.max(from, to))} · 松手缩放到这一段`;
+    tag.setAttribute('display', '');
+  };
+  const finish = (): void => {
+    rect.setAttribute('display', 'none');
+    tag.setAttribute('display', 'none');
+    dragZooming = false;
+    document.removeEventListener('mousemove', onMove, true);
+    document.removeEventListener('mouseup', onUp, true);
+  };
+  const onMove = (event: MouseEvent): void => {
+    to = cycleAt(event);
+    if (Math.abs(event.clientX - startClientX) > 3) moved = true;
+    if (moved) paint();
+  };
+  const onUp = (event: MouseEvent): void => {
+    const dragged = moved;
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    finish();
+    if (!dragged) return; // 没动 ⇒ 让 click 去选中周期
+    swallowDragClick = true; // 拖完浏览器还会补一次 click，吞掉它
+    void event;
+    zoomToCycleRange(lo, hi);
+  };
+  svg.addEventListener('mousedown', (event) => {
+    const me = event as MouseEvent;
+    // 修饰键留给行/条目的选中手势；右键留给菜单
+    if (me.button !== 0 || me.shiftKey || me.ctrlKey || me.metaKey) return;
+    if (me.detail > 1) return; // 双击不算拖拽
+    from = cycleAt(me);
+    to = from;
+    startClientX = me.clientX;
+    moved = false;
+    dragZooming = true;
+    hideHoverCycle();
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('mouseup', onUp, true);
+    me.preventDefault();
+  });
+}
+
+/** 拖拽产生的 click 要被吞掉一次（否则松手会顺手选中周期） */
+let swallowDragClick = false;
+
+function fmtCycleRange(lo: number, hi: number): string {
+  const round = (v: number) => Math.round(v);
+  const a = round(lo);
+  const b = round(hi);
+  return a === b ? `${a}` : `${a} – ${b}（${Math.max(1, b - a)} 个周期）`;
 }
 
 function stepZoom(factor: number): void {
