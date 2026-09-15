@@ -1271,8 +1271,9 @@ function valueModeToggle(track: ValueTrack, ctx: ViewContext): HTMLElement {
   return button;
 }
 
+/** 默认用 hex 显示：RTL 里绝大多数数值是位向量，十进制反而不便对照 */
 function valueFormatOf(key: string): ValueFormat {
-  return valueFormats.get(key) ?? 'dec';
+  return valueFormats.get(key) ?? 'hex';
 }
 
 /** 行头的显示格式选择器：dec/oct/hex/bin，宽度 ≤ 32 位时再加 rv32/rv64 */
