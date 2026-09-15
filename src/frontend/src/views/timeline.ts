@@ -193,8 +193,8 @@ interface LaneRow {
   label: string;
   color: string;
   height: number;
-  /** 行头里的附加控件（例如数值行的显示格式选择） */
-  controls?: HTMLElement;
+  /** 右键菜单可配置的内容（显示格式 / 显示模式） */
+  menu?: { formatKey?: string; formatWidth?: number; modeKey?: string };
   /** 标签列点击 / 悬停时广播的选中态 */
   select?: Selection;
   hover?: Selection;
@@ -448,6 +448,16 @@ function hideHoverCycle(): void {
 }
 
 /** 泳道底：透明命中矩形 + 底部分隔线 */
+/**
+ * 六边形：左右两端切角，中段是水平的本体。
+ * 切角正好落在相邻两段的交界处，于是"这里发生了数值跳变"一眼可见（传统总线波形的画法）。
+ */
+function hexPath(x0: number, x1: number, top: number, bottom: number, slant: number): string {
+  const mid = (top + bottom) / 2;
+  const s = Math.min(slant, Math.max(0.5, (x1 - x0) / 3));
+  return `M${round2(x0 + s)},${round2(top)}L${round2(x1 - s)},${round2(top)}L${round2(x1)},${round2(mid)}L${round2(x1 - s)},${round2(bottom)}L${round2(x0 + s)},${round2(bottom)}L${round2(x0)},${round2(mid)}Z`;
+}
+
 function laneCanvas(g: SVGGElement, reg: Registry, y: number, h: number): SVGRectElement {
   const plot = reg.plot;
   g.append(svgEl('line', { x1: plot.x0, x2: plot.x1, y1: y + h - 0.5, y2: y + h - 0.5, stroke: 'var(--border)' }));
@@ -540,6 +550,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     reg.currentRow = null;
     reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
     gutter.append(gutterCell(row, h, ctx));
+    installRowMenu(g, row);
     y += h + ROW_GAP;
   }
 
@@ -686,9 +697,6 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
         style: 'flex:0 1 auto;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
         text: row.label,
       }),
-      row.controls
-        ? el('span', { style: 'margin-left:auto;flex:0 0 auto;display:flex;align-items:center;gap:3px' }, [row.controls])
-        : null,
     ],
   );
   if (row.select) node.addEventListener('click', () => ctx.selection.set(row.select ?? null));
@@ -698,6 +706,7 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
     node.addEventListener('mouseleave', () => ctx.selection.hover(null));
   }
   installRowDrag(node, row);
+  installRowMenu(node, row);
   return node;
 }
 
@@ -971,7 +980,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     color: colorFor(track.name),
     height: H.pip,
     hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
-    controls: pipelineFormatSelect(track, ctx),
+    menu: pipelineMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       cycleSurface(hit, reg, track.domain, ctx, (probe) =>
@@ -1030,16 +1039,14 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const w = Math.max(1.5, right - x);
         reg.itemBoxes.set(`${track.name}\u0000${item.enterSeq}`, { x, y: barY, w, h: barH });
 
-        const rect = svgEl('rect', {
-          x,
-          y: barY,
-          width: w,
-          height: barH,
-          rx: 2,
+        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的数值分界
+        const rect = svgEl('path', {
+          d: hexPath(x, x + w, barY, barY + barH, 4),
           fill: item.orphan ? 'var(--surface)' : aborted ? COLOR.abort : color,
           'fill-opacity': item.orphan ? 1 : open ? 0.3 : 0.88,
           stroke: item.orphan ? COLOR.orphan : aborted ? COLOR.abort : color,
           'stroke-width': 1.2,
+          'stroke-linejoin': 'round',
           ...(open ? { 'stroke-dasharray': '4 3' } : {}),
         });
         g.append(rect);
@@ -1060,7 +1067,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
         target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
         if (aborted && !item.orphan) {
-          g.append(svgEl('rect', { x, y: barY, width: w, height: barH, rx: 2, fill: 'url(#tl-stripe)', 'pointer-events': 'none' }));
+          g.append(svgEl('path', { d: hexPath(x, x + w, barY, barY + barH, 4), fill: 'url(#tl-stripe)', 'pointer-events': 'none' }));
         }
         if (item.orphan) {
           const cx = x + w / 2;
@@ -1150,7 +1157,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
     color,
     height: H.value,
     hover: { kind: 'value', key: track.key },
-    controls: valueLaneControls(track, ctx),
+    menu: valueMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const pad = 7;
@@ -1171,7 +1178,49 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
         const firstX = xOf(first.sample.pos, first.sample.async);
         const lastX = xOf(last.sample.pos, last.sample.async);
         const points = numeric.map((entry) => [xOf(entry.sample.pos, entry.sample.async), yOf(entry.value)] as [number, number]);
-        if (mode === 'line') {
+        if (mode === 'blocks') {
+          // 六边形块：每个采样到下一个采样之间一段，块里直接写出格式化后的值
+          const blockH = clamp(h - 14, 12, 24);
+          const segments: { left: number; right: number; value: number | null; sample: (typeof numeric)[number]['sample']; faint: boolean }[] = [];
+          if (firstX > reg.plot.x0 + 0.5) segments.push({ left: reg.plot.x0, right: firstX, value: first.value, sample: first.sample, faint: true });
+          for (let index = 0; index < numeric.length; index++) {
+            const entry = numeric[index]!;
+            const next = numeric[index + 1];
+            const left = xOf(entry.sample.pos, entry.sample.async);
+            const right = next ? xOf(next.sample.pos, next.sample.async) : reg.plot.x1;
+            segments.push({ left, right, value: entry.value, sample: entry.sample, faint: false });
+          }
+          for (const segment of segments) {
+            const left = clamp(segment.left, reg.plot.x0, reg.plot.x1);
+            const right = clamp(segment.right, reg.plot.x0, reg.plot.x1);
+            if (right - left < 1) continue;
+            const unknown = segment.sample.value.hasXZ === true;
+            const centerY = segment.value === null ? (top + bottom) / 2 : yOf(segment.value);
+            g.append(
+              svgEl('path', {
+                d: hexPath(left, right, centerY - blockH / 2, centerY + blockH / 2, 5),
+                fill: unknown ? 'var(--surface)' : color,
+                'fill-opacity': segment.faint ? 0.15 : unknown ? 1 : 0.9,
+                stroke: color,
+                'stroke-width': 1.1,
+                'stroke-linejoin': 'round',
+                ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
+              }),
+            );
+            const width = right - left;
+            if (width >= 34) {
+              g.append(
+                svgEl('text', {
+                  x: (left + right) / 2,
+                  y: centerY + 3.4,
+                  'text-anchor': 'middle',
+                  style: 'font-size:9.5px;pointer-events:none;fill:#0f172a;fill-opacity:0.85',
+                  text: clip(formatScalarBy(segment.sample.value, format), width - 8),
+                }),
+              );
+            }
+          }
+        } else if (mode === 'line') {
           // 折线：直接连采样点（两端各补到画布边界，线不断开），适合看数值趋势
           const polyline: [number, number][] = [[reg.plot.x0, points[0]![1]], ...points, [reg.plot.x1, points[points.length - 1]![1]]];
           g.append(svgEl('path', { d: linePath(polyline), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
@@ -1242,59 +1291,22 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
   };
 }
 
-/** 每行数值的显示格式（dec/hex/oct/bin/rv32/rv64），默认 dec，按行记忆 */
+/** 每行数值的显示格式（dec/hex/oct/bin/rv32/rv64），按行记忆，默认 hex */
 const valueFormats = new Map<string, ValueFormat>();
 
-/** 数值行的呈现方式：波形（保持型阶梯）或折线（直接连采样点看趋势） */
-type ValueMode = 'wave' | 'line';
+/** 数值行的显示模式：波形(保持型阶梯) / 折线 / 六边形块（像流水线那样每段一个块） */
+type ValueMode = 'wave' | 'line' | 'blocks';
+
+const VALUE_MODES: { id: ValueMode; label: string; glyph: string }[] = [
+  { id: 'wave', label: '波形（保持型阶梯）', glyph: '⊓' },
+  { id: 'line', label: '折线（直接连采样点）', glyph: '∿' },
+  { id: 'blocks', label: '六边形块（每段一个值）', glyph: '⬡' },
+];
+
 const valueModes = new Map<string, ValueMode>();
 
 function valueModeOf(key: string): ValueMode {
   return valueModes.get(key) ?? 'wave';
-}
-
-/** 波形 / 折线 的小切换按钮 */
-function valueModeToggle(track: ValueTrack, ctx: ViewContext): HTMLElement {
-  const mode = valueModeOf(track.key);
-  const button = el('button', {
-    class: 'tl-mode',
-    type: 'button',
-    title: mode === 'wave' ? '当前：波形（保持型阶梯）—— 点击切换为折线' : '当前：折线（直接连采样点）—— 点击切换为波形',
-    text: mode === 'wave' ? '⊓' : '∿',
-    style: 'font:inherit;font-size:11px;line-height:1;padding:1px 4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);cursor:pointer',
-  });
-  button.addEventListener('click', (event) => {
-    event.stopPropagation();
-    valueModes.set(track.key, mode === 'wave' ? 'line' : 'wave');
-    rerenderTimeline();
-  });
-  return button;
-}
-
-/** 默认用 hex 显示：RTL 里绝大多数数值是位向量，十进制反而不便对照 */
-function valueFormatOf(key: string): ValueFormat {
-  return valueFormats.get(key) ?? 'hex';
-}
-
-/** 行头的显示格式选择器：dec/oct/hex/bin，宽度 ≤ 32 位时再加 rv32/rv64 */
-function formatSelect(key: string, width: number, ctx: ViewContext): HTMLElement {
-  const options = VALUE_FORMATS.filter((item) => (item.id !== 'rv32' && item.id !== 'rv64') || width <= 32);
-  const select = el('select', {
-    class: 'tl-format',
-    title: '该行的显示格式（只影响显示，不改动解析结果）',
-    style: 'font:inherit;font-size:10px;padding:0 2px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);max-width:56px',
-  });
-  for (const item of options) {
-    const option = el('option', { value: item.id, text: item.label });
-    if (item.id === valueFormatOf(key)) option.setAttribute('selected', 'selected');
-    select.append(option);
-  }
-  select.addEventListener('change', () => {
-    valueFormats.set(key, (select.value as ValueFormat) ?? 'dec');
-    rerenderTimeline();
-  });
-  select.addEventListener('click', (event) => event.stopPropagation());
-  return select;
 }
 
 /** 宽度估计：声明宽度 / 实际位数，按行取最大值 */
@@ -1309,21 +1321,124 @@ function widthOf(values: ScalarValue[]): number {
 const isFormattable = (values: ScalarValue[]): boolean =>
   values.length > 0 && !values.every((value) => value.kind === 'str' || value.kind === 'sym');
 
-/** 数值行行头：格式选择 + 波形/折线切换 */
-function valueLaneControls(track: ValueTrack, ctx: ViewContext): HTMLElement | undefined {
-  const values = track.samples.map((sample) => sample.value);
-  const nodes: HTMLElement[] = [];
-  if (isFormattable(values)) nodes.push(formatSelect(track.key, widthOf(values), ctx));
-  nodes.push(valueModeToggle(track, ctx));
-  return el('span', { style: 'display:flex;align-items:center;gap:3px' }, nodes);
+/** 默认用 hex 显示：RTL 里绝大多数数值是位向量，十进制反而不便对照 */
+function valueFormatOf(key: string): ValueFormat {
+  return valueFormats.get(key) ?? 'hex';
 }
 
-/** 流水线行行头：标记（tag）的显示格式 */
-function pipelineFormatSelect(track: TrackInfo, ctx: ViewContext): HTMLElement | undefined {
+function valueMenu(track: ValueTrack): LaneRow['menu'] {
+  const values = track.samples.map((sample) => sample.value);
+  const menu: NonNullable<LaneRow['menu']> = { modeKey: track.key };
+  if (isFormattable(values)) {
+    menu.formatKey = track.key;
+    menu.formatWidth = widthOf(values);
+  }
+  return menu;
+}
+
+function pipelineMenu(track: TrackInfo): LaneRow['menu'] | undefined {
   const tags = track.items.map((item) => item.tag).filter((tag): tag is ScalarValue => tag !== null);
   if (!isFormattable(tags)) return undefined;
-  return formatSelect(`pip:${track.name}`, widthOf(tags), ctx);
+  return { formatKey: `pip:${track.name}`, formatWidth: widthOf(tags) };
 }
+
+// ------------------------------------------------------------------ 右键菜单
+
+interface MenuItem {
+  label: string;
+  checked: boolean;
+  pick: () => void;
+}
+
+interface MenuSection {
+  title: string;
+  items: MenuItem[];
+}
+
+let openMenuNode: HTMLElement | null = null;
+
+function closeRowMenu(): void {
+  openMenuNode?.remove();
+  openMenuNode = null;
+}
+
+/** 在鼠标处弹出一个轻量菜单（单选式），点击条目立即生效并关闭 */
+function openRowMenu(clientX: number, clientY: number, sections: MenuSection[]): void {
+  closeRowMenu();
+  if (sections.length === 0) return;
+  const root = el('div', { class: 'ctx-menu', role: 'menu' });
+  for (const section of sections) {
+    root.append(el('div', { class: 'ctx-title', text: section.title }));
+    for (const item of section.items) {
+      const node = el('button', { class: `ctx-item${item.checked ? ' is-on' : ''}`, type: 'button', role: 'menuitemradio' }, [
+        el('span', { class: 'ctx-tick', text: item.checked ? '✓' : '' }),
+        el('span', { text: item.label }),
+      ]);
+      node.addEventListener('click', (event) => {
+        event.stopPropagation();
+        item.pick();
+        closeRowMenu();
+      });
+      root.append(node);
+    }
+  }
+  const width = 190;
+  root.style.left = `${Math.min(clientX, window.innerWidth - width - 8)}px`;
+  root.style.top = `${Math.min(clientY, window.innerHeight - 220)}px`;
+  document.body.append(root);
+  openMenuNode = root;
+}
+
+function menuSectionsFor(row: LaneRow): MenuSection[] {
+  const sections: MenuSection[] = [];
+  const menu = row.menu;
+  if (!menu) return sections;
+  if (menu.formatKey !== undefined) {
+    const key = menu.formatKey;
+    const width = menu.formatWidth ?? 32;
+    sections.push({
+      title: '显示格式',
+      items: VALUE_FORMATS.filter((item) => (item.id !== 'rv32' && item.id !== 'rv64') || width <= 32).map((item) => ({
+        label: item.label,
+        checked: valueFormatOf(key) === item.id,
+        pick: () => {
+          valueFormats.set(key, item.id);
+          rerenderTimeline();
+        },
+      })),
+    });
+  }
+  if (menu.modeKey !== undefined) {
+    const key = menu.modeKey;
+    sections.push({
+      title: '显示模式',
+      items: VALUE_MODES.map((mode) => ({
+        label: `${mode.glyph}  ${mode.label}`,
+        checked: valueModeOf(key) === mode.id,
+        pick: () => {
+          valueModes.set(key, mode.id);
+          rerenderTimeline();
+        },
+      })),
+    });
+  }
+  return sections;
+}
+
+/** 给行头与泳道都挂上右键菜单（在泳道上右键也能改） */
+function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
+  if (row.menu === undefined) return;
+  node.addEventListener('contextmenu', (event) => {
+    const me = event as MouseEvent;
+    me.preventDefault();
+    openRowMenu(me.clientX, me.clientY, menuSectionsFor(row));
+  });
+}
+
+document.addEventListener('click', () => closeRowMenu());
+document.addEventListener('keydown', (event) => {
+  if ((event as KeyboardEvent).key === 'Escape') closeRowMenu();
+});
 
 // ------------------------------ 事件 / 消息
 
