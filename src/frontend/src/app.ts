@@ -337,12 +337,20 @@ function buildDropzone(): HTMLElement {
 export function installGlobalDropzone(): void {
   const zone = document.body;
   const highlight = (on: boolean) => zone.classList.toggle('is-dragging', on);
+  // 只对"拖文件进来"反应：页内拖拽（例如时间轴行排序）也会冒泡到这里，
+  // 靠 dataTransfer.types 区分，否则拖行时会错误地弹出"松开以载入 .chiperf"
+  const carriesFiles = (event: DragEvent): boolean => (event.dataTransfer?.types ?? []).includes('Files');
   zone.addEventListener('dragover', (event) => {
+    if (!carriesFiles(event)) return;
     event.preventDefault();
     highlight(true);
   });
-  zone.addEventListener('dragleave', () => highlight(false));
+  zone.addEventListener('dragleave', (event) => {
+    if (!carriesFiles(event)) return;
+    highlight(false);
+  });
   zone.addEventListener('drop', (event) => {
+    if (!carriesFiles(event)) return;
     event.preventDefault();
     highlight(false);
     const file = event.dataTransfer?.files?.[0];
