@@ -475,6 +475,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
         ),
       );
       stripe = false;
+      // 分节表头同样占一行高度：漏掉这一句会让右侧泳道整体上移（左侧标签列却照常堆叠）
+      y += h;
       continue;
     }
     const g = svgEl('g', {});
