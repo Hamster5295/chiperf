@@ -1,4 +1,4 @@
-/** 数据总览：周期、事件、追踪对象、条目、延迟、气泡、诊断 */
+/** 数据总览：周期、事件、追踪对象、条目、延迟、气泡、警告（规范里叫诊断） */
 import type { Trace } from '../../../parser/src/index.ts';
 import { latencyStats } from '../../../parser/src/index.ts';
 import {
@@ -146,7 +146,7 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     statTile('在飞条目', countLabel(totalsInfo.items), `${totalsInfo.completed} 完成 · ${totalsInfo.aborted} 撤销 · ${totalsInfo.open} 未闭合`),
     statTile('平均延迟', totalsInfo.latencyCount > 0 ? `${totalsInfo.avg.toFixed(2)} 周期` : '—', totalsInfo.latencyCount > 0 ? `最大 ${totalsInfo.max} 周期（${totalsInfo.latencyCount} 条）` : '没有完成的同域条目'),
     statTile('气泡', countLabel(totalsInfo.bubbles), '占用度为 0 的活跃周期'),
-    statTile('诊断', countLabel(trace.diagnostics.length), trace.diagnostics.length === 0 ? '无异常' : [...trace.diagnosticCounts.keys()].slice(0, 2).join(' · ')),
+    statTile('警告', countLabel(trace.diagnostics.length), trace.diagnostics.length === 0 ? '无异常' : [...trace.diagnosticCounts.keys()].slice(0, 2).join(' · ')),
   ].filter((n): n is HTMLElement => n !== null));
   const summary = card('总览', '文件级统计（按当前时钟域筛选）');
   summary.body.append(stats);
@@ -236,7 +236,7 @@ let mountedContainer: HTMLElement | null = null;
 export const overviewView: View = {
   id: 'overview',
   title: '总览',
-  hint: '周期、事件、延迟、气泡、诊断',
+  hint: '周期、事件、延迟、气泡、警告',
   mount(container, ctx) {
     mountedContainer = container;
     overviewBody(container, ctx);

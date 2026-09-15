@@ -656,7 +656,7 @@ function eventDataset(trace: Trace): Dataset {
   });
 }
 
-/** 取值类诊断（其余算提示） */
+/** 取值类警告（规范里叫诊断，其余算提示） */
 const ERROR_CODES = new Set([
   'negative_total',
   'records_after_end',
@@ -671,17 +671,17 @@ const ERROR_CODES = new Set([
 function diagnosticDataset(trace: Trace): Dataset {
   return defineDataset<Diagnostic>({
     id: 'diagnostics',
-    title: '诊断',
+    title: '警告',
     hint: '解析器只报告、不改数据',
-    empty: '没有诊断信息，解析很干净',
+    empty: '没有警告，解析很干净',
     defaultSort: [{ key: 'line', dir: 1 }],
     rows: () => trace.diagnostics,
     selection: () => null,
-    titleOf: (d) => `诊断 ${d.code}${d.line > 0 ? ` · 第 ${d.line} 行` : ' · 文件级'}`,
+    titleOf: (d) => `警告 ${d.code}${d.line > 0 ? ` · 第 ${d.line} 行` : ' · 文件级'}`,
     columns: [
       {
         key: 'code',
-        label: '诊断码',
+        label: '警告码',
         width: 190,
         mono: true,
         cell: (d) => chip(d.code, ERROR_CODES.has(d.code) ? 'var(--err)' : 'var(--warn)', d.code),
@@ -696,7 +696,7 @@ function diagnosticDataset(trace: Trace): Dataset {
       { key: 'message', label: '说明', width: 620, cell: (d) => ({ t: d.message, full: d.message }) },
     ],
     detail: (d) => [
-      ['诊断码', d.code],
+      ['警告码', d.code],
       ['行号', d.line > 0 ? String(d.line) : '文件级（0）'],
       ['说明', d.message],
       ['总次数', String(trace.diagnosticCounts.get(d.code) ?? 0)],
@@ -736,7 +736,7 @@ const DATASET_DEFS: { id: string; title: string; make(trace: Trace): Dataset }[]
   { id: 'values', title: '数值', make: valueDataset },
   { id: 'fsm', title: '状态机跳转', make: fsmDataset },
   { id: 'events', title: '事件', make: eventDataset },
-  { id: 'diagnostics', title: '诊断', make: diagnosticDataset },
+  { id: 'diagnostics', title: '警告', make: diagnosticDataset },
   { id: 'skipped', title: '跳过的行', make: skippedDataset },
 ];
 

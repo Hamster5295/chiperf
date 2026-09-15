@@ -97,7 +97,8 @@ function buildHeader(): HTMLElement {
     chips.append(chip(`chiperf ${t.version.major}.${t.version.minor}${t.version.explicit ? '' : '（隐含）'}`, ''));
     chips.append(chip(`${t.domains.size} 时钟域`, ''));
     const diagCount = t.diagnostics.length;
-    const diagChip = chip(`诊断 ${diagCount}`, diagCount === 0 ? 'chip-ok' : 'chip-warn');
+    // 界面上叫「警告」；规范里这套东西仍叫诊断（§10.4），对应关系见 README
+    const diagChip = chip(`警告 ${diagCount}`, diagCount === 0 ? 'chip-ok' : 'chip-warn');
     diagChip.style.cursor = 'pointer';
     diagChip.addEventListener('click', () => openDiagnostics());
     chips.append(diagChip);
@@ -247,7 +248,7 @@ function buildToolbar(): HTMLElement {
     bar.append(el('span', { class: 'muted nowrap', text: '各域周期号独立计数（≠ 同一时刻）' }));
   }
 
-  const diagBtn = el('button', { class: 'btn btn-ghost', text: `诊断 (${trace.diagnostics.length})` });
+  const diagBtn = el('button', { class: 'btn btn-ghost', text: `警告 (${trace.diagnostics.length})` });
   diagBtn.addEventListener('click', () => openDiagnostics());
   bar.append(diagBtn);
   return bar;
@@ -397,7 +398,7 @@ function openDiagnostics(): void {
   const trace = state.trace;
   if (!trace) return;
   const panel = drawer();
-  panel.root.querySelector('h3')!.textContent = `诊断（${trace.diagnostics.length}）`;
+  panel.root.querySelector('h3')!.textContent = `警告（${trace.diagnostics.length}）`;
   const counts = [...trace.diagnosticCounts].sort((a, b) => b[1] - a[1]);
   panel.body.append(
     el('div', { class: 'stat-row' }, counts.map(([code, n]) => statTile(code, fmtInt(n)))),
