@@ -85,11 +85,10 @@ function inkOn(color: string, alpha = 1): string {
 }
 
 /** 每周期像素范围 */
-const PX_MIN = 0.35;
-const PX_MAX = 64;
+/** 自动铺满时每周期的最小像素（默认视图别太挤） */
 const PX_DEFAULT = 8;
-/** 单个 SVG 的最大宽度（px）：更大的轨迹自动降级缩放，避免把浏览器撑爆 */
-const MAX_PLOT_WIDTH = 40000;
+/** 画布总宽保险（不是缩放上限）：几十万像素的 SVG 浏览器渲染会明显吃力 */
+const MAX_PLOT_WIDTH = 200000;
 /** 每个泳道的条目 / 标记 / 文本上限 */
 const MAX_ITEMS = 4000;
 const MAX_MARKS = 2000;
@@ -657,16 +656,6 @@ function buildControls(ctx: ViewContext, plot: Plot, span: number): HTMLElement 
     }),
     el('span', { class: 'toolbar-spacer' }),
   );
-  for (const n of [4, 8, 16, 32]) {
-    row.append(
-      button(`1 周期 = ${n}px`, `每周期 ${n} 像素`, !fitWidth && Math.abs(plot.pxPerCycle - n) < 0.01, () => {
-        const center = currentCenterCycle();
-        fitWidth = false;
-        ctx.options.zoom = n;
-        rebuildAnchored(center);
-      }),
-    );
-  }
   row.append(
     el('span', {
       class: 'muted nowrap',
@@ -1699,17 +1688,20 @@ function placeBox(box: SVGRectElement, sel: Selection, reg: Registry, solid: boo
 
 // ------------------------------------------------------------------ 缩放 / 重建
 
-/** 每周期像素：`fitWidth` = 适应宽度；`options.zoom ≥ 2` = 用户显式选择；默认（1）= 自动铺满但至少 8px/周期 */
+/**
+ * 每周期像素：`fitWidth` = 适应宽度；`options.zoom ≥ 2` = 用户显式选择；默认（1）= 自动铺满但至少 8px/周期。
+ * 缩放本身不设上限（滚轮/± 按钮可以一直放大），只保留画布总宽的保险。
+ */
 function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
   // 重建时旧滚动容器已从文档摘掉（clientWidth = 0），此时用上一次量到的宽度或容器宽度估算
   const live = scrollEl?.isConnected ? scrollEl.clientWidth : chartAvail > 0 ? chartAvail : host.clientWidth;
   const avail = Math.max(200, live - GUTTER - SIDE * 2 - 2);
-  const ceiling = MAX_PLOT_WIDTH / span;
+  const ceiling = MAX_PLOT_WIDTH / Math.max(1, span);
   // 「适应宽度」要正好铺满，所以不受手动缩放的像素上限约束
-  if (fitWidth) return clamp(avail / span, PX_MIN, ceiling);
+  if (fitWidth) return Math.min(avail / span, ceiling);
   const zoom = ctx.options.zoom;
   const explicit = Number.isFinite(zoom) && zoom >= 2;
-  return clamp(explicit ? zoom : clamp(avail / span, PX_DEFAULT, PX_MAX), PX_MIN, Math.min(PX_MAX, ceiling));
+  return Math.min(explicit ? zoom : Math.max(avail / span, PX_DEFAULT), ceiling);
 }
 
 /** 清空并重画；「适应宽度」下首帧量宽不准时再补一帧，保证正好铺满 */
@@ -1767,8 +1759,8 @@ function installWheelZoom(scroll: HTMLElement): void {
       const box = reg.svg.getBoundingClientRect();
       const userX = box.width > 0 ? (wheel.clientX - box.left) * (plot.width / box.width) : plot.x0;
       const anchor = clamp(Math.round(plot.scale.invert(clamp(userX, plot.x0, plot.x1))), plot.from, plot.to);
-      const next = clamp(plot.pxPerCycle * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2), PX_MIN, PX_MAX);
-      if (Math.abs(next - plot.pxPerCycle) < 1e-6) return;
+      const next = plot.pxPerCycle * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2);
+      if (!Number.isFinite(next) || next <= 0 || Math.abs(next - plot.pxPerCycle) < 1e-6) return;
       fitWidth = false;
       ctxRef!.options.zoom = Number(next.toFixed(4));
       rebuild(false, anchor);
@@ -1785,8 +1777,8 @@ function stepZoom(factor: number): void {
   const ctx = ctxRef;
   if (!ctx) return;
   const current = registry?.plot.pxPerCycle ?? PX_DEFAULT;
-  const next = clamp(current * factor, PX_MIN, PX_MAX);
-  if (Math.abs(next - current) < 1e-6) return;
+  const next = current * factor;
+  if (!Number.isFinite(next) || next <= 0 || Math.abs(next - current) < 1e-6) return;
   const center = currentCenterCycle();
   fitWidth = false;
   ctx.options.zoom = Number(next.toFixed(4));
