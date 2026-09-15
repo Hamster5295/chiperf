@@ -37,6 +37,7 @@ import {
   el,
   emptyState,
   hoverTarget,
+  linePath,
   legend,
   linearScale,
   statTile,
@@ -970,6 +971,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     color: colorFor(track.name),
     height: H.pip,
     hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
+    controls: pipelineFormatSelect(track, ctx),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       cycleSurface(hit, reg, track.domain, ctx, (probe) =>
@@ -980,6 +982,36 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           `${track.items.length} 条目 · ${track.completed} 完成 · ${track.aborted} 冲刷 · ${track.open} 未闭合`,
         ].join('\n'),
       );
+
+      // 气泡：该级本周期没有内容 —— 用虚线框标出来
+      for (const range of track.bubbleRanges) {
+        const left = clamp(reg.plot.scale(range.start), reg.plot.x0, reg.plot.x1);
+        const right = clamp(reg.plot.scale(range.end + 1), reg.plot.x0, reg.plot.x1);
+        const width = Math.max(3, right - left);
+        const box = svgEl('rect', {
+          x: left + 0.5,
+          y: y + 4,
+          width: Math.max(2, width - 1),
+          height: h - 9,
+          rx: 3,
+          fill: COLOR.bubble,
+          'fill-opacity': 0.08,
+          stroke: COLOR.bubble,
+          'stroke-width': 1,
+          'stroke-dasharray': '4 3',
+        });
+        hoverTarget(
+          box,
+          () =>
+            [
+              `气泡：${track.name}`,
+              `周期 ${range.start}${range.end > range.start ? ` – ${range.end}` : ''}（共 ${range.end - range.start + 1} 周期）`,
+              '这些周期该轨道没有在飞内容',
+            ].join('\n'),
+          () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: range.start }),
+        );
+        g.append(box);
+      }
 
       const color = colorFor(track.name);
       const barH = h - 9;
@@ -1051,7 +1083,12 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         if (w >= 30 && tagBudget > 0 && item.tag) {
           tagBudget--;
           g.append(
-            svgEl('text', { x: x + 3, y: y + h - 11, style: 'font-size:10px;fill:#0f172a;fill-opacity:0.8;pointer-events:none', text: clip(fmtValue(item.tag), w - 6) }),
+            svgEl('text', {
+              x: x + 3,
+              y: y + h - 11,
+              style: 'font-size:10px;fill:#0f172a;fill-opacity:0.8;pointer-events:none',
+              text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
+            }),
           );
         }
       }
@@ -1063,7 +1100,10 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 }
 
 function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
-  const lines = [`轨道 ${track.name}（域 ${track.domain}）`, `标记 ${item.tag ? fmtValue(item.tag) : '（无）'}`];
+  const lines = [
+    `轨道 ${track.name}（域 ${track.domain}）`,
+    `标记 ${item.tag ? formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)) : '（无）'}`,
+  ];
   lines.push(`入：${formatPosition(item.enter)}${item.async ? ' · 异步（画在区间中点）' : ''}`);
   lines.push(item.exit ? `出：${formatPosition(item.exit)}${item.closeAsync ? ' · 异步' : ''}` : '出：（没有匹配的出 / 撤记录）');
   if (item.orphan) lines.push('延迟：—（孤立条目，没有对应的入记录）');
@@ -1100,6 +1140,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
   const color = colorFor(track.key);
   const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
   const format = valueFormatOf(track.key);
+  const mode = valueModeOf(track.key);
   return {
     kind: 'lane',
     group: 'value',
@@ -1109,7 +1150,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
     color,
     height: H.value,
     hover: { kind: 'value', key: track.key },
-    controls: valueFormatSelect(track, ctx) ?? undefined,
+    controls: valueLaneControls(track, ctx),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const pad = 7;
@@ -1125,71 +1166,52 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
       if (numeric.length > 0) {
-        const yOfValue = (entry: { sample: (typeof numeric)[number]['sample']; value: number }): number => yOf(entry.value);
-        // 无记录处按"保持"处理：左侧用虚线补出（首个采样之前是推断），右侧实线保持到画布结尾
         const first = numeric[0]!;
         const last = numeric[numeric.length - 1]!;
         const firstX = xOf(first.sample.pos, first.sample.async);
         const lastX = xOf(last.sample.pos, last.sample.async);
-        if (firstX > reg.plot.x0 + 0.5) {
-          g.append(
-            svgEl('path', {
-              d: `M${reg.plot.x0},${yOfValue(first)}L${firstX},${yOfValue(first)}`,
-              fill: 'none',
-              stroke: color,
-              'stroke-width': 1.7,
-              // 实线但更淡：线是连续的（首采样之前按"保持"补出），淡一些表示是推断段
-              'stroke-opacity': 0.45,
-            }),
-          );
+        const points = numeric.map((entry) => [xOf(entry.sample.pos, entry.sample.async), yOf(entry.value)] as [number, number]);
+        if (mode === 'line') {
+          // 折线：直接连采样点（两端各补到画布边界，线不断开），适合看数值趋势
+          const polyline: [number, number][] = [[reg.plot.x0, points[0]![1]], ...points, [reg.plot.x1, points[points.length - 1]![1]]];
+          g.append(svgEl('path', { d: linePath(polyline), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
+        } else {
+          // 波形：保持型阶梯；首个采样之前用更淡的实线补出（推断段），最后一个采样之后保持到画布右边
+          if (firstX > reg.plot.x0 + 0.5) {
+            g.append(
+              svgEl('path', {
+                d: `M${reg.plot.x0},${yOf(first.value)}L${firstX},${yOf(first.value)}`,
+                fill: 'none',
+                stroke: color,
+                'stroke-width': 1.7,
+                'stroke-opacity': 0.45,
+              }),
+            );
+          }
+          if (lastX < reg.plot.x1 - 0.5) {
+            g.append(
+              svgEl('path', {
+                d: `M${lastX},${yOf(last.value)}L${reg.plot.x1},${yOf(last.value)}`,
+                fill: 'none',
+                stroke: color,
+                'stroke-width': 1.7,
+              }),
+            );
+          }
+          g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         }
-        if (lastX < reg.plot.x1 - 0.5) {
-          g.append(
-            svgEl('path', {
-              d: `M${lastX},${yOfValue(last)}L${reg.plot.x1},${yOfValue(last)}`,
-              fill: 'none',
-              stroke: color,
-              'stroke-width': 1.7,
-            }),
-          );
-        }
-        const points = numeric.map((entry, index) => {
-          const x = xOf(entry.sample.pos, entry.sample.async);
-          return [index === 0 && firstX > reg.plot.x0 ? reg.plot.x0 : x, yOfValue(entry)] as [number, number];
-        });
-        g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         for (const entry of numeric) {
           const x = xOf(entry.sample.pos, entry.sample.async);
-          const y2 = yOfValue(entry);
           const unknown = entry.sample.value.hasXZ === true;
           g.append(
             svgEl('circle', {
               cx: x,
-              cy: y2,
+              cy: yOf(entry.value),
               r: unknown ? 2.6 : 1.8,
               fill: unknown ? 'var(--surface)' : color,
               stroke: color,
               'stroke-width': 1.1,
               ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
-            }),
-          );
-        }
-        // 变化处画「X」（传统波形图的交叉写法）：从旧值到新值的两条对角交叉线
-        const halfWidth = clamp(reg.plot.pxPerCycle * 0.35, 2, 7);
-        for (let index = 1; index < numeric.length; index++) {
-          const prev = numeric[index - 1]!;
-          const cur = numeric[index]!;
-          if (prev.value === cur.value) continue;
-          const x = xOf(cur.sample.pos, cur.sample.async);
-          const yPrev = yOfValue(prev);
-          const yCur = yOfValue(cur);
-          g.append(
-            svgEl('path', {
-              d: `M${x - halfWidth},${yPrev}L${x + halfWidth},${yCur}M${x - halfWidth},${yCur}L${x + halfWidth},${yPrev}`,
-              fill: 'none',
-              stroke: color,
-              'stroke-width': 1.3,
-              'stroke-opacity': 0.9,
             }),
           );
         }
@@ -1223,41 +1245,83 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
 /** 每行数值的显示格式（dec/hex/oct/bin/rv32/rv64），默认 dec，按行记忆 */
 const valueFormats = new Map<string, ValueFormat>();
 
+/** 数值行的呈现方式：波形（保持型阶梯）或折线（直接连采样点看趋势） */
+type ValueMode = 'wave' | 'line';
+const valueModes = new Map<string, ValueMode>();
+
+function valueModeOf(key: string): ValueMode {
+  return valueModes.get(key) ?? 'wave';
+}
+
+/** 波形 / 折线 的小切换按钮 */
+function valueModeToggle(track: ValueTrack, ctx: ViewContext): HTMLElement {
+  const mode = valueModeOf(track.key);
+  const button = el('button', {
+    class: 'tl-mode',
+    type: 'button',
+    title: mode === 'wave' ? '当前：波形（保持型阶梯）—— 点击切换为折线' : '当前：折线（直接连采样点）—— 点击切换为波形',
+    text: mode === 'wave' ? '⊓' : '∿',
+    style: 'font:inherit;font-size:11px;line-height:1;padding:1px 4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);cursor:pointer',
+  });
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    valueModes.set(track.key, mode === 'wave' ? 'line' : 'wave');
+    rerenderTimeline();
+  });
+  return button;
+}
+
 function valueFormatOf(key: string): ValueFormat {
   return valueFormats.get(key) ?? 'dec';
 }
 
-/**
- * 数值行的行头控件：进制 / RISC-V 译码。
- * 只有"整条轨都是数字"的行才给选择器（字符串/符号轨无从格式化）；
- * rv32/rv64 只在数据宽度 ≤ 32 位时给出。
- */
-function valueFormatSelect(track: ValueTrack, ctx: ViewContext): HTMLElement | null {
-  // 允许个别采样是 x/z（它们按原样显示），只排除字符串/符号轨
-  if (track.samples.every((sample) => sample.value.kind === 'str' || sample.value.kind === 'sym')) return null;
-  const width = track.samples.reduce((max, sample) => {
-    const value = sample.value;
-    const declared = value.width ?? 0;
-    const needed = value.big === undefined ? 0 : Math.max(1, value.big < 0n ? (-value.big).toString(2).length + 1 : value.big.toString(2).length);
-    return Math.max(max, declared, needed);
-  }, 0);
-  const options = VALUE_FORMATS.filter((item) => item.id !== 'rv32' && item.id !== 'rv64' || width <= 32);
+/** 行头的显示格式选择器：dec/oct/hex/bin，宽度 ≤ 32 位时再加 rv32/rv64 */
+function formatSelect(key: string, width: number, ctx: ViewContext): HTMLElement {
+  const options = VALUE_FORMATS.filter((item) => (item.id !== 'rv32' && item.id !== 'rv64') || width <= 32);
   const select = el('select', {
     class: 'tl-format',
-    title: '该行的显示格式（不影响解析结果）',
-    style: 'font:inherit;font-size:10px;padding:0 2px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);max-width:58px',
+    title: '该行的显示格式（只影响显示，不改动解析结果）',
+    style: 'font:inherit;font-size:10px;padding:0 2px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);max-width:56px',
   });
   for (const item of options) {
     const option = el('option', { value: item.id, text: item.label });
-    if (item.id === valueFormatOf(track.key)) option.setAttribute('selected', 'selected');
+    if (item.id === valueFormatOf(key)) option.setAttribute('selected', 'selected');
     select.append(option);
   }
   select.addEventListener('change', () => {
-    valueFormats.set(track.key, (select.value as ValueFormat) ?? 'dec');
+    valueFormats.set(key, (select.value as ValueFormat) ?? 'dec');
     rerenderTimeline();
   });
   select.addEventListener('click', (event) => event.stopPropagation());
   return select;
+}
+
+/** 宽度估计：声明宽度 / 实际位数，按行取最大值 */
+function widthOf(values: ScalarValue[]): number {
+  return values.reduce((max, value) => {
+    const declared = value.width ?? 0;
+    const needed = value.big === undefined ? 0 : Math.max(1, value.big < 0n ? (-value.big).toString(2).length + 1 : value.big.toString(2).length);
+    return Math.max(max, declared, needed);
+  }, 0);
+}
+
+const isFormattable = (values: ScalarValue[]): boolean =>
+  values.length > 0 && !values.every((value) => value.kind === 'str' || value.kind === 'sym');
+
+/** 数值行行头：格式选择 + 波形/折线切换 */
+function valueLaneControls(track: ValueTrack, ctx: ViewContext): HTMLElement | undefined {
+  const values = track.samples.map((sample) => sample.value);
+  const nodes: HTMLElement[] = [];
+  if (isFormattable(values)) nodes.push(formatSelect(track.key, widthOf(values), ctx));
+  nodes.push(valueModeToggle(track, ctx));
+  return el('span', { style: 'display:flex;align-items:center;gap:3px' }, nodes);
+}
+
+/** 流水线行行头：标记（tag）的显示格式 */
+function pipelineFormatSelect(track: TrackInfo, ctx: ViewContext): HTMLElement | undefined {
+  const tags = track.items.map((item) => item.tag).filter((tag): tag is ScalarValue => tag !== null);
+  if (!isFormattable(tags)) return undefined;
+  return formatSelect(`pip:${track.name}`, widthOf(tags), ctx);
 }
 
 // ------------------------------ 事件 / 消息
