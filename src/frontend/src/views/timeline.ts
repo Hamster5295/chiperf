@@ -122,8 +122,8 @@ const BAR_MIN_PX = 2;
 /**
  * 内容型六边形色块的填充不透明度。
  * 只作用于"实色内容块"（流水线条目、状态机状态段、数值/计数器块）；
- * 空心与推断类标记另有更淡的值：气泡 0.08、推断段 0.15、未闭合的空心/表面色，
- * 冲刷条目干脆不填充 —— 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
+ * 空心与推断类标记另有更淡的值：气泡 0.08、推断段 0.15、未闭合条目空心 ——
+ * 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
  */
 const BLOCK_FILL = 0.6;
 
@@ -132,9 +132,7 @@ const CLOCK_COLOR = '#22c55e';
 const clockColor = (domain: string): string => (domain === 'default' ? CLOCK_COLOR : colorFor(domain));
 
 const COLOR = {
-  abort: '#dc2626',
   bubble: '#f97316',
-  orphan: '#64748b',
   async: '#7c3aed',
   msg: '#0891b2',
   neutral: '#94a3b8',
@@ -634,7 +632,6 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   };
 
   const svg = svgRoot(plot.width, plot.height, { style: 'flex:0 0 auto' });
-  svg.append(buildDefs());
   axisLayer(svg, plot, primary, ctx);
 
   const reg: Registry = {
@@ -706,11 +703,9 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   cardNode.body.append(buildControls(ctx, plot, span));
   cardNode.body.append(
     legend([
-      { label: '完成（O）', color: colorFor('pip') },
-      { label: '冲刷（X，空心斜纹）', color: COLOR.abort },
-      { label: '未闭合（虚线）', color: colorFor('pip') },
-      { label: '孤立条目（空心 ×）', color: COLOR.orphan },
-      { label: '气泡周期', color: COLOR.bubble },
+      { label: '条目（该级此刻持有它）', color: colorFor('pip') },
+      { label: '未闭合（虚线：文件结束时仍持有）', color: colorFor('pip') },
+      { label: '气泡周期（该级为空）', color: COLOR.bubble },
       { label: '异步记录（区间中点・空心）', color: COLOR.async },
     ]),
   );
@@ -732,7 +727,7 @@ function buildStats(domains: DomainInfo[], scan: Scan, trace: Trace): HTMLElemen
   const names = new Set(domains.map((d) => d.name));
   let items = 0;
   let open = 0;
-  let aborted = 0;
+  let closed = 0;
   let bubbles = 0;
   let lanes = 0;
   for (const track of trace.tracks.values()) {
@@ -740,14 +735,14 @@ function buildStats(domains: DomainInfo[], scan: Scan, trace: Trace): HTMLElemen
     lanes++;
     items += track.items.length;
     open += track.open;
-    aborted += track.aborted;
+    closed += track.closed;
     bubbles += track.bubbles.length;
   }
   const clkEdges = [...scan.edges.values()].reduce((sum, e) => sum + e.p.length + e.n.length, 0);
   return el('div', { class: 'stat-row' }, [
     statTile('周期范围', `${countLabel(scan.from)} – ${countLabel(scan.to)}`, `${countLabel(scan.to - scan.from + 1)} 个周期槽`),
     statTile('时钟域', countLabel(domains.length), `${countLabel(clkEdges)} 条 [clk] 记录`),
-    statTile('流水线', countLabel(items), `${lanes} 轨道 · ${aborted} 冲刷 · ${open} 未闭合`),
+    statTile('流水线', countLabel(items), `${lanes} 轨道 · ${closed} 已结束 · ${open} 未闭合`),
     statTile('气泡周期', countLabel(bubbles), '占用度为 0 的活跃周期'),
     statTile('异步记录', countLabel(scan.asyncRecords.length), '画在周期区间中点（spec §6.7）'),
   ]);
@@ -1021,21 +1016,6 @@ function drawGrid(g: SVGGElement, plot: Plot): void {
   }
 }
 
-/**
- * 斜纹：用于「冲刷（X）」条目。
- * 冲刷条目本身不填充（空心），所以斜纹必须是冲刷色 —— 原来那条白色斜纹
- * 是画在实色底上的提亮线，白底上看不见。
- */
-function buildDefs(): SVGDefsElement {
-  const defs = svgEl('defs', {});
-  defs.append(
-    svgEl('pattern', { id: 'tl-stripe', width: 6, height: 6, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' }, [
-      svgEl('line', { x1: 0, y1: 0, x2: 0, y2: 6, stroke: COLOR.abort, 'stroke-width': 1.6, 'stroke-opacity': 0.85 }),
-    ]),
-  );
-  return defs;
-}
-
 // ------------------------------------------------------------------ 泳道
 
 function buildRows(
@@ -1306,7 +1286,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       // 条目按**取值**着色，而不是按行：同一条指令在 IF/ID/EX/MEM/WB 里是同一个颜色，
       // 一眼就能顺着颜色把一条指令跟到写回。没有标记的条目退回轨道色。
       const laneColor = colorFor(track.name);
-      const colorOfItem = (item: { tag: ScalarValue | null }): string => (item.tag === null ? laneColor : colorFor(numericKey(item.tag)));
+      const colorOfItem = (item: { value: ScalarValue | null }): string => (item.value === null ? laneColor : colorFor(numericKey(item.value)));
       let tagsDrawn = 0;
       // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
       const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
@@ -1315,7 +1295,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           `轨道 ${track.name}（域 ${track.domain}）`,
           cycleLabel(probe.cycle),
           `本周期占用 ${track.occupancy.get(probe.cycle) ?? 0} · 到达 ${track.arrivals.get(probe.cycle) ?? 0} · 离开 ${track.departures.get(probe.cycle) ?? 0}`,
-          `${track.items.length} 条目 · ${track.completed} 完成 · ${track.aborted} 冲刷 · ${track.open} 未闭合`,
+          `${track.items.length} 条目 · ${track.closed} 已结束 · ${track.open} 未闭合`,
         ].join('\n'),
       );
 
@@ -1360,36 +1340,31 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       const barY = y + 4;
       for (const item of shown) {
         const color = colorOfItem(item);
-        const open = item.closed === null;
-        const aborted = item.closed === 'X';
+        const open = item.close === null;
         const enterX = reg.plot.scale(item.enter.cycle + phaseOffset(item.enter, item.async));
-        // 同域用关闭周期作锚点；跨域锚点在 enter 域上（spec §9.4），不再叠加出记录的相位；
-        // 未闭合只画到轨道末周期，**不伪造**退出周期
+        // 同域用结束周期作锚点；跨域锚点在起始域上（spec §9.4），不再叠加结束记录的相位；
+        // 未闭合只画到轨道末周期，**不伪造**结束周期
         const anchor = item.closeAnchorCycle;
         // 未闭合条目：内容一直在飞，画到该域末尾（不伪造退出周期，只是把已知状态延续下去）。
         // 这里用的是**半开**末端（与 anchor 同一口径）：要覆盖到第 domainEnd 周期，末端就得是 domainEnd + 1
         const endCycle = open || anchor === null ? domainEnd + 1 : anchor;
-        const endShift = open || anchor === null || item.crossDomain ? 0 : phaseOffset(item.exit ?? item.abort ?? item.enter, item.closeAsync);
+        const endShift = open || anchor === null || item.crossDomain ? 0 : phaseOffset(item.close ?? item.enter, item.closeAsync);
         const right = Math.max(reg.plot.x0 + 1, Math.min(reg.plot.scale(endCycle + endShift), reg.plot.x1));
         const x = clamp(enterX, reg.plot.x0, reg.plot.x1 - 1);
         const w = Math.max(1.5, right - x);
         reg.itemBoxes.set(`${track.name}\u0000${item.enterSeq}`, { x, y: barY, w, h: barH });
 
-        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的数值分界。
-        // 冲刷（X）条目不填充：靠「空心 + 斜纹 + 虚线框」表达，虚线框与空泡同一套画法，
-        // 于是"这个周期没有内容"和"有内容但被冲掉"一眼能分开，又不会误认成实心条目。
-        const hollow = item.orphan || aborted;
+        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的取值分界。
+        // 未闭合条目（文件结束时仍持有）用虚线框；不画到域末尾之外，也不伪造结束周期。
+        const hollow = false;
         const rect = svgEl('path', {
           d: hexPath(x, x + w, barY, barY + barH, 4),
-          ...(item.orphan
-            ? { fill: 'var(--surface)' }
-            : aborted
-              ? { fill: 'none' }
-              : { fill: color, 'fill-opacity': BLOCK_FILL }),
-          stroke: item.orphan ? COLOR.orphan : aborted ? COLOR.abort : color,
-          'stroke-width': aborted ? 1 : 1.2,
+          fill: color,
+          'fill-opacity': BLOCK_FILL,
+          stroke: color,
+          'stroke-width': 1.2,
           'stroke-linejoin': 'round',
-          ...(open || aborted ? { 'stroke-dasharray': '4 3' } : {}),
+          ...(open ? { 'stroke-dasharray': '4 3' } : {}),
         });
         g.append(rect);
         // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
@@ -1408,35 +1383,19 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         );
         target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
         target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
-        if (aborted && !item.orphan) {
-          g.append(svgEl('path', { d: hexPath(x, x + w, barY, barY + barH, 4), fill: 'url(#tl-stripe)', 'pointer-events': 'none' }));
-        }
-        if (item.orphan) {
-          const cx = x + w / 2;
-          const cy = barY + barH / 2;
-          const r = clamp(w / 3, 2, 4);
-          g.append(
-            svgEl('path', {
-              d: `M${round2(cx - r)},${round2(cy - r)}L${round2(cx + r)},${round2(cy + r)}M${round2(cx + r)},${round2(cy - r)}L${round2(cx - r)},${round2(cy + r)}`,
-              stroke: COLOR.orphan,
-              'stroke-width': 1.4,
-              'pointer-events': 'none',
-            }),
-          );
-        }
         if (item.async) {
           g.append(
             svgEl('circle', { cx: x, cy: barY + barH / 2, r: 2.6, fill: 'var(--surface)', stroke: color, 'stroke-width': 1.2, 'pointer-events': 'none' }),
           );
         }
-        if (w >= 30 && tagsDrawn < TAG_BUDGET && item.tag) {
+        if (w >= 30 && tagsDrawn < TAG_BUDGET && item.value) {
           tagsDrawn++;
           g.append(
             svgEl('text', {
               x: x + 3,
               y: y + h - 11,
               style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? null : color, hollow ? 1 : BLOCK_FILL)};pointer-events:none`,
-              text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
+              text: clip(formatScalarBy(item.value, valueFormatOf(`pip:${track.name}`)), w - 6),
             }),
           );
         }
@@ -1451,22 +1410,17 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
   const lines = [
     `轨道 ${track.name}（域 ${track.domain}）`,
-    `标记 ${item.tag ? formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)) : '（无）'}`,
+    `持有值 ${item.value ? formatScalarBy(item.value, valueFormatOf(`pip:${track.name}`)) : '（无）'}`,
   ];
-  lines.push(`入：${formatPosition(item.enter)}${item.async ? ' · 异步（画在区间中点）' : ''}`);
-  lines.push(item.exit ? `出：${formatPosition(item.exit)}${item.closeAsync ? ' · 异步' : ''}` : '出：（没有匹配的出 / 撤记录）');
-  if (item.orphan) lines.push('延迟：—（孤立条目，没有对应的入记录）');
-  else if (item.latencyCycles !== null) lines.push(`延迟：${item.latencyCycles} 周期（同域）`);
-  else if (item.latencyNs !== null) lines.push(`延迟：${fmtNs(item.latencyNs)}（跨域，两端域都声明了 period）`);
-  else if (item.crossDomain) lines.push('延迟：跨域条目不给周期延迟（spec §6.5），按两端位置读数');
-  else lines.push('延迟：—（未闭合）');
-  lines.push(
-    `状态：${
-      item.orphan ? '孤立条目（没有可匹配的在飞条目）' : item.closed === 'O' ? '完成（O）' : item.closed === 'X' ? '冲刷 / 撤销（X）' : '未闭合'
-    }`,
-  );
-  if (open) lines.push(`未闭合：内容仍在飞，画到该域末尾（第 ${track.lastCycle} 周期之后没有记录，不伪造退出周期）`);
-  lines.push(`跨域 ${item.crossDomain ? '是' : '否'} · 入 seq ${item.enterSeq}${item.closeSeq !== null ? ` · 出 seq ${item.closeSeq}` : ''}`);
+  lines.push(`起始：${formatPosition(item.enter)}${item.async ? ' · 异步（画在区间中点）' : ''}`);
+  lines.push(item.close ? `结束：${formatPosition(item.close)}${item.closeAsync ? ' · 异步' : ''}` : '结束：（没有后续记录改掉它）');
+  if (item.latencyCycles !== null) lines.push(`驻留：${item.latencyCycles} 周期（同域）`);
+  else if (item.latencyNs !== null) lines.push(`驻留：${fmtNs(item.latencyNs)}（跨域，两端域都声明了 period）`);
+  else if (item.crossDomain) lines.push('驻留：跨域条目不给周期延迟（spec §6.5），按两端位置读数');
+  else lines.push('驻留：—（未闭合）');
+  lines.push(`状态：${item.close ? '已结束（被后续记录改掉）' : '文件结束时仍持有'}`);
+  if (open) lines.push(`未闭合：该级一直持有到这个域的第 ${track.lastCycle} 周期之后（不伪造结束周期）`);
+  lines.push(`跨域 ${item.crossDomain ? '是' : '否'} · 起始 seq ${item.enterSeq}${item.closeSeq !== null ? ` · 结束 seq ${item.closeSeq}` : ''}`);
   return lines.join('\n');
 }
 
@@ -1805,9 +1759,9 @@ function valueMenu(track: ValueTrack): LaneRow['menu'] {
 }
 
 function pipelineMenu(track: TrackInfo): LaneRow['menu'] | undefined {
-  const tags = track.items.map((item) => item.tag).filter((tag): tag is ScalarValue => tag !== null);
-  if (!isFormattable(tags)) return undefined;
-  return { formatKey: `pip:${track.name}`, formatWidth: widthOf(tags) };
+  const values = track.items.map((item) => item.value).filter((value): value is ScalarValue => value !== null);
+  if (!isFormattable(values)) return undefined;
+  return { formatKey: `pip:${track.name}`, formatWidth: widthOf(values) };
 }
 
 // ------------------------------------------------------------------ 右键菜单

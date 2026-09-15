@@ -22,22 +22,22 @@ chiperf 是一种用于硬件微架构**性能分析与可视化**的通用文�
 ## 60 秒上手
 
 ```chiperf
-chiperf 1.0
+chiperf 2.0
 @meta design="rv32i-core"
 @domain core, period=1.0ns
 
 [clk] p, dom=core
 [cnt] "Branch Miss"
 [val] "core.if.pc", 32'h8000_01d0
-[pip] "core.if", I, 0x800001d0
+[pip] "core.if", 0x800001d0        # 这一级此刻持有这条内容
 [fsm] "core.ctrl", FETCH
 [clk] n, dom=core
 [clk] p, dom=core
-[pip] "core.if", O, 0x800001d0
+[pip] "core.if", bubble            # 这一级空了（没有记录就保持上一值）
 @end
 ```
 
-这一小段已经表达了：第 1 个上升沿分支预测失败一次、PC 的值、`core.if` 在这个周期开始处理 `0x800001d0`、控制器进入 `FETCH`；第 2 个上升沿该内容离开 `core.if`（延迟 1 周期）。
+这一小段已经表达了：第 1 个上升沿分支预测失败一次、PC 的值、`core.if` 在这个周期开始持有 `0x800001d0`、控制器进入 `FETCH`；第 2 个上升沿该级变空（该条目驻留 1 周期）。
 
 ## 能力覆盖
 
@@ -48,7 +48,7 @@ AGENT.md 列出的追踪能力与记录类型的对应关系：
 | 时钟上升沿/下降沿 | `clk` | 只有 `p` 记录也足以定义周期编号 |
 | 事件次数 + 发生沿 | `cnt`（+ `evt`） | 每次增减都是一条带位置的记录 |
 | 数值变化 + 发生沿 | `val` | 保持型采样，支持 4 态（`x`/`z`）与字符串 |
-| 模块内正在处理的内容 | `pip` | 入/出事件配对，派生延迟与占用度 |
+| 模块内正在处理的内容 | `pip` | 每级**此刻持有什么**（保持型）；空写 `bubble`，不写就是保持 |
 | 状态机变化 | `fsm` | 保持型；相邻记录构成跳转 |
 
 ## 解析器最小实现要点
@@ -75,6 +75,6 @@ AGENT.md 列出的追踪能力与记录类型的对应关系：
 
 ## 状态
 
-- 规范版本：`1.1`（1.0 已冻结；`async=` 属性为 1.0 定稿修订，`rst` 为 1.1 新增，见 spec §7.8）
+- 规范版本：`2.0`（`pip` 改为保持型取值，不兼容 `1.x`；`async=` 属性为 1.0 定稿修订，`rst` 为 1.1 新增，见 spec §7.8 与 §12.5）
 - 解析器：99 个测试通过（含对 [`examples.md`](examples.md) 全部公开数字的一致性断言）；`cd src/parser && bun test`
 - 前端：改完源码后 `cd src/frontend && bun run build` 重新生成 `dist/`；产物契约由 `bun test` 断言（页面自包含、服务器路由与内容一致）

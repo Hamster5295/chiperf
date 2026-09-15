@@ -108,24 +108,20 @@ function recordsPerCycleChart(trace: Trace, domain: string, height = 120): SVGSV
 
 function totals(trace: Trace) {
   let items = 0;
-  let completed = 0;
-  let aborted = 0;
+  let closed = 0;
   let open = 0;
-  let orphans = 0;
   let bubbles = 0;
   const latencies: number[] = [];
   for (const track of trace.tracks.values()) {
     items += track.items.length;
-    completed += track.completed;
-    aborted += track.aborted;
+    closed += track.closed;
     open += track.open;
-    orphans += track.orphan;
     bubbles += track.bubbles.length;
     latencies.push(...track.latencies);
   }
   const avg = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
   const max = latencies.length > 0 ? Math.max(...latencies) : 0;
-  return { items, completed, aborted, open, orphans, bubbles, avg, max, latencyCount: latencies.length };
+  return { items, closed, open, bubbles, avg, max, latencyCount: latencies.length };
 }
 
 function overviewBody(root: HTMLElement, ctx: ViewContext): void {
@@ -143,7 +139,7 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     statTile('事件记录', countLabel(trace.stats.records), `${trace.stats.bytesPerRecord.toFixed(1)} B/记录`),
     statTile('文件大小', fmtBytes(trace.stats.bytes), trace.domains.size > 0 ? `${trace.stats.lines} 行` : ''),
     statTile('追踪对象', countLabel(trace.counters.size + trace.values.size + trace.fsms.size + trace.events.size + trace.tracks.size), `${trace.tracks.size} 轨道 · ${trace.counters.size} 计数器 · ${trace.fsms.size} 状态机`),
-    statTile('在飞条目', countLabel(totalsInfo.items), `${totalsInfo.completed} 完成 · ${totalsInfo.aborted} 撤销 · ${totalsInfo.open} 未闭合`),
+    statTile('在飞条目', countLabel(totalsInfo.items), `${totalsInfo.closed} 已结束 · ${totalsInfo.open} 未闭合`),
     statTile('平均延迟', totalsInfo.latencyCount > 0 ? `${totalsInfo.avg.toFixed(2)} 周期` : '—', totalsInfo.latencyCount > 0 ? `最大 ${totalsInfo.max} 周期（${totalsInfo.latencyCount} 条）` : '没有完成的同域条目'),
     statTile('气泡', countLabel(totalsInfo.bubbles), '占用度为 0 的活跃周期'),
     statTile('警告', countLabel(trace.diagnostics.length), trace.diagnostics.length === 0 ? '无异常' : [...trace.diagnosticCounts.keys()].slice(0, 2).join(' · ')),
@@ -211,8 +207,7 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
       el('code', { text: track.name }),
       track.domain,
       String(track.items.length),
-      String(track.completed),
-      String(track.aborted),
+      String(track.closed),
       String(track.open),
       stats2.count > 0 ? `${stats2.min} / ${stats2.avg.toFixed(2)} / ${stats2.max}` : '—',
       String(track.bubbles.length),
@@ -222,7 +217,7 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     trackRows.length > 0
       ? el('div', { class: 'table-wrap' }, [
           el('table', { class: 'table' }, [
-            el('thead', {}, [tableRow(['轨道', '域', '条目', '完成', '撤销', '未闭合', '延迟 最小/平均/最大', '气泡周期'], 'th')]),
+            el('thead', {}, [tableRow(['轨道', '域', '条目', '已结束', '未闭合', '延迟 最小/平均/最大', '气泡周期'], 'th')]),
             el('tbody', {}, trackRows.map((cells) => tableRow(cells))),
           ]),
         ])

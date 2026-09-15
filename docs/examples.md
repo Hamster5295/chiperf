@@ -31,8 +31,8 @@ chiperf 1.0
 [cnt] "Branch Miss"
 [cnt] "Cache Hit"
 [val] "PC", 0x800001d0
-[pip] "IF", I, 0x1234abcd
-[pip] "IF", O
+[pip] "IF", 0x1234abcd
+[pip] "IF", bubble
 [clk] n
 
 # ---- 周期 2 ----
@@ -48,8 +48,8 @@ chiperf 1.0
 | 2 | `[cnt] "Branch Miss"` | `(default, 1, p, 2)` | `total = 1`（缺省增量 `+1`） |
 | 3 | `[cnt] "Cache Hit"` | `(default, 1, p, 3)` | `total = 1` |
 | 4 | `[val] "PC", 0x800001d0` | `(default, 1, p, 4)` | `PC` 从此保持该值 |
-| 5 | `[pip] "IF", I, 0x1234abcd` | `(default, 1, p, 5)` | 入队，标记 `0x1234abcd` |
-| 6 | `[pip] "IF", O` | `(default, 1, p, 6)` | 按 FIFO 出队该条目 ⇒ 延迟 `1-1 = 0` 周期 |
+| 5 | `[pip] "IF", 0x1234abcd` | `(default, 1, p, 5)` | IF 开始持有 `0x1234abcd`（条目开始） |
+| 6 | `[pip] "IF", bubble` | `(default, 1, p, 6)` | IF 变空 ⇒ 该条目驻留 `1-1 = 0` 周期，第 1 周期占用度为 0 |
 | 7 | `[clk] n` | `(default, 1, n, 7)` | 同一周期进入相位 `n` |
 | 8 | `[clk] p` | `(default, 2, p, 8)` | 周期推进到 2 |
 
@@ -90,22 +90,22 @@ chiperf 1.0
 | 该周期记录数 | 6 | 6 | 10 | 10 | 12 | 14 | 12 | 10 | 8 | 3 | 3 | 4 | 4 |
 
 - 时钟之前的 6 条记录位于 `(default, 0, -, 1..6)`：`msg`、两个 FSM 的初态、`cnt abs=0`、`val if.pc = x`（4 态未知）、`val if.valid = 0`。
-- 第 6 周期的冲刷记录：`[pip] "core.if", X, 0x80000010` 位于 `(default, 6, p, 63)`，`[pip] "core.id", X, 0x8000000c` 位于 `(default, 6, p, 64)`。
+- 第 6 周期把两级设空：`[pip] "core.if", bubble` 位于 `(default, 6, p, 63)`，`[pip] "core.id", bubble` 位于 `(default, 6, p, 64)`（前一条把 IF 持有的 `0x80000010` 结束掉，后一条结束 ID 里的 `0x8000000c`）。
 - 文件共 102 条事件记录，最后一个位置是 `(default, 12, p, 102)`；`clk` 记录共 12 条（12 个上升沿），没有 `n` 记录（该域只用上升沿插桩模式）。
 
 ### 2.3 轨道与延迟
 
-| 轨道 | 条目（tag: 进入 → 结局） | 延迟（周期） |
+| 轨道 | 条目（值: 起始 → 结束） | 驻留（周期） |
 | --- | --- | --- |
-| `core.if` | A `c1→O c2`、B `c2→O c3`、C `c3→O c4`、D `c4→O c5`、E `c5→**X** c6`、F `c7→O c8` | 全部 1（含被冲刷的 E） |
-| `core.id` | A `c2→O c3`、B `c3→O c4`、C `c4→O c5`、D `c5→**X** c6`、F `c8→O c9` | 全部 1 |
-| `core.ex` | A `c3→O c4`、B `c4→O c5`、C `c5→O c6`、F `c9→O c10` | 全部 1 |
-| `core.mem` | A `c4→O c5`、B `c5→O c6`、C `c6→O c7`、F `c10→O c11` | 全部 1 |
-| `core.wb` | A `c5→O c6`、B `c6→O c7`、C `c7→O c8`、F `c11→O c12` | 全部 1 |
+| `core.if` | A `c1→c2`、B `c2→c3`、C `c3→c4`、D `c4→c5`、E `c5→**c6 变空**`、F `c7→c8` | 全部 1（含被冲刷的 E） |
+| `core.id` | A `c2→c3`、B `c3→c4`、C `c4→c5`、D `c5→**c6 变空**`、F `c8→c9` | 全部 1 |
+| `core.ex` | A `c3→c4`、B `c4→c5`、C `c5→c6`、F `c9→c10` | 全部 1 |
+| `core.mem` | A `c4→c5`、B `c5→c6`、C `c6→c7`、F `c10→c11` | 全部 1 |
+| `core.wb` | A `c5→c6`、B `c6→c7`、C `c7→c8`、F `c11→c12` | 全部 1 |
 
-- 出/撤事件都带标记，因此匹配走"最早同标记条目"这条路；所有 `O`/`X` 都能匹配到在飞条目 ⇒ **`orphan_exit` 为 0**。
-- 文件结束时所有条目都已闭合 ⇒ **`open` 条目为 0**。
-- 冲刷（`X`）2 条：E（在 `core.if` 驻留 1 周期）、D（在 `core.id` 驻留 1 周期）。这正是"预测错误只冲刷年轻指令，分支本身继续执行"的建模：C 的 `mem`/`wb` 记录照常出现。
+- 结束位置由"下一条把该级改成别的值的记录"给出（v2.0 的保持型语义，spec §7.4）；同一条内容在相邻两级的区间首尾相接，正是流水线的样子。
+- 文件结束时所有条目都已被后续记录改掉 ⇒ **`open` 条目为 0**。
+- 第 6 周期把 `core.if` / `core.id` 设成 `bubble`：E（在 `core.if` 驻留 1 周期）、D（在 `core.id` 驻留 1 周期）就此离开流水线，这正是"预测错误只冲刷年轻指令，分支本身继续执行"的建模 —— C 的 `mem`/`wb` 记录照常出现。**注意**：v2.0 里"被冲刷"与"正常离开"在数据上不可区分（spec §12.5），这里靠"它此后再没出现在任何一级"才能看出来。
 
 ### 2.4 占用度（`inflight(track, c)`）
 
@@ -117,7 +117,7 @@ chiperf 1.0
 | `core.mem` | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `core.wb` | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 0 | 0 | 1 | 0 |
 
-- `c6` 的 `core.if` / `core.id` 占用度为 0 ⇒ 两个气泡，正是冲刷留下的空洞。
+- `c6` 的 `core.if` / `core.id` 占用度为 0 ⇒ 两个气泡，正是第 6 周期把两级设空留下的空洞。
 - B 在 `core.mem` 只停留 1 个周期（`c5`），因为在 `c6` 它就离开了；半开区间 `[enter, exit)` 的含义在这里很直观。
 
 ### 2.5 计数器
@@ -132,7 +132,7 @@ chiperf 1.0
 \* 每条记录只给一个位置代表；同一周期内可能有多条记录，按 `seq` 区分。
 
 - 被冲刷的取指（`c4` 的 D、`c5` 的 E）仍然计入 `icache.access` —— 插桩点在取指发出处，这是刻意的：可视化的"访问数"不应因为冲刷而消失。
-- `core.retired` 只统计 `core.wb` 的出队：A、B、C、F 共 4 次，与 2.1 的"退休"列一致。
+- `core.retired` 只在内容离开 `core.wb`（该级被设成别的值或 `bubble`）时记一次：A、B、C、F 共 4 次，与 2.1 的"退休"列一致。
 
 ### 2.6 状态机
 
@@ -159,7 +159,7 @@ chiperf 1.0
 | 诊断 | 次数 | 说明 |
 | --- | --- | --- |
 | `self_transition` | 1 | `core.icache.ctrl` 连续两周期 `FILL` |
-| 其它全部诊断 | 0 | 没有 `orphan_exit`、`open`、重复属性、非法记录 |
+| 其它全部诊断 | 0 | 没有 `open`、重复属性、非法记录 |
 
 ---
 
@@ -174,11 +174,11 @@ chiperf 1.0
 | `[clk] p, dom=core` | `(core, 1, p)` | core 第 1 个上升沿 |
 | `[cnt] "stall", dom="core"` | `(core, 1, p)` | 计入 `(core, "stall")` |
 | `[val] "core.if.pc", …, dom="core"` | `(core, 1, p)` | —— |
-| `[pip] "core.l2", I, 0x4000, dom="core"` | `(core, 1, p)` | 入队 |
+| `[pip] "core.l2", 0x4000, dom="core"` | `(core, 1, p)` | `core.l2` 开始持有 `0x4000` |
 | `[clk] p, dom=mem` | `(mem, 1, p)` | mem 第 1 个上升沿（与 core 的周期计数无关） |
 | `[cnt] "stall", dom="mem"` | `(mem, 1, p)` | 计入 `(mem, "stall")`，与上一个**不是**同一个计数器 |
 | `[clk] n, dom=core` / `[clk] n, dom=mem` | `(core, 1, n)` / `(mem, 1, n)` | 两个域的下降沿 |
-| `[pip] "core.l2", O, 0x4000, dom="mem"` | `(mem, 2, p)` | 出队；条目的入在 core、出在 mem |
+| `[pip] "core.l2", bubble, dom="mem"` | `(mem, 2, p)` | `core.l2` 变空；该条目的起始在 core、结束在 mem（`cross_domain`） |
 
 ### 派生量
 
@@ -205,19 +205,19 @@ chiperf 1.0
 | --- | --- | --- |
 | 1 | `[val] "PC", 32'h8000_0000, at=1p` | `(default, 1, p, 1)` |
 | 2 | `[cnt] "Retired", at=1p` | `(default, 1, p, 2)` |
-| 3 | `[pip] "IF", I, 0x80000000, at=1p` | `(default, 1, p, 3)` |
+| 3 | `[pip] "IF", 0x80000000, at=1p` | `(default, 1, p, 3)` |
 | 4 | `[val] "PC", 32'h8000_0004, at=2p` | `(default, 2, p, 4)` |
-| 5 | `[pip] "IF", O, 0x80000000, at=2p` | `(default, 2, p, 5)`，延迟 `2-1 = 1` 周期 |
-| 6 | `[pip] "ID", I, 0x80000000, at=2` | `(default, 2, p, 6)`（相位字母缺省 ⇒ `p`） |
+| 5 | `[pip] "IF", bubble, at=2p` | `(default, 2, p, 5)`，该条目驻留 `2-1 = 1` 周期 |
+| 6 | `[pip] "ID", 0x80000000, at=2` | `(default, 2, p, 6)`（相位字母缺省 ⇒ `p`） |
 | 7 | `[val] "PC", 32'h8000_0008, at=3p` | `(default, 3, p, 7)` |
-| 8 | `[pip] "ID", O, 0x80000000, at=3p` | `(default, 3, p, 8)`，延迟 1 周期 |
+| 8 | `[pip] "ID", bubble, at=3p` | `(default, 3, p, 8)`，该条目驻留 1 周期 |
 | 9 | `[cnt] "Retired", at=3p` | `(default, 3, p, 9)` |
 | 10 | `[val] "PC", 32'h8000_000c, at=3n` | `(default, 3, n, 10)` |
 | 11 | `[cnt] "stall", dom="mem", at=7p` | `(mem, 7, p, 11)` |
 
 - 域 `default` 与 `mem` 都**没有**上升沿记录：`cycles` 与 `phase` 保持初值 `0` / `-`。这不影响事件的定位，也**不**产生任何诊断。
 - `at=` 不推进时钟：即便出现过 `at=7p`，`(mem)` 的周期计数仍是 0。
-- 计数器：`Retired = 2`、`(mem, "stall") = 1`；轨道 `IF`、`ID` 各 1 个条目、延迟均为 1 周期、全部闭合。
+- 计数器：`Retired = 2`、`(mem, "stall") = 1`；轨道 `IF`、`ID` 各 1 个条目、驻留均为 1 周期、都已结束。
 - 无诊断。
 
 ---
@@ -235,7 +235,7 @@ chiperf 1.0
 [clk] p
 [val] "core.pc", 32'h8000_0000
 [cnt] "core.instr"
-[pip] "core.l2", I, 0x4000
+[pip] "core.l2", 0x4000
 [clk] n
 [val] "core.irq.level", 0                # 下降沿上采样：沿对齐（与下面的异步事件同属一个区间）
 [cnt] "core.instr", async=1              # 低相位区间内发生的取指：不在任何时钟沿上
@@ -247,7 +247,7 @@ chiperf 1.0
 [cnt] "core.instr"
 [clk] n
 [val] "core.pc", 32'h8000_0100, async=1  # 影子 PC 被异步改写
-[pip] "core.l2", O, 0x4000, async=1      # 响应到达也是异步的（延迟仍按周期算：2-1 = 1）
+[pip] "core.l2", bubble, async=1          # 响应到达也是异步的（驻留仍按周期算：2-1 = 1）
 [msg] irq serviced
 
 # ---- cycle 3 ----
@@ -263,7 +263,7 @@ chiperf 1.0
 | 1 | `[clk] p` | `(core, 1, p, 1)` | —— |
 | 2 | `[val] "core.pc", 32'h8000_0000` | `(core, 1, p, 2)` | 沿对齐 |
 | 3 | `[cnt] "core.instr"` | `(core, 1, p, 3)` | 沿对齐，`total = 1` |
-| 4 | `[pip] "core.l2", I, 0x4000` | `(core, 1, p, 4)` | 沿对齐 |
+| 4 | `[pip] "core.l2", 0x4000` | `(core, 1, p, 4)` | 沿对齐 |
 | 5 | `[clk] n` | `(core, 1, n, 5)` | 低相位区间开始 |
 | 6 | `[val] "core.irq.level", 0` | `(core, 1, n, 6)` | 沿对齐 |
 | 7 | `[cnt] "core.instr", async=1` | `(core, 1, n, 7)` | **异步**，`total = 2` |
@@ -273,7 +273,7 @@ chiperf 1.0
 | 11 | `[cnt] "core.instr"` | `(core, 2, p, 11)` | 沿对齐，`total = 3` |
 | 12 | `[clk] n` | `(core, 2, n, 12)` | —— |
 | 13 | `[val] "core.pc", 32'h8000_0100, async=1` | `(core, 2, n, 13)` | **异步** |
-| 14 | `[pip] "core.l2", O, 0x4000, async=1` | `(core, 2, n, 14)` | **异步出队** |
+| 14 | `[pip] "core.l2", bubble, async=1` | `(core, 2, n, 14)` | **异步地把该级设空** |
 | 15 | `[msg] irq serviced` | `(core, 2, n, 15)` | —— |
 | 16 | `[clk] p` | `(core, 3, p, 16)` | —— |
 | 17 | `[cnt] "core.instr"` | `(core, 3, p, 17)` | 沿对齐，`total = 4` |
@@ -307,7 +307,7 @@ chiperf 1.0
 | `[cnt] "Retired", x` | 增量不是 `int` | 跳过，`skipped_invalid_record` +1 |
 | `[val] "PC", 0x80000000` | 正常 | `seq 4` |
 | `[val] "PC", 32'hDEAD_BEEF, x-vendor-tag=7` | 未知属性 | 属性被忽略，**记录仍然有效**，`seq 5` |
-| `[pip] "IF", O, 0x9999` | 无在飞条目 | 记录仍有效（`seq 6`），`orphan_exit` +1 |
+| `[pip] "IF", bubble` | 该级本来就是空的 | 记录仍有效（`seq 6`）：只是把"空"再说一遍，**不产生任何诊断**（v2.0 没有"凭空出队"这回事，spec §7.4） |
 | `[clk] p` ×2 | 只有上升沿 | 周期 2、周期 3 |
 | `[clk] n` / `[clk] n` | 重复否定相位 | 第二条 `redundant_edge` +1 |
 | `[cnt] "Retired", -10` | 累计变负 | `total = 2-10 = -8`，`negative_total` +1 |
@@ -318,7 +318,7 @@ chiperf 1.0
 | `[clk] p, async=1` | `async` 用在时钟沿上 | 记录有效且**沿仍然生效**（周期 4，`seq 17`），属性被忽略 ⇒ `async_on_clk` +1 |
 | `@end` | 正常结束 | 无 `eof_without_end_marker` |
 
-统计：**17 条有效事件记录**；被跳过 3 行（未知类型 1、非法记录 1、未知指令 1）；语义异常 6 次（`orphan_exit`、`redundant_edge`、`negative_total`、`self_transition`、`undeclared_domain`、`async_on_clk` 各 1）。
+统计：**17 条有效事件记录**；被跳过 3 行（未知类型 1、非法记录 1、未知指令 1）；语义异常 5 次（`redundant_edge`、`negative_total`、`self_transition`、`undeclared_domain`、`async_on_clk` 各 1）。
 
 关键点：
 
@@ -334,15 +334,15 @@ chiperf 1.0
 | --- | --- | --- | --- |
 | 1 | `[clk] p` | `(default, 1, p, 1)` | 周期 1 |
 | 2 | `[cnt] "Retired"` | `(default, 1, p, 2)` | `total = 1` |
-| 3 | `[pip] "IF", I, 0x80000000` | `(default, 1, p, 3)` | 入队 |
-| 4 | `[pip] "IF", O, 0x80000000` | `(default, 1, p, 4)` | 延迟 0 周期 |
-| 5 | `[pip] "ID", I, 0x80000000` | `(default, 1, p, 5)` | 入队，**之后没有出队** |
+| 3 | `[pip] "IF", 0x80000000` | `(default, 1, p, 3)` | IF 开始持有它 |
+| 4 | `[pip] "IF", bubble` | `(default, 1, p, 4)` | 驻留 0 周期 |
+| 5 | `[pip] "ID", 0x80000000` | `(default, 1, p, 5)` | ID 开始持有它，**之后没有任何记录改掉** |
 | 6 | `[val] "PC", 0x80000000` | `(default, 1, p, 6)` | `PC` 保持 |
 | 7 | `[clk] p` | `(default, 2, p, 7)` | 周期 2 |
 | — | `[cnt] "Retire` | 丢弃 | `truncated_tail` 保留原文 |
 
 - **7 条有效事件记录**；残行 **不得** 被解析（否则会得到一条名为 `Retire` 的伪计数）。
-- 轨道 `ID` 留下 1 个 `open` 条目（`enter = (default,1,p,5)`，标记 `0x80000000`）⇒ 可视化应画成开放区间，而不是伪造一个出队。
+- 轨道 `ID` 留下 1 个 `open` 条目（`enter = (default,1,p,5)`，值 `0x80000000`）⇒ 可视化应画成开放区间，而不是伪造一个结束位置。
 - 没有 `@end` ⇒ `eof_without_end_marker`。
 - 这正是 §10.1 前缀封闭性的具体体现：截断到任意行边界，剩下的部分都是一个可以正常解析、语义自洽的 chiperf 文件。
 
@@ -360,7 +360,7 @@ chiperf 1.1
 [clk] p
 [cnt] "retired"
 [val] "core.pc", 0x1000
-[pip] "core.if", I, 0x1000
+[pip] "core.if", 0x1000
 [clk] n
 [clk] p
 [cnt] "retired"
@@ -388,4 +388,4 @@ chiperf 1.1
 | 周期号 | 不重编：复位后的记录接着原来的周期号（本例第 3 个周期），时钟不"回到 0" |
 | 诊断 | 一条 `rst_boundary`（信息性）；复位前的诊断与跳过行一并作废 |
 
-复位处正在飞的条目会被销毁：若上例的 `[pip] "core.if", I` 之后（复位后）再出现 `O`，那条 `O` 在窗口内匹配不到任何入记录，解析器报 `orphan_exit` —— 这是正确诊断，不是解析器的错。
+复位处正在飞的条目会被销毁：复位之前 `[pip] "core.if", 0x1000` 的保持状态随记录一起作废，复位后该级处于"未开始"状态，直到下一条 `[pip]` 把它设成某个值或 `bubble`（spec §7.4 / §7.8）。复位后写 `[pip] "core.if", bubble` 也完全正常 —— 那只是"该级变空"，不产生诊断。

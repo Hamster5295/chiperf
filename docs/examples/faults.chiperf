@@ -1,4 +1,4 @@
-chiperf 1.0
+chiperf 2.0
 @meta design="robustness fixture" note="故意注入未知类型/未知指令/未知属性/非法记录/语义异常"
 @domain core, period=1.0ns, note="声明了 core；文件里故意把一条写成 cor 来触发域拼写诊断"
 # 期望的解析结果见 docs/examples.md（每个注入点标注了期望诊断）
@@ -11,7 +11,7 @@ chiperf 1.0
 [cnt] "Retired", x                           # skipped_invalid_record（增量不是 int）
 [val] "PC", 0x80000000
 [val] "PC", 32'hDEAD_BEEF, x-vendor-tag=7    # 未知属性被忽略，记录仍有效
-[pip] "IF", O, 0x9999                        # orphan_exit（无在飞条目）
+[pip] "IF", bubble # orphan_exit（无在飞条目）
 [clk] p
 [clk] p                                      # 合法：只插桩上升沿
 [clk] n

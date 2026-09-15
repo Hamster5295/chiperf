@@ -96,6 +96,8 @@ export function sampleTrace(): string {
   // 重排一次：被冲刷的指令不再占用 EX/MEM，后面的指令才是真实的时间线
   const slots = schedule(overrides, new Set(killedIndices));
 
+  // 观测窗口：最后一条指令写回之后再多留 3 拍，够画完收尾的状态机
+  const lastCycle = Math.max(...slots.map((s) => s.wbOut)) + 3;
   const lines: string[] = [];
   const push = (s: string) => lines.push(s);
   const hex = (v: number) => `0x${v.toString(16).padStart(8, '0')}`;
@@ -114,7 +116,7 @@ export function sampleTrace(): string {
     at(cycle, line);
   };
 
-  push('chiperf 1.0');
+  push('chiperf 2.0');
   push('@meta design="rv32i-demo" tool="chiperf frontend sample" date="2026-09-15" note="内置示例：双时钟域 + 5 级流水 + 异步中断"');
   push('@domain default, period=1.0ns, note="主时钟 1GHz（隐式默认域）"');
   push('@domain mem, freq=800MHz, note="内存时钟 800MHz"');
@@ -137,30 +139,37 @@ export function sampleTrace(): string {
     put(index, slot.ifIn, `[cnt] "core.icache.access"`);
     put(index, slot.ifIn, `[val] "core.if.pc", ${tag}`);
     put(index, slot.ifIn, `[val] "core.if.valid", 1`);
-    put(index, slot.ifIn, `[pip] "core.if", I, ${tag}`);
-    put(index, slot.idIn, `[pip] "core.if", O, ${tag}`);
-    put(index, slot.idIn, `[pip] "core.id", I, ${tag}`);
+    // pip 记录不在这里逐级配对：v2.0 起 [pip] 是"该级的新值或 bubble"，
+    // 下面统一按"每级每拍持有谁、值变了才写一条"生成（保持型，spec §7.4）
     put(index, slot.idIn, `[val] "core.id.instr", ${instr.enc}`);
     if (instr.pc === PROGRAM[1]!.pc) put(index, slot.idIn, `[val] "core.id.disasm", "${instr.disasm}"`);
-    put(index, slot.exIn, `[pip] "core.id", O, ${tag}`);
-    put(index, slot.exIn, `[pip] "core.ex", I, ${tag}`);
-    put(index, slot.memIn, `[pip] "core.ex", O, ${tag}`);
-    put(index, slot.memIn, `[pip] "core.mem", I, ${tag}`);
-    put(index, slot.wbIn, `[pip] "core.mem", O, ${tag}`);
-    put(index, slot.wbIn, `[pip] "core.wb", I, ${tag}`);
-    put(index, slot.wbOut, `[pip] "core.wb", O, ${tag}`);
+    put(index, slot.wbOut, `[cnt] "core.retired"`);
     put(index, slot.wbOut, `[cnt] "core.retired"`);
   }
 
-  // X 标在"冲刷生效的那个沿"，而不是解析出预测错误的当拍：被冲刷的指令确实占用了
-  // mispredictCycle 这一拍（stageAt 说它此刻在 IF/ID 里），撤走发生在该拍末尾 ——
-  // 位置取后一拍才与它自己那份 O 记录（O 也写在离开的那一拍）同一套约定。
-  // 若把 X 写在 mispredictCycle 当拍，条目会成为零宽 `[c, c)`：按 §9.4 那类条目
-  // 不计入任何周期的占用度，图上只剩周期交界处的一个薄片，占用度曲线里也看不到它。
+  // 冲刷生效的那个沿：被冲刷的指令确实占用了 mispredictCycle 这一拍（stageAt 说它此刻在
+  // IF/ID 里），撤走发生在该拍末尾 —— 于是它的持有区间到 mispredictCycle 为止，下一拍该级变空。
   const flushCycle = mispredictCycle + 1;
-  for (const index of killedIndices) {
-    const slot = slots[index]!;
-    at(flushCycle, `[pip] "core.${stageAt(slot, mispredictCycle)}", X, ${hex(slot.instr.pc)}`);
+
+  // 流水线泳道：每级每拍持有谁，**只在值变了的那一拍**写一条 [pip]（保持型，spec §7.4）。
+  // 该级为空就写 bubble；从头到尾没变过就不写记录（那正是"保持不变"的表达）。
+  const STAGES = ['if', 'id', 'ex', 'mem', 'wb'] as const;
+  const killed = new Set(killedIndices);
+  const holderOf = (stage: (typeof STAGES)[number], cycle: number): string | null => {
+    for (const [index, slot] of slots.entries()) {
+      if (killed.has(index) && cycle > mispredictCycle) continue; // 冲掉之后它不在了
+      if (stageAt(slot, cycle) === stage) return hex(slot.instr.pc);
+    }
+    return null;
+  };
+  for (const stage of STAGES) {
+    let previous: string | null = null;
+    for (let cycle = 1; cycle <= lastCycle; cycle++) {
+      const value = holderOf(stage, cycle);
+      if (value === previous) continue;
+      previous = value;
+      at(cycle, value === null ? `[pip] "core.${stage}", bubble` : `[pip] "core.${stage}", ${value}`);
+    }
   }
   at(mispredictCycle, `[cnt] "core.br.miss"`);
   at(mispredictCycle, `[evt] "core.flush", ${hex(PROGRAM[MISPREDICT_INDEX]!.pc)}`);
@@ -173,7 +182,6 @@ export function sampleTrace(): string {
   at(mispredictCycle, '[fsm] "core.ctrl", FLUSH');
   at(redirectFetch, '[fsm] "core.ctrl", FETCH');
   at(redirectFetch + 1, '[fsm] "core.ctrl", RUN');
-  const lastCycle = Math.max(...slots.map((s) => s.wbOut)) + 3;
   at(lastCycle - 2, '[fsm] "core.ctrl", DRAIN');
   at(lastCycle, '[fsm] "core.ctrl", DONE');
 
@@ -206,7 +214,7 @@ export function sampleTrace(): string {
 
   // 跨时钟域请求：在默认域发起，稍后在 mem 域完成
   const crossTag = 0x9000;
-  at(slots[1]!.ifIn, `[pip] "l2.req", I, ${hex(crossTag)}`);
+  at(slots[1]!.ifIn, `[pip] "l2.req", ${hex(crossTag)}`);
 
   // 按周期输出；mem 域更快（每 4 个默认域周期多跑一拍）
   for (let cycle = 1; cycle <= lastCycle; cycle++) {
@@ -224,7 +232,7 @@ export function sampleTrace(): string {
   push('');
   push('# ---- 跨时钟域请求在 mem 域完成（不给周期延迟，spec §6.5）----');
   push('[clk] p, dom=mem');
-  push(`[pip] "l2.req", O, ${hex(crossTag)}, dom="mem"`);
+  push(`[pip] "l2.req", bubble, dom="mem"`);
   push('[cnt] "mem.access", dom="mem"');
   push('[clk] n, dom=mem');
   push('');

@@ -1,4 +1,4 @@
-chiperf 1.0
+chiperf 2.0
 @meta design="demo" note="AGENT.md 中的示例；补上可选的版本行与 @end"
 @domain default, period=1.0ns
 
@@ -7,8 +7,8 @@ chiperf 1.0
 [cnt] "Branch Miss"
 [cnt] "Cache Hit"
 [val] "PC", 0x800001d0
-[pip] "IF", I, 0x1234abcd
-[pip] "IF", O
+[pip] "IF", 0x1234abcd
+[pip] "IF", bubble
 [clk] n
 
 # ---- 周期 2 ----

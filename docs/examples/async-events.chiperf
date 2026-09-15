@@ -1,4 +1,4 @@
-chiperf 1.0
+chiperf 2.0
 @meta design="async demo" note="async=1：事件不是时钟沿采样得到的，可视化落在两个时钟沿之间"
 @domain core, period=1.0ns
 
@@ -6,7 +6,7 @@ chiperf 1.0
 [clk] p
 [val] "core.pc", 32'h8000_0000
 [cnt] "core.instr"
-[pip] "core.l2", I, 0x4000
+[pip] "core.l2", 0x4000
 [clk] n
 [val] "core.irq.level", 0                # 下降沿上采样：沿对齐（与下面的异步事件同属一个区间）
 [cnt] "core.instr", async=1              # 低相位区间内发生的取指：不在任何时钟沿上
@@ -18,7 +18,7 @@ chiperf 1.0
 [cnt] "core.instr"
 [clk] n
 [val] "core.pc", 32'h8000_0100, async=1  # 影子 PC 被异步改写
-[pip] "core.l2", O, 0x4000, async=1      # 响应到达也是异步的（延迟仍按周期算：2-1 = 1）
+[pip] "core.l2", bubble, async=1       # 响应到达也是异步的（延迟仍按周期算：2-1 = 1）
 [msg] irq serviced
 
 # ---- cycle 3 ----

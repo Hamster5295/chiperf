@@ -1,4 +1,4 @@
-chiperf 1.1
+chiperf 2.0
 @domain default, period=1.0ns
 @meta design="rst-demo", tool="handwritten", note="演示 [rst]：复位前的记录整批作废"
 
@@ -6,7 +6,7 @@ chiperf 1.1
 [clk] p
 [cnt] "retired"
 [val] "core.pc", 0x1000
-[pip] "core.if", I, 0x1000
+[pip] "core.if", 0x1000
 [clk] n
 [clk] p
 [cnt] "retired"

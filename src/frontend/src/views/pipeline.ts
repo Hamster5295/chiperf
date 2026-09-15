@@ -6,7 +6,7 @@
  *  - **占用 vs 空泡（饼图）**：该级活跃周期里"有内容"与"空泡"的比例。
  *    占用度是半开区间 `[enter, close)`（spec §9.4），所以活跃区间内每个周期
  *    非"有内容"即"空泡"，两者相加就是活跃周期数。
- *  - **延迟分布（横向柱状图）**：只统计**同域完成**条目（跨域条目不给周期延迟，
+ *  - **延迟分布（横向柱状图）**：只统计**同域已结束**条目（跨域条目不给周期延迟，
  *    spec §6.5），按出现次数取前 10 个延迟，并给出中位 / 平均 / 方差等数值。
  *
  * 其余内容（气泡区间列表、逐周期占用度曲线、跨域表、条目明细）已按要求移除；
@@ -262,12 +262,12 @@ function stageCard(track: TrackInfo, state: PipelineState): HTMLElement {
       metric('占用 vs 空泡', `${countLabel(track.bubbles.length)} 个气泡周期`, [occupancyMetric(track, state.ctx)]),
       metric(
         '延迟分布',
-        stats.count === 0 ? '没有已完成条目' : `同域完成 ${fmtInt(stats.count)} 条 · 按次数取前 10`,
+        stats.count === 0 ? '没有已结束条目' : `同域已结束 ${fmtInt(stats.count)} 条 · 按次数取前 10`,
         [
           distributionList(stats, {
             unit: '周期',
-            empty: '该级没有已完成条目（未闭合 / 撤销的不计入延迟分布）',
-            tip: (value, count, share) => [`延迟 ${value} 周期`, `${fmtInt(count)} 条`, `占已完成条目 ${(share * 100).toFixed(1)}%`].join('\n'),
+            empty: '该级没有已结束条目（未闭合的不计入驻留分布）',
+            tip: (value, count, share) => [`延迟 ${value} 周期`, `${fmtInt(count)} 条`, `占已结束条目 ${(share * 100).toFixed(1)}%`].join('\n'),
             note: (kinds, shown) => `共 ${kinds} 种延迟，这里取出现次数最多的 ${shown} 种`,
           }),
           distributionMetrics(stats, '条'),
@@ -314,20 +314,16 @@ function renderPipeline(state: PipelineState): void {
   }
 
   let items = 0;
-  let completed = 0;
-  let aborted = 0;
+  let closed = 0;
   let open = 0;
-  let orphan = 0;
   let crossDomain = 0;
   let bubbles = 0;
   let cycles = 0;
   let widest: { track: string; start: number; end: number; length: number } | null = null;
   for (const track of tracks) {
     items += track.items.length;
-    completed += track.completed;
-    aborted += track.aborted;
+    closed += track.closed;
     open += track.open;
-    orphan += track.orphan;
     bubbles += track.bubbles.length;
     cycles += Math.max(0, track.lastCycle - track.firstCycle + 1);
     for (const item of track.items) if (item.crossDomain) crossDomain += 1;
@@ -341,7 +337,7 @@ function renderPipeline(state: PipelineState): void {
   overview.body.append(
     el('div', { class: 'stat-row' }, [
       statTile('流水级', countLabel(tracks.length), `域 ${[...new Set(tracks.map((t) => t.domain))].join(' · ')}`),
-      statTile('在飞条目', countLabel(items), `${completed} 完成 · ${aborted} 撤销 · ${open} 未闭合`),
+      statTile('在飞条目', countLabel(items), `${closed} 已结束 · ${open} 未闭合`),
       statTile(
         '占用率',
         cycles > 0 ? `${(((cycles - bubbles) / cycles) * 100).toFixed(1)}%` : '—',
@@ -351,7 +347,6 @@ function renderPipeline(state: PipelineState): void {
         ? statTile('最长气泡', `${countLabel(widest.length)} 周期`, `${widest.track} · ${widest.start}–${widest.end}`)
         : statTile('最长气泡', '—', '没有气泡'),
       statTile('跨域条目', countLabel(crossDomain), '不计入周期延迟分布（§6.5）'),
-      statTile('孤儿条目', countLabel(orphan), '没有匹配的在飞条目'),
     ]),
   );
   container.append(overview.root);

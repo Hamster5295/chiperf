@@ -1,6 +1,6 @@
 # @chiperf/parser
 
-chiperf 1.0 的 TypeScript 实现（Bun 工具链）。规范见 [`../../docs/spec.md`](../../docs/spec.md)。
+chiperf 2.0 的 TypeScript 实现（Bun 工具链）。规范见 [`../../docs/spec.md`](../../docs/spec.md)。
 
 ## 用法
 
@@ -31,8 +31,8 @@ const trace3 = parser.finish();
 | §6 时间模型 | 每域 `(cycle, phase)`；`at=` 单条覆盖；跨域锚定；clk-free 模式 |
 | §7 事件 | 7 种记录 + `dom=`/`at=`/`async=`/`note=` 属性 + 未知属性忽略 |
 | §8 指令 | `@meta` / `@domain` / `@end`；未知指令忽略 |
-| §9 派生量 | 计数器、数值、状态机、在飞条目、占用度、气泡、延迟、`latency_time`、区间差 |
-| §10 鲁棒性 | 前缀封闭；未知/非法/语义异常三档处理；全部 14+ 诊断码 |
+| §9 派生量 | 计数器、数值、状态机、在飞条目（= 该级持有同一个值的区间）、占用度、气泡、驻留、`latency_time`、区间差 |
+| §10 鲁棒性 | 前缀封闭；未知/非法/语义异常三档处理；全部 15+ 诊断码（含 `pip_legacy_direction`） |
 | §13 一致性 | 写入者/解析器清单（核心层 MUST、派生层 SHOULD） |
 
 ### 相对规范的补充（规范要求但未命名，或实现细节）
@@ -61,7 +61,7 @@ const trace3 = parser.finish();
 | `src/value.ts` | 值扫描与类型化（§4.3–§4.5） |
 | `src/lexer.ts` | 注释剥除、字段切分、`at=` 值规则（§4.1 / §5.1） |
 | `src/parse.ts` | 记录分派、校验、位置推导、诊断（§5–§7 / §10） |
-| `src/derive.ts` | 在飞条目、占用度、气泡、延迟、状态机、计数器（§9） |
+| `src/derive.ts` | 在飞条目（保持型取值区间）、占用度、气泡、驻留、状态机、计数器（§9） |
 | `src/selectors.ts` | 只读查询（`stateAt` / `occupancyAt` / `latencyStats` / `equalRuns` / `eventCounters` …） |
 | `src/inflate.ts` | DEFLATE/gzip 解码（§3.1 / §10.6） |
 | `src/gzip.ts` | `.chiperf.gz` 容器层 |
@@ -73,7 +73,7 @@ bun test        # 99 个用例，含：
 bunx tsc --noEmit
 ```
 
-- **一致性**：`test/spec-conformance.test.ts` 断言 `docs/examples.md` 里公开的每一项数字（事件数、诊断、每周期 seq、60 格占用度、延迟、计数器、状态机跳转、异步标记）。
+- **一致性**：`test/spec-conformance.test.ts` 断言 `docs/examples.md` 里公开的每一项数字（事件数、诊断、每周期 seq、60 格占用度、驻留、计数器、状态机跳转、异步标记）。
 - **前缀封闭性**：对 7 个语料的**每一个行边界前缀**都做一次完整解析，并核对位置与完整解析一致。
 - **流式等价**：逐字符喂入与一次性解析结果完全一致。
 - **容器恢复**：单成员/多成员 gzip、截断恢复、CRC 损坏仍交付数据。

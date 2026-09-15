@@ -94,17 +94,19 @@ describe('rv32i-pipeline.chiperf（docs/examples.md §2）', () => {
     }
   });
 
-  test('所有条目延迟均为 1 周期；2 条被冲刷；无 orphan、无未闭合', async () => {
+  test('所有条目驻留均为 1 周期；条目数 = 已结束数；无未闭合', async () => {
     const trace = await loadAsync('rv32i-pipeline');
+    // v2.0 起没有"完成/撤销"之分：被后续记录改掉的条目一律算结束，
+    // 所以旧模型里那 2 条 X（冲刷）的驻留也进延迟分布（各 1 周期）
     for (const name of ['core.if', 'core.id', 'core.ex', 'core.mem', 'core.wb']) {
       const t = track(trace, name);
       expect(`${name} latencies=${[...new Set(t.latencies)].join(',')}`).toBe(`${name} latencies=1`);
-      expect(t.orphan).toBe(0);
       expect(t.open).toBe(0);
+      expect(t.closed).toBe(t.items.length);
     }
-    expect(track(trace, 'core.if').aborted).toBe(1);
-    expect(track(trace, 'core.id').aborted).toBe(1);
-    expect(track(trace, 'core.ex').aborted).toBe(0);
+    expect(track(trace, 'core.if').closed).toBe(6);
+    expect(track(trace, 'core.id').closed).toBe(5);
+    expect(track(trace, 'core.ex').closed).toBe(4);
   });
 
   test('计数器终值', async () => {
@@ -147,7 +149,6 @@ describe('multiclk.chiperf（docs/examples.md §3）', () => {
     expect(trace.domains.get('core')!.cycles).toBe(2);
     expect(trace.domains.get('mem')!.cycles).toBe(4);
     expect(countOf(trace, 'cross_domain')).toBe(1);
-    expect(countOf(trace, 'orphan_exit')).toBe(0);
   });
 
   test('同名不同域的追踪对象彼此独立（spec §7 追踪键）', async () => {
@@ -163,8 +164,8 @@ describe('multiclk.chiperf（docs/examples.md §3）', () => {
     const item = track(trace, 'core.l2').items[0]!;
     expect(item.enter.domain).toBe('core');
     expect(item.enter.cycle).toBe(1);
-    expect(item.exit!.domain).toBe('mem');
-    expect(item.exit!.cycle).toBe(2);
+    expect(item.close!.domain).toBe('mem');
+    expect(item.close!.cycle).toBe(2);
     expect(item.crossDomain).toBe(true);
     expect(item.latencyCycles).toBeNull();
     // core 声明了 1.0ns，mem 由 800MHz 换算得 1.25ns（spec §8.2）
@@ -192,7 +193,7 @@ describe('postprocess.chiperf（docs/examples.md §4）', () => {
 
   test('at= 的相位缺省为 p', async () => {
     const trace = await loadAsync('postprocess');
-    const id = trace.records.find((r) => r.kind === 'pip' && r.track === 'ID' && r.dir === 'I')!;
+    const id = trace.records.find((r) => r.kind === 'pip' && r.track === 'ID' && r.value !== null)!;
     expect(`${id.pos.cycle}${id.pos.phase}`).toBe('2p');
   });
 
@@ -247,7 +248,7 @@ describe('faults.chiperf（docs/examples.md §6）', () => {
 
   test('语义异常各 1 次（含 async 误用与域拼写）', async () => {
     const trace = await loadAsync('faults');
-    for (const code of ['orphan_exit', 'redundant_edge', 'negative_total', 'self_transition', 'undeclared_domain', 'async_on_clk']) {
+    for (const code of ['redundant_edge', 'negative_total', 'self_transition', 'undeclared_domain', 'async_on_clk']) {
       expect(`${code}=${countOf(trace, code)}`).toBe(`${code}=1`);
     }
   });
@@ -259,9 +260,11 @@ describe('faults.chiperf（docs/examples.md §6）', () => {
     const clk = trace.records.filter((r) => r.kind === 'clk');
     expect(clk.length).toBe(6);
     expect(clk.every((c) => c.async === false)).toBe(true);
-    // orphan 出队不伪造配对，也不进入延迟分布
-    expect(latencyStats(track(trace, 'IF')).count).toBe(0);
-    expect(track(trace, 'IF').orphan).toBe(1);
+    // 那条孤立的出队记录在新模型里就是"该级被设成空"：只有气泡，没有条目
+    const ifTrack = track(trace, 'IF');
+    expect(latencyStats(ifTrack).count).toBe(0);
+    expect(ifTrack.items.length).toBe(0);
+    expect(ifTrack.bubbles).toEqual([1]);
   });
 });
 
@@ -278,9 +281,8 @@ describe('truncated.chiperf（docs/examples.md §7）', () => {
     const trace = await loadAsync('truncated');
     const id = track(trace, 'ID');
     expect(id.open).toBe(1);
-    expect(id.items[0]!.closed).toBeNull();
-    expect(id.items[0]!.exit).toBeNull();
-    expect(track(trace, 'IF').completed).toBe(1);
+    expect(id.items[0]!.close).toBeNull();
+    expect(track(trace, 'IF').closed).toBe(1);
   });
 });
 
@@ -290,29 +292,32 @@ describe('future-version.chiperf（docs/examples.md §8）', () => {
     expect(() => parseChiperf(text)).toThrow(/主版本/);
   });
 
-  test('显式忽略版本时才按 1.x 解析', async () => {
+  test('显式忽略版本时才强行解析', async () => {
     const text = await Bun.file(join(EXAMPLES, 'future-version.chiperf')).text();
     const trace = parseChiperf(text, { ignoreVersion: true });
     expect(trace.records.length).toBe(2);
     expect(trace.endSeen).toBe(true);
-    expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: true });
+    expect(trace.version).toMatchObject({ major: 3, minor: 0, explicit: true });
   });
 });
 
 describe('§9.4 延迟统计（中位 / 方差）', () => {
-  /** 造一条只有一个轨道 T 的轨迹：入都在周期 1，出按给定的延迟落在各自周期 */
+  /**
+   * 造一条只有一个轨道 T 的轨迹：第 i 条在周期 c 起持有自己的值、c+latency 拍被设成 bubble。
+   * 保持型语义下"同一拍只能持有一个值"，所以条目按 (latency + 1) 拍依次排开、互不重叠。
+   */
   const traceWithLatencies = (latencies: number[]): Trace => {
-    const lines = ['chiperf 1.0', '[clk] p'];
-    latencies.forEach((_, index) => lines.push(`[pip] "T", I, 0x${(index + 10).toString(16)}`));
-    lines.push('[clk] n');
-    const max = Math.max(...latencies);
-    for (let cycle = 2; cycle <= 1 + max; cycle++) {
-      lines.push('[clk] p');
-      latencies.forEach((latency, index) => {
-        if (latency === cycle - 1) lines.push(`[pip] "T", O, 0x${(index + 10).toString(16)}`);
-      });
-      lines.push('[clk] n');
-    }
+    const plan = new Map<number, string[]>();
+    const at = (cycle: number, line: string) => plan.set(cycle, [...(plan.get(cycle) ?? []), line]);
+    let cycle = 1;
+    latencies.forEach((latency, index) => {
+      const tag = `0x${(index + 10).toString(16)}`;
+      at(cycle, `[pip] "T", ${tag}`);
+      at(cycle + latency, '[pip] "T", bubble');
+      cycle += latency + 1;
+    });
+    const lines = ['chiperf 2.0'];
+    for (let c = 1; c <= cycle; c++) lines.push('[clk] p', ...(plan.get(c) ?? []), '[clk] n');
     lines.push('@end');
     return parseChiperf(`${lines.join('\n')}\n`);
   };
@@ -340,7 +345,7 @@ describe('§9.4 延迟统计（中位 / 方差）', () => {
   });
 
   test('没有已完成条目时返回全 0 而不是 NaN', () => {
-    const trace = parseChiperf('chiperf 1.0\n[clk] p\n[pip] "T", I, 0xa\n[clk] n\n@end\n');
+    const trace = parseChiperf('chiperf 2.0\n[clk] p\n[pip] "T", 0xa\n[clk] n\n@end\n');
     const stats = latencyStats(track(trace, 'T'));
     expect(stats).toMatchObject({ count: 0, min: 0, max: 0, avg: 0, median: 0, variance: 0, histogram: [] });
     expect(Number.isNaN(stats.variance)).toBe(false);
@@ -378,7 +383,7 @@ describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
     expect(domain.periodNs).toBe(1);
     expect(domain.declared).toBe(true);
     expect(trace.meta['design']).toContain('rst-demo');
-    expect(trace.version.minor).toBe(1);
+    expect(trace.version.minor).toBe(0);
     // 沿数与记录范围按复位后的窗口重算；周期号不重编（新窗口从第 3 个周期开始）
     expect(domain.posEdges).toBe(1);
     expect(domain.negEdges).toBe(1);
@@ -393,18 +398,19 @@ describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
     expect(trace.diagnostics[0]!.message).toContain('丢弃此前 8 条');
   });
 
-  test('复位后关闭一个被丢弃的条目 → orphan_exit（窗口内确实匹配不到）', () => {
+  test('复位后把该级设成空：窗口内没有条目，只有一个气泡（不再有 orphan_exit）', () => {
     const trace = parseChiperf(
-      ['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '[rst]', '[clk] p', '[pip] "T", O, 0xa', '[clk] n', '@end', ''].join('\n'),
+      ['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[rst]', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
     );
     expect(trace.records.length).toBe(3);
-    const item = track(trace, 'T').items[0]!;
-    expect(item.orphan).toBe(true);
-    expect(countOf(trace, 'orphan_exit')).toBe(1);
+    const t = track(trace, 'T');
+    expect(t.items.length).toBe(0);
+    expect(t.bubbles).toEqual([2]); // 周期号不重编：复位后第一条 [clk] p 就是周期 2
+    expect([...trace.diagnosticCounts]).toEqual([['rst_boundary', 1]]);
   });
 
   test('[rst] 不接受任何参数', () => {
-    const trace = parseChiperf(['chiperf 1.1', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
+    const trace = parseChiperf(['chiperf 2.0', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
     expect(trace.records.length).toBe(1);
     expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
   });
@@ -418,14 +424,14 @@ describe('连续空泡段长度（§9.4 气泡 + describeSamples）', () => {
    */
   const trace = parseChiperf(
     [
-      'chiperf 1.1',
-      '[clk] p', '[pip] "T", I, 0xa', '[clk] n',
-      '[clk] p', '[pip] "T", O, 0xa', '[clk] n',
+      'chiperf 2.0',
+      '[clk] p', '[pip] "T", 0xa', '[clk] n',
+      '[clk] p', '[pip] "T", bubble', '[clk] n',
       '[clk] p', '[clk] n',
       '[clk] p', '[clk] n',
       '[clk] p', '[clk] n',
-      '[clk] p', '[pip] "T", I, 0xb', '[clk] n',
-      '[clk] p', '[pip] "T", O, 0xb', '[clk] n',
+      '[clk] p', '[pip] "T", 0xb', '[clk] n',
+      '[clk] p', '[pip] "T", bubble', '[clk] n',
       '@end',
       '',
     ].join('\n'),
@@ -449,14 +455,14 @@ describe('连续空泡段长度（§9.4 气泡 + describeSamples）', () => {
   });
 
   test('全程有内容时没有气泡段（未闭合条目一直占着）', () => {
-    const dense = parseChiperf(['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '@end', ''].join('\n'));
+    const dense = parseChiperf(['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '@end', ''].join('\n'));
     expect(bubbleStats(track(dense, 'T'))).toMatchObject({ count: 0, histogram: [] });
   });
 
-  test('以关闭记录收尾的轨道，最后一拍按 §9.4 算气泡', () => {
-    // 关闭记录落在第 2 拍：条目占的是 [1, 2)，所以第 2 拍该轨道没有在飞内容
+  test('以结束记录收尾的轨道，最后一拍按 §9.4 算气泡', () => {
+    // 结束记录落在第 2 拍：条目占的是 [1, 2)，所以第 2 拍该轨道没有内容
     const closed = parseChiperf(
-      ['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '[clk] p', '[pip] "T", O, 0xa', '[clk] n', '@end', ''].join('\n'),
+      ['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
     );
     const t2 = track(closed, 'T');
     expect(t2.bubbleRanges).toEqual([{ start: 2, end: 2 }]);

@@ -248,7 +248,7 @@ function recordValue(r: EventRecord): string {
     case 'val':
       return fmtValue(r.value);
     case 'pip':
-      return r.tag ? `${r.dir} ${fmtValue(r.tag)}` : r.dir;
+      return r.value ? fmtValue(r.value) : 'bubble';
     case 'fsm':
       return fmtValue(r.state);
     case 'evt':
@@ -280,7 +280,7 @@ function recordDetail(r: EventRecord): [string, string][] {
       rows.push(['数值轨', r.name], ['取值', fmtValue(r.value)], ['原始记号', r.value.raw]);
       break;
     case 'pip':
-      rows.push(['轨道', r.track], ['方向', r.dir], ['标记', r.tag ? fmtValue(r.tag) : DASH]);
+      rows.push(['轨道', r.track], ['新值', r.value ? fmtValue(r.value) : 'bubble（该级变空）']);
       break;
     case 'fsm':
       rows.push(['状态机', r.name], ['状态', fmtValue(r.state)], ['原始记号', r.state.raw]);
@@ -333,7 +333,7 @@ function recordDataset(trace: Trace): Dataset {
       },
       { key: 'async', label: 'async', width: 66, cell: (r) => (r.async ? chip('async', 'var(--warn)', 1) : { t: DASH, sort: 0 }) },
       { key: 'name', label: '名字/轨道', width: 168, cell: (r) => ({ t: recordName(r), mono: true }) },
-      { key: 'value', label: '值/方向/状态', width: 178, cell: (r) => ({ t: recordValue(r), mono: true }) },
+      { key: 'value', label: '值/状态', width: 178, cell: (r) => ({ t: recordValue(r), mono: true }) },
       { key: 'raw', label: '原始行', width: 330, cell: (r) => ({ t: clip(r.raw, 90), full: r.raw, mono: true }) },
     ],
     detail: (r) => recordDetail(r),
@@ -346,21 +346,19 @@ function itemDetail(item: PipelineItem): [string, string][] {
   return [
     ['轨道', item.track],
     ['域', item.enter.domain],
-    ['标记', item.tag ? `${fmtValue(item.tag)}（原始 ${item.tag.raw}）` : DASH],
-    ['入位置', fmtPosition(item.enter)],
-    ['出位置', item.exit ? fmtPosition(item.exit) : DASH],
-    ['撤销位置', item.abort ? fmtPosition(item.abort) : DASH],
-    ['结局', item.closed === 'O' ? '完成（O）' : item.closed === 'X' ? '撤销（X）' : '文件结束时仍未闭合'],
-    ['延迟', item.latencyCycles !== null ? `${item.latencyCycles} 周期` : DASH],
-    ['时间延迟', item.latencyNs !== null ? fmtNs(item.latencyNs) : DASH],
-    ['关闭锚定周期', item.closeAnchorCycle !== null ? String(item.closeAnchorCycle) : DASH],
+    ['持有值', item.value ? `${fmtValue(item.value)}（原始 ${item.value.raw}）` : DASH],
+    ['起始位置', fmtPosition(item.enter)],
+    ['结束位置', item.close ? fmtPosition(item.close) : DASH],
+    ['状态', item.close ? '已结束（被后续记录改掉）' : '文件结束时仍持有至今'],
+    ['驻留周期', item.latencyCycles !== null ? `${item.latencyCycles} 周期` : DASH],
+    ['时间差', item.latencyNs !== null ? fmtNs(item.latencyNs) : DASH],
+    ['结束锚定周期', item.closeAnchorCycle !== null ? String(item.closeAnchorCycle) : DASH],
     ['跨域', item.crossDomain ? '是' : '否'],
-    ['入记录异步', item.async ? '是' : '否'],
-    ['出记录异步', item.closeAsync ? '是' : '否'],
-    ['orphan', item.orphan ? '是（没有匹配的入记录）' : '否'],
-    ['入行号', String(item.enterLine)],
-    ['出行号', item.closeLine !== null ? String(item.closeLine) : DASH],
-    ['入序号 / 出序号', `${item.enterSeq} / ${item.closeSeq ?? DASH}`],
+    ['起始记录异步', item.async ? '是' : '否'],
+    ['结束记录异步', item.closeAsync ? '是' : '否'],
+    ['起始行号', String(item.enterLine)],
+    ['结束行号', item.closeLine !== null ? String(item.closeLine) : DASH],
+    ['起始序号 / 结束序号', `${item.enterSeq} / ${item.closeSeq ?? DASH}`],
   ];
 }
 
@@ -368,7 +366,7 @@ function itemDataset(trace: Trace): Dataset {
   return defineDataset<ItemRow>({
     id: 'items',
     title: '轨道条目',
-    hint: '每条 pip 条目一行；占用区间是半开区间 [enter, close)',
+    hint: '每条 pip 条目一行：该级连续持有同一个值的那一段；占用区间是半开区间 [enter, close)',
     empty: '这份轨迹没有 pip 条目',
     hasDomain: true,
     defaultSort: [{ key: 'enter', dir: 1 }],
@@ -384,22 +382,22 @@ function itemDataset(trace: Trace): Dataset {
       { key: 'track', label: '轨道', width: 130, mono: true, cell: (r) => ({ t: r.item.track, mono: true, color: colorFor(r.item.track) }) },
       { key: 'domain', label: '域', width: 92, mono: true, cell: (r) => ({ t: r.item.enter.domain, mono: true }) },
       {
-        key: 'tag',
-        label: '标记',
-        width: 140,
+        key: 'value',
+        label: '持有值',
+        width: 160,
         mono: true,
-        cell: (r) => ({ t: r.item.tag ? fmtValue(r.item.tag) : DASH, mono: true, sort: r.item.tag?.text ?? null }),
+        cell: (r) => ({ t: r.item.value ? fmtValue(r.item.value) : DASH, mono: true, sort: r.item.value?.text ?? null }),
       },
       { key: 'enter', label: '入周期', width: 84, align: 'right', cell: (r) => numeric(String(r.item.enter.cycle), r.item.enter.cycle) },
       {
-        key: 'exit',
-        label: '出周期',
-        width: 92,
+        key: 'close',
+        label: '结束周期',
+        width: 96,
         align: 'right',
         cell: (r) => {
-          const close = r.item.exit ?? r.item.abort;
+          const close = r.item.close;
           if (!close) return { t: DASH, sort: null };
-          return numeric(`${close.cycle}${r.item.exit ? '' : ' 撤'}`, close.cycle);
+          return numeric(`${close.cycle}${r.item.crossDomain ? ` (${close.domain})` : ''}`, close.cycle);
         },
       },
       {
@@ -414,15 +412,10 @@ function itemDataset(trace: Trace): Dataset {
         },
       },
       {
-        key: 'closed',
-        label: '结局',
+        key: 'state',
+        label: '状态',
         width: 82,
-        cell: (r) =>
-          r.item.closed === 'O'
-            ? chip('完成', 'var(--ok)', 0)
-            : r.item.closed === 'X'
-              ? chip('撤销', 'var(--err)', 1)
-              : chip('未闭合', 'var(--warn)', 2),
+        cell: (r) => (r.item.close ? chip('已结束', 'var(--ok)', 0) : chip('未闭合', 'var(--warn)', 2)),
       },
       { key: 'cross', label: '跨域', width: 66, cell: (r) => yesNo(r.item.crossDomain) },
       {
@@ -430,11 +423,10 @@ function itemDataset(trace: Trace): Dataset {
         label: '异步',
         width: 74,
         cell: (r) => {
-          const text = r.item.async && r.item.closeAsync ? '入+出' : r.item.async ? '入' : r.item.closeAsync ? '出' : '';
+          const text = r.item.async && r.item.closeAsync ? '起+止' : r.item.async ? '起' : r.item.closeAsync ? '止' : '';
           return text === '' ? { t: DASH, sort: 0 } : chip(text, 'var(--warn)', 1);
         },
       },
-      { key: 'orphan', label: 'orphan', width: 76, cell: (r) => yesNo(r.item.orphan) },
     ],
     detail: (r) => itemDetail(r.item),
   });

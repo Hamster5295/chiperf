@@ -45,6 +45,8 @@ export class Deriver {
   readonly atDomains = new Set<string>();
   /** (域, 名字) → 用过的语义类型，用于 name_reused */
   private readonly nameKinds = new Map<string, Set<string>>();
+  /** 轨道名 → 该级**当前**持有的设置（值或气泡），用于判断"值变了没有" */
+  private readonly pipHeld = new Map<string, { key: string; item: PipelineItem | null }>();
 
   constructor(private readonly ctx: DeriveContext) {}
 
@@ -174,100 +176,71 @@ export class Deriver {
     track.samples.push({ value: rec.payload, pos: rec.pos, async: rec.async, line: rec.line });
   }
 
+  /**
+   * `[pip]`：把该级设成一个值（或气泡）。**保持型** —— 没有记录就保持上一值（spec §7.4）。
+   *
+   * 值变了就是"上一条目结束、新条目开始"；重复写同一个值是空操作（该级一直持有它，
+   * 这正是 v1.x 的 `duplicate_tag` 在新模型里不需要存在的原因）。气泡段不进 `items`：
+   * 占用度与气泡由"条目区间 + 活跃区间"的差推出（与 §9.4 的旧口径逐格一致）。
+   */
   private applyPip(rec: Extract<EventRecord, { kind: 'pip' }>): void {
     const track = this.trackFor(rec.track, rec.pos.domain);
-    if (rec.dir === 'I') {
-      if (rec.tag !== null) {
-        const key = valueKey(rec.tag);
-        const clash = track.items.some((it) => it.closed === null && it.tag !== null && valueKey(it.tag) === key);
-        if (clash) {
-          track.duplicateTags++;
-          this.ctx.diag('duplicate_tag', rec.line, `轨道 "${rec.track}" 中已存在标记 ${formatValue(rec.tag)} 的在飞条目（匹配会取最早的一条）`);
-        }
-      }
-      track.items.push({
-        track: rec.track,
-        domain: rec.pos.domain,
-        tag: rec.tag,
-        enter: rec.pos,
-        exit: null,
-        abort: null,
-        closed: null,
-        crossDomain: false,
-        latencyCycles: null,
-        latencyNs: null,
-        closeAnchorCycle: null,
-        enterSeq: rec.seq,
-        closeSeq: null,
-        orphan: false,
-        async: rec.async,
-        closeAsync: false,
-        enterLine: rec.line,
-        closeLine: null,
-      });
-      return;
-    }
+    // 活跃区间按**记录**算（spec §9.4 的 track_first/last_cycle）；跨域记录锚到轨道绑定域的当前周期
+    const anchor = rec.pos.domain === track.domain ? rec.pos.cycle : this.ctx.cyclesOf(track.domain);
+    track.firstCycle = Math.min(track.firstCycle, anchor);
+    track.lastCycle = Math.max(track.lastCycle, anchor);
 
-    // O / X：按 spec §7.4 匹配
-    let index = -1;
-    if (track.items.length > 0) {
-      if (rec.tag === null) {
-        index = 0;
+    const key = valueKey(rec.value); // null ⇒ '∅'（气泡）
+    const held = this.pipHeld.get(rec.track);
+    if (held !== undefined && held.key === key) return; // 同一个值再写一次：仍在保持，不是新条目
+
+    if (held !== undefined && held.item !== null) {
+      const item = held.item;
+      item.close = rec.pos;
+      item.closeSeq = rec.seq;
+      item.closeAsync = rec.async;
+      item.closeLine = rec.line;
+      item.crossDomain = rec.pos.domain !== item.enter.domain;
+      if (!item.crossDomain) {
+        item.latencyCycles = rec.pos.cycle - item.enter.cycle;
+        item.closeAnchorCycle = rec.pos.cycle;
       } else {
-        const key = valueKey(rec.tag);
-        index = track.items.findIndex((it) => it.closed === null && it.tag !== null && valueKey(it.tag) === key);
+        // 跨域条目：不给周期延迟（spec §6.5），改用时间延迟或两端位置
+        const a = this.ctx.domainInfo(item.enter.domain);
+        const b = this.ctx.domainInfo(rec.pos.domain);
+        if (a.periodNs !== undefined && b.periodNs !== undefined) {
+          item.latencyNs = (rec.pos.cycle - 1) * b.periodNs - (item.enter.cycle - 1) * a.periodNs;
+        }
+        // 占用度按 enter 域统计：结束时刻锚定到 enter 域当前的周期（spec §9.4）
+        item.closeAnchorCycle = this.ctx.cyclesOf(item.enter.domain);
+        this.ctx.diag('cross_domain', rec.line, `轨道 "${rec.track}" 的条目跨域：起在 "${item.enter.domain}" 周期 ${item.enter.cycle}，止在 "${rec.pos.domain}" 周期 ${rec.pos.cycle}`);
       }
+      track.items[track.items.length - 1] = item;
     }
 
-    if (index < 0) {
-      this.ctx.diag('orphan_exit', rec.line, `轨道 "${rec.track}" 的 ${rec.dir} 没有可匹配的在飞条目${rec.tag ? `（标记 ${formatValue(rec.tag)}）` : ''}`);
-      track.items.push({
-        track: rec.track,
-        domain: rec.pos.domain,
-        tag: rec.tag,
-        enter: rec.pos,
-        exit: rec.dir === 'O' ? rec.pos : null,
-        abort: rec.dir === 'X' ? rec.pos : null,
-        closed: rec.dir,
-        crossDomain: false,
-        latencyCycles: null,
-        latencyNs: null,
-        closeAnchorCycle: rec.pos.cycle,
-        enterSeq: rec.seq,
-        closeSeq: rec.seq,
-        orphan: true,
-        async: rec.async,
-        closeAsync: rec.async,
-        enterLine: rec.line,
-        closeLine: rec.line,
-      });
-      track.orphan++;
+    if (rec.value === null) {
+      this.pipHeld.set(rec.track, { key, item: null }); // 气泡段
       return;
     }
-
-    const item = track.items[index]!;
-    if (rec.dir === 'O') item.exit = rec.pos;
-    else item.abort = rec.pos;
-    item.closed = rec.dir;
-    item.closeAsync = rec.async;
-    item.closeSeq = rec.seq;
-    item.closeLine = rec.line;
-    item.crossDomain = rec.pos.domain !== item.enter.domain;
-
-    if (!item.crossDomain) {
-      item.latencyCycles = rec.pos.cycle - item.enter.cycle;
-      item.closeAnchorCycle = rec.pos.cycle;
-    } else {
-      // 跨域条目：不给周期延迟（spec §6.5），改用时间延迟或两端位置
-      const a = this.ctx.domainInfo(item.enter.domain);
-      const b = this.ctx.domainInfo(rec.pos.domain);
-      if (a.periodNs !== undefined && b.periodNs !== undefined) {
-        item.latencyNs = (rec.pos.cycle - 1) * b.periodNs - (item.enter.cycle - 1) * a.periodNs;
-      }
-      // 占用度按 enter 域统计：关闭时刻锚定到 enter 域当前的周期（spec §9.4）
-      item.closeAnchorCycle = this.ctx.cyclesOf(item.enter.domain);
-      this.ctx.diag('cross_domain', rec.line, `轨道 "${rec.track}" 的条目跨域：入在 "${item.enter.domain}" 周期 ${item.enter.cycle}，出在 "${rec.pos.domain}" 周期 ${rec.pos.cycle}`);
-    }
+    const item: PipelineItem = {
+      track: rec.track,
+      domain: rec.pos.domain,
+      value: rec.value,
+      enter: rec.pos,
+      close: null,
+      crossDomain: false,
+      latencyCycles: null,
+      latencyNs: null,
+      closeAnchorCycle: null,
+      enterSeq: rec.seq,
+      closeSeq: null,
+      async: rec.async,
+      closeAsync: false,
+      enterLine: rec.line,
+      closeLine: null,
+    };
+    track.items.push(item);
+    this.pipHeld.set(rec.track, { key, item });
   }
 
   private trackFor(name: string, domain: string): TrackInfo {
@@ -282,15 +255,11 @@ export class Deriver {
         occupancy: new Map(),
         arrivals: new Map(),
         departures: new Map(),
-        aborts: new Map(),
         bubbles: [],
         bubbleRanges: [],
-        completed: 0,
-        aborted: 0,
+        closed: 0,
         open: 0,
-        orphan: 0,
         latencies: [],
-        duplicateTags: 0,
       };
       this.tracks.set(name, track);
     }
@@ -298,34 +267,31 @@ export class Deriver {
   }
 
   private finalizeTrack(track: TrackInfo): void {
-    if (track.items.length === 0) return;
+    if (!Number.isFinite(track.firstCycle)) {
+      // 轨道由记录创建，这里只可能是"记录全被 [rst] 丢弃"的极端情况
+      track.firstCycle = 0;
+      track.lastCycle = 0;
+      return;
+    }
 
-    // 第一遍：确定活跃区间与计数（占用度需要最终的 lastCycle）
+    // 计数：未闭合（文件结束时仍持有至今）与已结束条目的驻留周期
     for (const item of track.items) {
-      track.firstCycle = Math.min(track.firstCycle, item.enter.cycle);
-      track.lastCycle = Math.max(track.lastCycle, item.enter.cycle, item.closeAnchorCycle ?? item.enter.cycle);
-      if (item.closed === null) track.open++;
-      else if (item.closed === 'X') track.aborted++;
-      else if (!item.orphan) {
-        track.completed++;
+      if (item.close === null) {
+        track.open++;
+      } else {
+        track.closed++;
         if (item.latencyCycles !== null) track.latencies.push(item.latencyCycles);
+        const anchor = item.closeAnchorCycle;
+        if (anchor !== null) track.departures.set(anchor, (track.departures.get(anchor) ?? 0) + 1);
       }
       const c = item.enter.cycle;
       track.arrivals.set(c, (track.arrivals.get(c) ?? 0) + 1);
-      const anchor = item.closeAnchorCycle;
-      if (anchor !== null && item.closed !== null) {
-        if (item.closed === 'O' && !item.orphan) track.departures.set(anchor, (track.departures.get(anchor) ?? 0) + 1);
-        if (item.closed === 'X') track.aborts.set(anchor, (track.aborts.get(anchor) ?? 0) + 1);
-      }
     }
-    if (!Number.isFinite(track.firstCycle)) track.firstCycle = 0;
 
-    // 第二遍：逐周期占用度。
-    //   已闭合条目：半开区间 [enter, close)（同周期进出 ⇒ 不占任何周期）
-    //   未闭合条目：exit 缺失 ⇒ 按 spec §9.4 的 `exit 缺失` 分支，从 enter 起一直算在飞，
-    //               可观测窗口到该轨道的最后周期
+    // 逐周期占用度：已结束条目占半开区间 [enter, close)（同周期改掉 ⇒ 不占任何周期）；
+    // 未闭合条目从 enter 起一直算在飞，可观测窗口到该轨道的最后周期（spec §9.4）
     for (const item of track.items) {
-      if (item.closed === null) {
+      if (item.close === null) {
         for (let c = item.enter.cycle; c <= track.lastCycle; c++) {
           track.occupancy.set(c, (track.occupancy.get(c) ?? 0) + 1);
         }

@@ -1,18 +1,18 @@
-chiperf 1.0
+chiperf 2.0
 @meta tool="chiperf-postproc" note="后处理工具输出的轨迹：没有 clk 记录，时间轴完全由 at= 给出"
 # 位置全部显式：cycle + 可选相位字母（缺省 p）。
 # 解析器不得因缺少 clk 记录而拒绝该文件，也不得让 at= 影响域的时钟状态。
 
 [val] "PC", 32'h8000_0000, at=1p
 [cnt] "Retired", at=1p
-[pip] "IF", I, 0x80000000, at=1p
+[pip] "IF", 0x80000000, at=1p
 
 [val] "PC", 32'h8000_0004, at=2p
-[pip] "IF", O, 0x80000000, at=2p
-[pip] "ID", I, 0x80000000, at=2
+[pip] "IF", bubble, at=2p
+[pip] "ID", 0x80000000, at=2
 
 [val] "PC", 32'h8000_0008, at=3p
-[pip] "ID", O, 0x80000000, at=3p
+[pip] "ID", bubble, at=3p
 [cnt] "Retired", at=3p
 
 # 同一条记录也可以指定相位 n，或另一个域

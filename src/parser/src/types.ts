@@ -43,8 +43,6 @@ export interface ScalarValue {
   unit?: string;
 }
 
-export type PipDirection = 'I' | 'O' | 'X';
-
 interface RecordBase {
   /** 源文件中的 1-based 行号 */
   line: number;
@@ -80,8 +78,11 @@ export interface ValRecord extends RecordBase {
 export interface PipRecord extends RecordBase {
   kind: 'pip';
   track: string;
-  dir: PipDirection;
-  tag: ScalarValue | null;
+  /**
+   * 该级此后**持有**的值；`null` = 气泡（记录写的是保留字 `bubble`）。
+   * 没有 `[pip]` 记录的那一拍保持上一值（spec §7.4）。
+   */
+  value: ScalarValue | null;
 }
 
 export interface FsmRecord extends RecordBase {
@@ -115,8 +116,7 @@ export type EventKind = EventRecord['kind'];
 
 /** 语义诊断码（spec §10.4）。解析器只报告，不修改数据。 */
 export type DiagnosticCode =
-  | 'orphan_exit'
-  | 'duplicate_tag'
+  | 'pip_legacy_direction'
   | 'undeclared_domain'
   | 'at_clk_conflict'
   | 'async_on_clk'
@@ -245,34 +245,35 @@ export interface ResetMark {
   droppedRecords: number;
 }
 
-/** 在飞条目（spec §7.4 / §9.4） */
+/**
+ * 在飞条目（spec §7.4 / §9.4）—— 该级**连续持有同一个值**的那一段。
+ *
+ * 与 `[val]` 的保持语义同构：值变了就是新条目，值没变就一直占着。
+ * "条目结束"= 该级被设成别的值（或气泡）的那条记录。
+ */
 export interface PipelineItem {
   track: string;
   domain: string;
-  tag: ScalarValue | null;
-  /** 入记录位置 */
+  /** 该条目持有的值 */
+  value: ScalarValue | null;
+  /** 起始记录位置（把该级设成此值的那条） */
   enter: Position;
-  /** 出/撤记录位置（原样保留，可能是另一个域） */
-  exit: Position | null;
-  abort: Position | null;
-  /** 关闭类型：`O` = 完成，`X` = 撤销，`null` = 文件结束时仍未闭合 */
-  closed: 'O' | 'X' | null;
+  /** 结束记录位置 = 把它改成别的值的那条记录（原样保留，可能是另一个域）；`null` = 文件结束时仍未变过 */
+  close: Position | null;
   /** 是否跨域条目（enter 与 close 的域不同） */
   crossDomain: boolean;
-  /** 同域延迟（周期差）；跨域或未闭合时为 null */
+  /** 同域驻留周期数（周期差）；跨域或未闭合时为 null */
   latencyCycles: number | null;
   /** 跨域且两端域都声明了 period 时的时间延迟（纳秒）；否则 null */
   latencyNs: number | null;
-  /** 关闭时刻在 enter 域上锚定的周期（占用度按 enter 域统计，spec §9.4） */
+  /** 结束时刻在 enter 域上锚定的周期（占用度按 enter 域统计，spec §9.4） */
   closeAnchorCycle: number | null;
-  /** 入、出记录的全局序号，便于表格排序与定位 */
+  /** 起、止记录的全局序号，便于表格排序与定位 */
   enterSeq: number;
   closeSeq: number | null;
-  /** 是否由 orphan（无匹配在飞条目）产生 */
-  orphan: boolean;
-  /** 入记录是否异步（spec §6.7） */
+  /** 起始记录是否异步（spec §6.7） */
   async: boolean;
-  /** 出/撤记录是否异步 */
+  /** 结束记录是否异步 */
   closeAsync: boolean;
   enterLine: number;
   closeLine: number | null;
@@ -289,21 +290,20 @@ export interface TrackInfo {
   lastCycle: number;
   /** 逐周期占用度（下标 = 周期号，稀疏区段为 0）；半开区间 [enter, close) */
   occupancy: Map<number, number>;
+  /** 周期 c 内"把该级设成某个值"（非气泡）的记录数 */
   arrivals: Map<number, number>;
+  /** 周期 c 内"结束掉一个条目"的记录数（即把该级从条目改成别的值的那条） */
   departures: Map<number, number>;
-  aborts: Map<number, number>;
   /** 气泡周期（占用度为 0 且在活跃区间内） */
   bubbles: number[];
   /** 气泡区间（连续气泡合并；**含两端**，与占用度的半开区间口径不同，刻意如此以便直接显示 "6–8"） */
   bubbleRanges: { start: number; end: number }[];
-  completed: number;
-  aborted: number;
+  /** 已结束（被后续记录改掉）的条目数 */
+  closed: number;
+  /** 文件结束时仍持有至今的条目数（spec §10.5 的 `open`） */
   open: number;
-  orphan: number;
-  /** 已完成条目的延迟（同域，周期） */
+  /** 已结束条目的驻留周期数（同域） */
   latencies: number[];
-  /** 两条同标记条目同时在飞 */
-  duplicateTags: number;
 }
 
 /** 瞬时事件（spec §7.6）。追踪键 = (域, 名字) */
