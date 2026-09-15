@@ -258,6 +258,25 @@ export function eventCounters(trace: Trace): CounterTrack[] {
   return out;
 }
 
+/**
+ * 把一串带取值的采样按**连续同值**切段，每段给起止下标（含端点）。
+ *
+ * 六边形块模式一段画一个六边形：两个连续的同值采样之间什么都没发生，
+ * 画成两个六边形会在中间多一条接缝，看上去像"值变了又变回来"。
+ * 同值判据用 `valueKey`（位向量按位、4 态按 4 态，spec §9.3 的比较口径），
+ * 所以 `32'h1f` 与 `8'h1f` 数值相同但位宽不同 —— 不合并。
+ */
+export function equalRuns<T extends { value: ScalarValue }>(points: readonly T[]): { from: number; to: number }[] {
+  const runs: { from: number; to: number; key: string }[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const key = valueKey(points[i]!.value);
+    const last = runs[runs.length - 1];
+    if (last && last.key === key) last.to = i;
+    else runs.push({ from: i, to: i, key });
+  }
+  return runs.map(({ from, to }) => ({ from, to }));
+}
+
 /** 同一取值是否构成"变化"（spec §9.3 的比较口径） */
 export function sameValue(a: ScalarValue | null, b: ScalarValue | null): boolean {
   return valueKey(a) === valueKey(b);

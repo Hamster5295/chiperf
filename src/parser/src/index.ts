@@ -33,6 +33,7 @@ export {
   occupancySeries,
   bubbleStats,
   describeSamples,
+  equalRuns,
   type Distribution,
   latencyStats,
   eventCounters,

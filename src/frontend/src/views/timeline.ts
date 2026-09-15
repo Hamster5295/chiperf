@@ -26,6 +26,7 @@ import type {
 } from '../../../parser/src/index.ts';
 import {
   counterTotalAt,
+  equalRuns,
   formatPosition,
   stateSegments,
   valueAt,
@@ -1552,9 +1553,10 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
           if (firstX > reg.plot.x0 + 0.5) {
             segments.push({ left: reg.plot.x0, right: firstX, value: first.value, numeric: first.numeric, unknown: first.unknown, faint: true });
           }
-          for (let index = 0; index < numeric.length; index++) {
-            const entry = numeric[index]!;
-            const next = numeric[index + 1];
+          // 连续同值的采样并成一段：中间没有变化，不该画出一条接缝（spec §9.3 的同值口径）
+          for (const run of equalRuns(numeric)) {
+            const entry = numeric[run.from]!;
+            const next = numeric[run.to + 1];
             segments.push({
               left: xOf(entry.pos, entry.async),
               right: next ? xOf(next.pos, next.async) : reg.plot.x1,
