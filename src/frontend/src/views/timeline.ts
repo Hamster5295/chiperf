@@ -1121,6 +1121,8 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     menu: pipelineMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
+      // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
+      const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
       cycleSurface(hit, reg, track.domain, ctx, (probe) =>
         [
           `轨道 ${track.name}（域 ${track.domain}）`,
@@ -1131,18 +1133,20 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       );
 
       // 气泡：该级本周期没有内容 —— 用虚线框标出来
-      for (const range of track.bubbleRanges) {
-        const left = clamp(reg.plot.scale(range.start), reg.plot.x0, reg.plot.x1);
-        const right = clamp(reg.plot.scale(range.end + 1), reg.plot.x0, reg.plot.x1);
+      // 与条目同一种形状（六边形），只是空心虚线：一眼能看出这是「占位/无内容」
+      const bubble = (start: number, end: number, inferred: boolean): void => {
+        const left = clamp(reg.plot.scale(start), reg.plot.x0, reg.plot.x1);
+        const right = clamp(reg.plot.scale(end + 1), reg.plot.x0, reg.plot.x1);
         const width = Math.max(3, right - left);
-        // 与条目同一种形状（六边形），只是空心虚线：一眼能看出这是「占位/无内容」
         const box = svgEl('path', {
           d: hexPath(left + 0.5, left + 0.5 + Math.max(2, width - 1), y + 4, y + h - 5, 4),
           fill: COLOR.bubble,
           'fill-opacity': 0.08,
           stroke: COLOR.bubble,
           'stroke-width': 1,
-          'stroke-dasharray': '4 3',
+          // 推断段与实测段靠虚线疏密区分（推断的更疏）：靠降低不透明度区分太弱，
+          // 那样"延续到末尾"就只剩个影子，等于没画
+          'stroke-dasharray': inferred ? '2 5' : '4 3',
           'stroke-linejoin': 'round',
         });
         hoverTarget(
@@ -1150,13 +1154,20 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           () =>
             [
               `气泡：${track.name}`,
-              `周期 ${range.start}${range.end > range.start ? ` – ${range.end}` : ''}（共 ${range.end - range.start + 1} 周期）`,
-              '这些周期该轨道没有在飞内容',
+              `周期 ${start}${end > start ? ` – ${end}` : ''}（共 ${end - start + 1} 周期）`,
+              inferred
+                ? `推断：第 ${track.lastCycle} 周期之后该轨道没有记录，而域 ${track.domain} 还在记录 —— 沿用"无内容"直到轨迹末尾`
+                : '这些周期该轨道没有在飞内容',
             ].join('\n'),
-          () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: range.start }),
+          () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: start }),
         );
         g.append(box);
-      }
+      };
+      for (const range of track.bubbleRanges) bubble(range.start, range.end, false);
+      // 推断的气泡尾巴：末尾已知"无内容"，且该域仍在继续（写到域自己的末周期为止，
+      // 再往后这个域根本没有记录，画出去就是编造）
+      const tailFrom = track.lastCycle + 1;
+      if ((track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd) bubble(tailFrom, domainEnd, true);
 
       const color = colorFor(track.name);
       const barH = h - 9;
@@ -1168,7 +1179,9 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         // 同域用关闭周期作锚点；跨域锚点在 enter 域上（spec §9.4），不再叠加出记录的相位；
         // 未闭合只画到轨道末周期，**不伪造**退出周期
         const anchor = item.closeAnchorCycle;
-        const endCycle = open || anchor === null ? track.lastCycle : anchor;
+        // 未闭合条目：内容一直在飞，画到该域末尾（不伪造退出周期，只是把已知状态延续下去）。
+        // 这里用的是**半开**末端（与 anchor 同一口径）：要覆盖到第 domainEnd 周期，末端就得是 domainEnd + 1
+        const endCycle = open || anchor === null ? domainEnd + 1 : anchor;
         const endShift = open || anchor === null || item.crossDomain ? 0 : phaseOffset(item.exit ?? item.abort ?? item.enter, item.closeAsync);
         const right = Math.max(reg.plot.x0 + 1, Math.min(reg.plot.scale(endCycle + endShift), reg.plot.x1));
         const x = clamp(enterX, reg.plot.x0, reg.plot.x1 - 1);
@@ -1265,7 +1278,7 @@ function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
       item.orphan ? '孤立条目（没有可匹配的在飞条目）' : item.closed === 'O' ? '完成（O）' : item.closed === 'X' ? '冲刷 / 撤销（X）' : '未闭合'
     }`,
   );
-  if (open) lines.push(`未闭合：只画到轨道末周期 ${track.lastCycle}，不伪造退出周期`);
+  if (open) lines.push(`未闭合：内容仍在飞，画到该域末尾（第 ${track.lastCycle} 周期之后没有记录，不伪造退出周期）`);
   lines.push(`跨域 ${item.crossDomain ? '是' : '否'} · 入 seq ${item.enterSeq}${item.closeSeq !== null ? ` · 出 seq ${item.closeSeq}` : ''}`);
   return lines.join('\n');
 }
