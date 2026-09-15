@@ -29,6 +29,7 @@ import {
   formatPosition,
   stateSegments,
   valueAt,
+  valueKey,
   type CounterTrack,
   type FsmTrack,
 } from '../../../parser/src/index.ts';
@@ -108,6 +109,11 @@ const MIN_PLOT_WIDTH = 24;
 /** 每个泳道的条目 / 标记 / 文本上限 */
 const MAX_ITEMS = 4000;
 const MAX_MARKS = 2000;
+/**
+ * **每条泳道**的条目文本上限。
+ * 曾经是全局一份：几千条记录的轨迹里，靠前的泳道（IF/ID/SG）把额度吃完，
+ * 后面的泳道（EX/MEM/WB）就一个字都画不出来 —— 看起来像"没有数值"。
+ */
 const TAG_BUDGET = 1200;
 /** 低于这个像素密度就不画每周期柱（改用聚合折线） */
 const BAR_MIN_PX = 2;
@@ -268,7 +274,6 @@ let unsub: (() => void) | null = null;
 let registry: Registry | null = null;
 let hoverSel: Selection = null;
 let lastHoverKey = '';
-let tagBudget = 0;
 /** 上一次量到的滚动容器宽度（px）：重建时旧容器已摘除，用它保持「适应宽度」稳定 */
 let chartAvail = 0;
 /** 上一次量到的视图容器宽度（px）：ResizeObserver 用它判断是否真的变宽/变窄 */
@@ -1192,6 +1197,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     menu: pipelineMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
+      let tagsDrawn = 0;
       // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
       const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
       cycleSurface(hit, reg, track.domain, ctx, (probe) =>
@@ -1240,9 +1246,9 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       const tailFrom = track.lastCycle + 1;
       if ((track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd) bubble(tailFrom, domainEnd, true);
 
-      const color = colorFor(track.name);
       const barH = h - 9;
       const barY = y + 4;
+      const color = colorFor(track.name);
       for (const item of shown) {
         const open = item.closed === null;
         const aborted = item.closed === 'X';
@@ -1313,8 +1319,8 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             svgEl('circle', { cx: x, cy: barY + barH / 2, r: 2.6, fill: 'var(--surface)', stroke: color, 'stroke-width': 1.2, 'pointer-events': 'none' }),
           );
         }
-        if (w >= 30 && tagBudget > 0 && item.tag) {
-          tagBudget--;
+        if (w >= 30 && tagsDrawn < TAG_BUDGET && item.tag) {
+          tagsDrawn++;
           g.append(
             svgEl('text', {
               x: x + 3,
@@ -2087,11 +2093,9 @@ function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
 function paint(host: HTMLElement, ctx: ViewContext): void {
   const before = chartAvail;
   clear(host);
-  tagBudget = TAG_BUDGET;
   build(host, ctx);
   if (fitWidth && Math.abs(chartAvail - before) > 1) {
     clear(host);
-    tagBudget = TAG_BUDGET;
     build(host, ctx);
   }
 }
@@ -2192,7 +2196,6 @@ export const timelineView: View = {
     hoverSel = null;
     lastHoverKey = '';
     chartAvail = 0;
-    tagBudget = TAG_BUDGET;
     paint(container, ctx);
     unsub = ctx.selection.subscribe((sel, kind) => {
       if (kind === 'hover') {
