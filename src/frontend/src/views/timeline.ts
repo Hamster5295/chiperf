@@ -868,19 +868,17 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
     if (me.ctrlKey || me.metaKey) {
       selectRow(row, 'toggle');
       me.preventDefault();
-      return;
     }
-    // 普通左键：已经是多选的一部分就保持整批（这样才能拖着一整块走），否则只选它
-    if (selectedRows.size > 1 && selectedRows.has(row.key)) return;
-    selectRow(row, 'only');
+    // 普通左键按下时**不动选中**：按下之后可能是"点击"（见下面的 click），
+    // 也可能是"拖拽"（拖拽不会触发 click）。先保留整批，才拖得动一整块。
   });
-  if (row.select) {
-    node.addEventListener('click', (event) => {
-      const me = event as MouseEvent;
-      if (me.shiftKey || me.ctrlKey || me.metaKey) return; // 批量选择时不动跨视图选中
-      ctx.selection.set(row.select ?? null);
-    });
-  }
+  node.addEventListener('click', (event) => {
+    const me = event as MouseEvent;
+    if (me.shiftKey || me.ctrlKey || me.metaKey) return; // 修饰键手势在 mousedown 里处理过了
+    // 纯点击（拖拽不会走到这里）：选中收窄到点中的这一行
+    selectRow(row, 'only');
+    if (row.select) ctx.selection.set(row.select ?? null);
+  });
   if (row.hover) {
     const sel = row.hover;
     node.addEventListener('mouseenter', () => ctx.selection.hover(sel));
@@ -896,12 +894,28 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
 let draggingKey: string[] | null = null;
 
 function installRowDrag(node: HTMLElement, row: LaneRow): void {
+  /**
+   * 拖动之后浏览器**可能**补一个 click（原生拖放通常会抑制它，但合成事件、
+   * 不同浏览器不一定）。补一个开关把这次 click 吃掉 —— 否则拖完一整块会立刻
+   * 被"点击收窄"打回一行，批量拖拽就废了。每次按下重新放行。
+   */
+  let swallowNextClick = false;
+  node.addEventListener('mousedown', () => {
+    swallowNextClick = false;
+  });
+  node.addEventListener('click', (event) => {
+    if (!swallowNextClick) return;
+    swallowNextClick = false;
+    event.stopImmediatePropagation();
+  }, true);
   const clearMarks = (): void => {
     document.querySelectorAll('.tl-drop-before, .tl-drop-after').forEach((n) => n.classList.remove('tl-drop-before', 'tl-drop-after'));
   };
   node.addEventListener('dragstart', (event) => {
-    // 拖的是选中行 → 整批一起搬；否则只搬它自己
-    draggingKey = selectedRows.size > 1 && selectedRows.has(row.key) ? [...selectedRows] : [row.key];
+    swallowNextClick = true;
+    // 拖的是选中行 → 整批一起搬；拖没选中的行 → 选中收窄到它，只搬它自己
+    if (!selectedRows.has(row.key)) selectRow(row, 'only');
+    draggingKey = selectedRows.size > 1 ? [...selectedRows] : [row.key];
     node.classList.add('tl-dragging');
     event.dataTransfer?.setData('text/plain', row.key);
     if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
