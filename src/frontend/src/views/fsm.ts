@@ -5,8 +5,8 @@
  * 色带区间是**半开**的 `[start, end)`，长度 = end − start。状态配色统一走 `colorFor(state)`，
  * 保证热力图与色带里同名同色。
  */
-import type { FsmTrack } from '../../../parser/src/index.ts';
-import { stateSegments } from '../../../parser/src/index.ts';
+import type { FsmTrack, Position } from '../../../parser/src/index.ts';
+import { formatPosition, stateSegments } from '../../../parser/src/index.ts';
 import {
   axisTicks,
   card,
@@ -93,12 +93,12 @@ function formatState(value: FsmTrack['samples'][number]['value']): string {
  * 一台状态机一张卡片：行内只放**它自己的**状态，格子 = 该状态的驻留周期数。
  * 颜色按该状态机自身的峰值归一（独立可读），卡片小标题里给出峰值以便跨状态机比较。
  */
-function fsmHeatCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement {
+function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement {
   const total = totalDwell(fsm);
   const peak = peakState(fsm);
   const tail = tailState(fsm);
   const cards = card(
-    `状态占用 · ${fsm.name}`,
+    `状态机 · ${fsm.name}`,
     `域 ${fsm.domain} · ${fsm.stateSet.length} 个状态 · 总驻留 ${fmtInt(total)} 周期` +
       (peak ? ` · 峰值 ${peak.state} ${fmtInt(peak.dwell)} 周期` : '') +
       (tail !== null ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : ''),
@@ -169,7 +169,9 @@ function fsmHeatCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElem
     cells.append(cell);
   }
 
+  // ① 状态占用比例
   cards.body.append(
+    el('h4', { class: 'fsm-section', text: `状态占用比例 · ${fsm.stateSet.length} 个状态` }),
     cells,
     legend([
       { label: '驻留少', color: heatColor(0) },
@@ -177,12 +179,289 @@ function fsmHeatCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElem
       { label: `按本状态机峰值 ${peakDwell > 0 ? fmtInt(peakDwell) : 0} 周期归一`, color: heatColor(0.7) },
     ]),
   );
+  // ② 该状态机自己的状态时序色带
+  cards.body.append(el('h4', { class: 'fsm-section', text: '状态时序色带' }), stateBands([fsm], ctx, state));
+  // ③ 该状态机的状态转移图（由相邻两条 fsm 记录推断）
+  cards.body.append(
+    el('h4', { class: 'fsm-section', text: '状态转移图' }),
+    el('p', {
+      class: 'muted',
+      style: 'margin:-2px 0 4px;font-size:11.5px',
+      text: '箭头方向 = 转移方向，箭头颜色 = 转移频度；虚线圆圈是"起始"入口（第一条记录没有前驱状态）',
+    }),
+    transitionGraph(fsm, ctx),
+  );
 
   state.highlights.push({
     node: cards.root,
     match: (selection) => selection?.kind === 'fsm' && selection.key === fsm.key,
   });
   return cards.root;
+}
+
+// ------------------------------------------------------------------ 状态转移图
+
+/** 首条记录没有前驱状态，画一个虚线的"起始"入口 */
+const START_NODE = '(起始)';
+const GRAPH_W = 540;
+const GRAPH_H = 380;
+const NODE_R = 23;
+
+interface EdgeAgg {
+  from: string;
+  to: string;
+  count: number;
+  selfLoop: boolean;
+  first: Position;
+  last: Position;
+}
+
+/** 由相邻两条 fsm 记录推断转移，并按 (from, to) 聚合 */
+function aggregateEdges(fsm: FsmTrack): EdgeAgg[] {
+  const map = new Map<string, EdgeAgg>();
+  for (const transition of fsm.transitions) {
+    const from = transition.from ?? START_NODE;
+    const key = `${from}\u0000${transition.to}`;
+    const found = map.get(key);
+    if (found) {
+      found.count += 1;
+      found.last = transition.pos;
+    } else {
+      map.set(key, {
+        from,
+        to: transition.to,
+        count: 1,
+        selfLoop: from === transition.to,
+        first: transition.pos,
+        last: transition.pos,
+      });
+    }
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+/** 频度配色：越频繁越深（与状态身份色区分开，避免混淆"颜色 = 状态"与"颜色 = 频度"） */
+function frequencyColor(share: number): string {
+  return heatColor(0.18 + 0.82 * Math.max(0, Math.min(1, share)));
+}
+
+function nodePositions(names: string[]): Map<string, { x: number; y: number }> {
+  const out = new Map<string, { x: number; y: number }>();
+  const cx = GRAPH_W / 2;
+  const cy = GRAPH_H / 2;
+  if (names.length === 1) {
+    out.set(names[0]!, { x: cx, y: cy });
+    return out;
+  }
+  const radius = Math.min(GRAPH_W, GRAPH_H) / 2 - NODE_R - 30;
+  names.forEach((name, index) => {
+    const angle = -Math.PI / 2 + (index * 2 * Math.PI) / names.length;
+    out.set(name, { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) });
+  });
+  return out;
+}
+
+/** 节点之间的曲线：两端各留出节点半径，反向边错开弯曲避免重叠 */
+function edgeGeometry(a: { x: number; y: number }, b: { x: number; y: number }, bow: number) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len;
+  const uy = dy / len;
+  const start = { x: a.x + ux * NODE_R, y: a.y + uy * NODE_R };
+  const end = { x: b.x - ux * (NODE_R + 10), y: b.y - uy * (NODE_R + 10) };
+  const mid = { x: (start.x + end.x) / 2 - uy * bow, y: (start.y + end.y) / 2 + ux * bow };
+  // 标签放在曲线中点，并沿"远离画布中心"的方向外推一点：弦很密时这样能显著减少标签互相压叠
+  const cx = GRAPH_W / 2;
+  const cy = GRAPH_H / 2;
+  const raw = { x: (start.x + end.x) / 4 + mid.x / 2, y: (start.y + end.y) / 4 + mid.y / 2 };
+  const ox = raw.x - cx;
+  const oy = raw.y - cy;
+  const olen = Math.hypot(ox, oy) || 1;
+  const label = { x: raw.x + (ox / olen) * 15, y: raw.y + (oy / olen) * 15 };
+  return { start, end, mid, label, d: `M${start.x},${start.y}Q${mid.x},${mid.y} ${end.x},${end.y}` };
+}
+
+function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
+  const edges = aggregateEdges(fsm);
+  const names = [...(edges.some((e) => e.from === START_NODE) ? [START_NODE] : []), ...fsm.stateSet];
+  const pos = nodePositions(names);
+  const total = Math.max(1, edges.reduce((sum, e) => sum + e.count, 0));
+  const maxCount = Math.max(1, ...edges.map((e) => e.count));
+  const svg = svgRoot(GRAPH_W, GRAPH_H, { style: 'width:100%;max-width:560px;height:auto' });
+
+  // 箭头：颜色随边变化，所以每条边一个 marker
+  const defs = svgEl('defs', {});
+  edges.forEach((edge, index) => {
+    defs.append(
+      svgEl('marker', {
+        id: `fsm-arrow-${index}-${fsm.key.replace(/[^\w]/g, '')}`,
+        viewBox: '0 0 10 10',
+        refX: 9,
+        refY: 5,
+        markerWidth: 5,
+        markerHeight: 5,
+        orient: 'auto-start-reverse',
+      }, [svgEl('path', { d: 'M0,0 L10,5 L0,10 z', fill: frequencyColor(edge.count / maxCount) })]),
+    );
+  });
+  svg.append(defs);
+
+  // 先画边，节点盖在上面
+  const edgeLayer = svgEl('g', {});
+  svg.append(edgeLayer);
+  const nodeLayer = svgEl('g', {});
+  svg.append(nodeLayer);
+
+  const seenPair = new Set(edges.map((e) => `${e.from}\u0000${e.to}`));
+  for (const [index, edge] of edges.entries()) {
+    const color = frequencyColor(edge.count / maxCount);
+    const share = (edge.count / total) * 100;
+    const from = pos.get(edge.from);
+    const to = pos.get(edge.to);
+    if (from === undefined || to === undefined) continue;
+    const group = svgEl('g', { style: 'cursor:pointer' });
+    let labelAt: { x: number; y: number };
+
+    if (edge.selfLoop) {
+      const x = from.x;
+      const y = from.y;
+      labelAt = { x, y: y - NODE_R - 30 };
+      group.append(
+        svgEl('path', {
+          d: `M${x - 12},${y - NODE_R + 4}C${x - 26},${y - NODE_R - 34} ${x + 26},${y - NODE_R - 34} ${x + 12},${y - NODE_R + 4}`,
+          fill: 'none',
+          stroke: color,
+          'stroke-width': 1.8,
+          'marker-end': `url(#fsm-arrow-${index}-${fsm.key.replace(/[^\w]/g, '')})`,
+        }),
+      );
+    } else {
+      const bow = seenPair.has(`${edge.to}\u0000${edge.from}`) ? 26 : 12;
+      const geometry = edgeGeometry(from, to, bow);
+      labelAt = geometry.label;
+      group.append(
+        svgEl('path', {
+          d: geometry.d,
+          fill: 'none',
+          stroke: color,
+          'stroke-width': 1.4 + Math.min(2.6, (edge.count / maxCount) * 2.6),
+          'marker-end': `url(#fsm-arrow-${index}-${fsm.key.replace(/[^\w]/g, '')})`,
+        }),
+      );
+    }
+
+    const label = svgEl('text', {
+      x: labelAt.x,
+      y: labelAt.y,
+      'text-anchor': 'middle',
+      style: 'font-size:10px;font-weight:600;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--surface);stroke-width:3.5px',
+      fill: color,
+      text: String(edge.count),
+    });
+    group.append(label);
+    hoverTarget(
+      group,
+      () =>
+        [
+          `${edge.from} → ${edge.to}${edge.selfLoop ? '（自环）' : ''}`,
+          `发生 ${fmtInt(edge.count)} 次 · 占该状态机跳转的 ${share.toFixed(1)}%`,
+          edge.selfLoop ? '自环 = 同一状态连续两次上报（spec §9.5）' : '',
+          `首次 ${formatPosition(edge.first)}`,
+          `最后 ${formatPosition(edge.last)}`,
+          '由相邻两条 fsm 记录推断',
+        ]
+          .filter((line) => line !== '')
+          .join('\n'),
+      () =>
+        selectFsm(ctx, fsm, `${edge.from} → ${edge.to}`, [
+          ['状态机', fsm.name],
+          ['时钟域', fsm.domain],
+          ['转移', `${edge.from} → ${edge.to}`],
+          ['次数', fmtInt(edge.count)],
+          ['占比', `${share.toFixed(2)}%`],
+          ['类型', edge.selfLoop ? '自环' : '普通跳转'],
+        ]),
+    );
+    edgeLayer.append(group);
+  }
+
+  for (const name of names) {
+    const at = pos.get(name);
+    if (at === undefined) continue;
+    const isStart = name === START_NODE;
+    const dwell = isStart ? null : (dwellOf(fsm, name) ?? 0);
+    const color = isStart ? 'var(--text-muted)' : colorFor(name);
+    const node = svgEl('g', { style: 'cursor:pointer' });
+    node.append(
+      svgEl('circle', {
+        cx: at.x,
+        cy: at.y,
+        r: NODE_R,
+        fill: isStart ? 'var(--surface-2)' : 'var(--surface)',
+        stroke: color,
+        'stroke-width': 2,
+        ...(isStart ? { 'stroke-dasharray': '3 3' } : {}),
+      }),
+    );
+    node.append(
+      svgEl('text', {
+        x: at.x,
+        y: at.y + 3.5,
+        'text-anchor': 'middle',
+        style: 'font-size:10.5px;font-weight:600',
+        fill: color,
+        text: name.length > 8 ? `${name.slice(0, 7)}…` : name,
+      }),
+    );
+    if (dwell !== null) {
+      node.append(
+        svgEl('text', {
+          x: at.x,
+          y: at.y + NODE_R + 12,
+          'text-anchor': 'middle',
+          class: 'axis-label',
+          style: 'font-size:9.5px',
+          text: `${fmtInt(dwell)} 周期`,
+        }),
+      );
+    }
+    hoverTarget(
+      node,
+      () =>
+        (isStart
+          ? ['起始：该状态机的第一条记录（还没有前驱状态）', fsm.name]
+          : [
+              `状态 ${name}`,
+              `驻留 ${fmtInt(dwell ?? 0)} 周期`,
+              `来自 ${edges.filter((e) => e.to === name).reduce((sum, e) => sum + e.count, 0)} 次跳转`,
+              `离开 ${edges.filter((e) => e.from === name).reduce((sum, e) => sum + e.count, 0)} 次`,
+              '点击查看该状态的详情',
+            ]).join('\n'),
+      () =>
+        isStart
+          ? selectFsm(ctx, fsm, '起始状态', [['状态机', fsm.name], ['说明', '第一条 fsm 记录，没有前驱']])
+          : selectFsm(ctx, fsm, `状态 · ${name}`, [
+              ['状态机', fsm.name],
+              ['时钟域', fsm.domain],
+              ['驻留周期', fmtInt(dwell ?? 0)],
+              ['占比', `${(((dwell ?? 0) / Math.max(1, totalDwell(fsm))) * 100).toFixed(2)}%`],
+            ]),
+    );
+    nodeLayer.append(node);
+  }
+
+  const wrap = el('div', { style: 'display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap' }, [svg]);
+  wrap.append(
+    legend([
+      { label: '箭头颜色 = 频度', color: frequencyColor(0.15) },
+      { label: '低', color: frequencyColor(0.25) },
+      { label: '中', color: frequencyColor(0.6) },
+      { label: '高', color: frequencyColor(1) },
+      { label: `${fmtInt(total)} 次跳转`, color: 'transparent' },
+    ]),
+  );
+  return wrap;
 }
 
 // ------------------------------------------------------------------ 时序色带
@@ -299,46 +578,6 @@ function stateBands(fsms: FsmTrack[], ctx: ViewContext, state: FsmState): HTMLEl
 
 // ------------------------------------------------------------------ 跳转
 
-interface TransitionRow {
-  fsm: FsmTrack;
-  from: string | null;
-  to: string;
-  count: number;
-  selfLoop: boolean;
-}
-
-function transitionRows(fsms: FsmTrack[]): TransitionRow[] {
-  const rows: TransitionRow[] = [];
-  const index = new Map<string, TransitionRow>();
-  for (const fsm of fsms) {
-    for (const transition of fsm.transitions) {
-      const key = `${fsm.key}\u0000${transition.from ?? ''}\u0000${transition.to}`;
-      const found = index.get(key);
-      if (found) {
-        found.count += 1;
-        found.selfLoop = found.selfLoop || transition.selfLoop;
-        continue;
-      }
-      const row: TransitionRow = {
-        fsm,
-        from: transition.from,
-        to: transition.to,
-        count: 1,
-        selfLoop: transition.selfLoop,
-      };
-      index.set(key, row);
-      rows.push(row);
-    }
-  }
-  rows.sort(
-    (a, b) =>
-      a.fsm.name.localeCompare(b.fsm.name) ||
-      b.count - a.count ||
-      (a.from ?? '').localeCompare(b.from ?? '') ||
-      a.to.localeCompare(b.to),
-  );
-  return rows;
-}
 
 function selectFsm(ctx: ViewContext, fsm: FsmTrack, title: string, rows: [string, string][]): void {
   ctx.selection.set({ kind: 'fsm', key: fsm.key });
@@ -387,69 +626,7 @@ function renderFsm(state: FsmState): void {
   // ---------------------------------------------------------------- 每台状态机各自的占用
   // 不把不同状态机塞进同一张表：每台状态机的状态集合、驻留口径与峰值都不同，
   // 合并后大多数格子会是空的，也看不出"某个模块各状态占了多少周期"。
-  for (const fsm of fsms) container.append(fsmHeatCard(fsm, ctx, state));
-
-  // ---------------------------------------------------------------- 色带
-  const bandCard = card('状态时序色带', '状态区间是半开的 [start, end)，长度 = end − start；颜色与热力图一致');
-  bandCard.body.append(
-    legend([...allStates].map((name) => ({ label: name, color: colorFor(name) }))),
-    stateBands(fsms, ctx, state),
-  );
-  container.append(bandCard.root);
-
-  // ---------------------------------------------------------------- 跳转表
-  const rows = transitionRows(fsms);
-  const jumpCard = card('跳转表（跨状态机）', 'from → to 聚合计数，含自环（同一状态连续上报，spec §9.5）；按状态机分组便于对照');
-  if (rows.length === 0) {
-    jumpCard.body.append(emptyState('没有跳转记录'));
-  } else {
-    const jumpTable = el('div', { class: 'table-wrap' }, [
-      el('table', { class: 'table' }, [
-        el('thead', {}, [
-          el('tr', {}, ['状态机', '从', '到', '次数', '占比', '备注'].map((h) => el('th', { text: h }))),
-        ]),
-        el(
-          'tbody',
-          {},
-          rows.map((row) => {
-            const fsmTotal = Math.max(1, row.fsm.transitions.length);
-            const tr = el('tr', {}, [
-              el('td', {}, [el('code', { class: 'mono', text: row.fsm.name })]),
-              el('td', { class: 'mono', text: row.from ?? '（初始）' }),
-              el('td', { class: 'mono', text: row.to }),
-              el('td', { class: 'num', text: fmtInt(row.count) }),
-              el('td', { class: 'num', text: `${((row.count / fsmTotal) * 100).toFixed(1)}%` }),
-              el(
-                'td',
-                { style: row.selfLoop ? 'color:var(--warn);font-weight:600' : undefined },
-                [el('span', { text: row.selfLoop ? '自环' : '' })],
-              ),
-            ]);
-            tr.style.cursor = 'pointer';
-            tr.addEventListener('click', () => {
-              selectFsm(ctx, row.fsm, `跳转 ${row.from ?? '（初始）'} → ${row.to}`, [
-                ['状态机', row.fsm.name],
-                ['时钟域', row.fsm.domain],
-                ['从', row.from ?? '（初始，第一条记录）'],
-                ['到', row.to],
-                ['次数', fmtInt(row.count)],
-                ['自环', row.selfLoop ? '是' : '否'],
-                ['该状态机跳转总数', fmtInt(row.fsm.transitions.length)],
-                ['该状态机总驻留', `${fmtInt(totalDwell(row.fsm))} 周期`],
-              ]);
-            });
-            state.highlights.push({
-              node: tr,
-              match: (selection) => selection?.kind === 'fsm' && selection.key === row.fsm.key,
-            });
-            return tr;
-          }),
-        ),
-      ]),
-    ]);
-    jumpCard.body.append(jumpTable);
-  }
-  container.append(jumpCard.root);
+  for (const fsm of fsms) container.append(fsmCard(fsm, ctx, state));
 
   applySelection(state);
 }

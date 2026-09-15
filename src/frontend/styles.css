@@ -292,6 +292,10 @@ svg { display: block; max-width: 100%; }
 .diag-item code { font-family: var(--mono); color: var(--accent); }
 .mono { font-family: var(--mono); }
 
+/* 状态机视图：卡片内的小节标题 */
+.fsm-section { margin: 12px 0 2px; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.fsm-section:first-child { margin-top: 0; }
+
 /* 视图内部常用小工具 */
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .col { display: flex; flex-direction: column; gap: 8px; }
