@@ -56,6 +56,7 @@ import {
   type ViewContext,
 } from '../view.ts';
 import { VALUE_FORMATS, formatScalarBy, type ValueFormat } from '../rv.ts';
+import { compositeOver, inkOn as inkOnBackdrop, parseCssColor, type Rgb } from '../contrast.ts';
 
 // ------------------------------------------------------------------ 常量
 
@@ -70,21 +71,30 @@ const H = { clk: 34, pip: 30, value: 36, evt: 26 } as const;
 /** 行间距（px）：行之间留白，靠间距而不是分隔线区分行 */
 const ROW_GAP = 9;
 /**
- * 背景色上该用黑字还是白字。
- * 六边形是实色块，深蓝/紫/红这类底色上继续用深色字根本看不清；
- * 半透明填充先按 alpha 与白底混色，再按感知明度取阈值。
+ * 泳道底下真正被涂上的颜色：从所在元素往上走，把半透明背景逐层合成掉。
+ * 不能假定是白色 —— 深色主题下写死白色会把"该用黑字还是白字"整个判反。
  */
-function inkOn(color: string, alpha = 1): string {
-  const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
-  if (!match) return 'var(--text)';
-  let hex = match[1]!;
-  if (hex.length === 3) hex = hex.replace(/./g, (c) => c + c);
-  const channels = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) * alpha + 255 * (1 - alpha));
-  const luminance = (0.299 * channels[0]! + 0.587 * channels[1]! + 0.114 * channels[2]!) / 255;
-  return luminance > 0.6 ? '#0b1220' : '#ffffff';
+function computeBackdrop(from: Element | null): Rgb {
+  const layers: { rgb: Rgb; alpha: number }[] = [];
+  for (let node: Element | null = from; node !== null; node = node.parentElement) {
+    const parsed = parseCssColor(getComputedStyle(node).backgroundColor);
+    if (parsed !== null && parsed.alpha > 0) {
+      layers.push(parsed);
+      if (parsed.alpha >= 1) break;
+    }
+  }
+  // 自下而上合成：最靠上的那层垫底
+  return compositeOver(layers.reverse(), [255, 255, 255]);
 }
 
-/** 每周期像素范围 */
+/** 本次渲染的画布底色（`build()` 里刷新；主题切换时置空并重画） */
+let backdrop: Rgb | null = null;
+
+/** 当前画布底色上的字色（`fill` 传 null 表示该处不填充，露出画布底色） */
+function inkOn(fill: string | null, alpha = 1): string {
+  return inkOnBackdrop(fill, alpha, backdrop ?? [255, 255, 255]);
+}
+
 /** 自动铺满时每周期的最小像素（默认视图别太挤） */
 const PX_DEFAULT = 8;
 /** 画布总宽上限（不是缩放上限）：几十万像素的 SVG 浏览器渲染会明显吃力 */
@@ -510,6 +520,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     host.append(emptyState('没有可显示的时钟域'));
     return;
   }
+  // 每次渲染重新解析一次画布底色（跟着主题走），供 inkOn 判断字色
+  backdrop = computeBackdrop(host);
   const scan = scanRecords(trace, new Set(domains.map((d) => d.name)));
 
   // 时间轴换算的主域：优先 default，其次任意声明了 period 的可见域
@@ -1120,7 +1132,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             svgEl('text', {
               x: x + 3,
               y: y + h - 11,
-              style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? '#ffffff' : color, hollow ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
+              style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? null : color, hollow ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
               text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
             }),
           );
@@ -1243,7 +1255,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
                   x: (left + right) / 2,
                   y: centerY + 3.6,
                   'text-anchor': 'middle',
-                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(unknown ? '#ffffff' : color, segment.faint ? 0.15 : unknown ? 1 : 0.9)}`,
+                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(unknown ? null : color, unknown ? 1 : segment.faint ? 0.15 : 0.9)}`,
                   text: clip(formatScalarBy(segment.sample.value, format), width - 8),
                 }),
               );
@@ -1478,6 +1490,11 @@ function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
   });
 }
 
+// 系统主题切换会换掉整套 CSS 变量：底色缓存作废，重画一次
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  backdrop = null;
+  rerenderTimeline();
+});
 document.addEventListener('click', () => closeRowMenu());
 // 菜单是 fixed 定位，画布滚动后位置就对不上那一行了；捕获阶段才能收到内层滚动容器的 scroll
 window.addEventListener('scroll', () => closeRowMenu(), true);
