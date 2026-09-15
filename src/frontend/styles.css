@@ -316,6 +316,11 @@ svg { display: block; max-width: 100%; }
 .mono { font-family: var(--mono); }
 
 /* 时间轴行头：拖拽排序 */
+/* 波形图左上角的"+"：恢复被右键隐藏的行 */
+.tl-restore { border: 1px solid var(--border-strong); background: var(--surface); color: var(--text-muted); border-radius: 5px; font: inherit; font-size: 10.5px; line-height: 1; padding: 3px 6px; cursor: pointer; }
+.tl-restore:hover { color: var(--text); border-color: var(--accent); }
+.tl-restore.is-active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+
 .tl-gutter-cell { transition: background 120ms ease; }
 .tl-gutter-cell:hover { filter: brightness(0.985); }
 .tl-drag-handle { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); opacity: 0.45; cursor: grab; letter-spacing: -1px; }

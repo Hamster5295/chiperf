@@ -204,6 +204,15 @@ interface Registry extends Surface {
   currentRow: { key: string; y: number; h: number; color: string } | null;
 }
 
+/** 行分组 → 中文名（"已隐藏的行"菜单里标出来源） */
+const GROUP_NAME: Record<LaneGroup, string> = {
+  clock: '时钟',
+  fsm: '状态机',
+  pipeline: '流水线',
+  value: '数值',
+  event: '事件',
+};
+
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
 type LaneGroup = 'clock' | 'fsm' | 'pipeline' | 'value' | 'event';
 
@@ -245,6 +254,10 @@ interface Probe {
 let hostEl: HTMLElement | null = null;
 /** 用户拖拽后的行顺序（按 LaneRow.key）；空数组表示默认顺序 */
 let rowOrder: string[] = [];
+/** 被右键隐藏的行（按 LaneRow.key）：拖拽顺序里仍然留着，重新显示时回到原位 */
+let hiddenRows = new Set<string>();
+/** 最近一次构建出的全部行（含被隐藏的），供"已隐藏的行"菜单取名字 */
+let allRows: LaneRow[] = [];
 let scrollEl: HTMLElement | null = null;
 let ctxRef: ViewContext | null = null;
 let unsub: (() => void) | null = null;
@@ -705,12 +718,60 @@ function axisGutterCell(plot: Plot): HTMLElement {
       style:
         'height:' +
         AXIS_H +
-        'px;display:flex;flex-direction:column;justify-content:center;gap:1px;padding:0 8px;border-bottom:1px solid var(--border-strong)',
+        'px;display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 8px;border-bottom:1px solid var(--border-strong)',
     },
-    [
-      el('span', { style: 'font-size:11px;font-weight:600', text: '周期' }),
-    ],
+    [el('span', { style: 'font-size:11px;font-weight:600', text: '周期' }), restoreButton()],
   );
+}
+
+/**
+ * 波形图左上角的 "+"：把右键隐藏掉的行重新显示出来。
+ * 有隐藏行时按钮上带数量，一眼能看出"图里少了东西"。
+ */
+function restoreButton(): HTMLElement {
+  const count = hiddenRows.size;
+  const node = el('button', {
+    class: `tl-restore${count > 0 ? ' is-active' : ''}`,
+    type: 'button',
+    text: count > 0 ? `+ ${count}` : '+',
+    title: count > 0 ? `${count} 行已隐藏，点击恢复` : '没有被隐藏的行',
+  });
+  node.addEventListener('click', (event) => {
+    const me = event as MouseEvent;
+    me.stopPropagation();
+    const items: MenuItem[] =
+      count === 0
+        ? []
+        : [...hiddenRows].map((key) => {
+            const row = allRows.find((lane) => lane.key === key);
+            return {
+              label: row ? `${row.label} · ${GROUP_NAME[row.group]}` : key,
+              checked: false,
+              pick: () => {
+                hiddenRows.delete(key);
+                rerenderTimeline();
+              },
+            };
+          });
+    const sections: MenuSection[] = [{ title: count > 0 ? '已隐藏的行' : '没有被隐藏的行', items }];
+    if (count > 1) {
+      sections.push({
+        title: '',
+        items: [
+          {
+            label: '全部显示',
+            checked: false,
+            pick: () => {
+              hiddenRows = new Set();
+              rerenderTimeline();
+            },
+          },
+        ],
+      });
+    }
+    openRowMenu(me.clientX, me.clientY, sections);
+  });
+  return node;
 }
 
 function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
@@ -899,7 +960,8 @@ function buildRows(
   const otherAsync = scan.asyncRecords.filter((r) => r.kind !== 'evt' && visible(r.pos.domain));
   if (otherAsync.length > 0) rows.push(asyncLane(otherAsync, ctx));
 
-  return applyRowOrder(rows);
+  allRows = rows;
+  return applyRowOrder(rows.filter((row) => !hiddenRows.has(row.key)));
 }
 
 /** 用户拖拽后的行顺序：未出现在顺序表里的行按默认顺序排在后面 */
@@ -1566,8 +1628,7 @@ function openRowMenu(clientX: number, clientY: number, sections: MenuSection[]):
 function menuSectionsFor(row: LaneRow): MenuSection[] {
   const sections: MenuSection[] = [];
   const menu = row.menu;
-  if (!menu) return sections;
-  if (menu.formatKey !== undefined) {
+  if (menu?.formatKey !== undefined) {
     const key = menu.formatKey;
     const width = menu.formatWidth ?? 32;
     sections.push({
@@ -1582,7 +1643,7 @@ function menuSectionsFor(row: LaneRow): MenuSection[] {
       })),
     });
   }
-  if (menu.modeKey !== undefined) {
+  if (menu?.modeKey !== undefined) {
     const key = menu.modeKey;
     sections.push({
       title: '显示模式',
@@ -1596,12 +1657,25 @@ function menuSectionsFor(row: LaneRow): MenuSection[] {
       })),
     });
   }
+  // 隐藏是每行都有的能力（时钟/事件行也在内）
+  sections.push({
+    title: '行',
+    items: [
+      {
+        label: '隐藏此行',
+        checked: false,
+        pick: () => {
+          hiddenRows.add(row.key);
+          rerenderTimeline();
+        },
+      },
+    ],
+  });
   return sections;
 }
 
 /** 给行头与泳道都挂上右键菜单（在泳道上右键也能改） */
 function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
-  if (row.menu === undefined) return;
   node.addEventListener('contextmenu', (event) => {
     const me = event as MouseEvent;
     me.preventDefault();
