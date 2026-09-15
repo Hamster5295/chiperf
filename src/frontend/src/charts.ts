@@ -311,22 +311,27 @@ export function numericAxis(
   return { scale, ticks: out };
 }
 
-/** 周期轴（底部刻度 + 网格）：返回周期 → x 的映射 */
+/**
+ * 周期轴（底部刻度 + 网格）：返回周期 → x 的映射。
+ * 步长**取整**：周期号只有整数，窄图上按 `axisTicks` 的"漂亮数字"会算出
+ * 0.2、0.5 这种步长，轴上就出现 "6.5 周期" 这种不存在的刻度。
+ */
 export function cycleAxis(
   svg: SVGSVGElement,
-  opts: { x: number; y: number; width: number; height: number; from: number; to: number; labelEvery?: number },
+  opts: { x: number; y: number; width: number; height: number; from: number; to: number },
 ): Scale {
   const scale = linearScale(opts.from, opts.to + 1, opts.x, opts.x + opts.width);
-  const span = opts.to - opts.from + 1;
-  const every = opts.labelEvery ?? Math.max(1, Math.ceil(span / Math.max(2, Math.floor(opts.width / 70))));
-  for (const value of axisTicks(opts.from, opts.to, Math.max(2, Math.floor(opts.width / 70)))) {
+  const target = Math.max(2, Math.floor(opts.width / 70));
+  const raw = Math.max(1, opts.to - opts.from + 1) / target;
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const step = Math.max(1, [1, 2, 5, 10].map((m) => m * magnitude).find((c) => c >= raw) ?? 10 * magnitude);
+  for (let value = Math.ceil(opts.from / step) * step; value <= opts.to; value += step) {
     const x = scale(value);
     svg.append(
       svgEl('line', { x1: x, x2: x, y1: opts.y, y2: opts.y + opts.height, class: 'grid-line' }),
       svgEl('text', { x, y: opts.y + opts.height + 14, class: 'axis-label', 'text-anchor': 'middle', text: String(value) }),
     );
   }
-  void every;
   return scale;
 }
 
