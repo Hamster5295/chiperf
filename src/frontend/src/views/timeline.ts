@@ -69,6 +69,21 @@ const SIDE = 8;
 const H = { clk: 34, pip: 30, value: 36, evt: 26 } as const;
 /** 行间距（px）：行之间留白，靠间距而不是分隔线区分行 */
 const ROW_GAP = 9;
+/**
+ * 背景色上该用黑字还是白字。
+ * 六边形是实色块，深蓝/紫/红这类底色上继续用深色字根本看不清；
+ * 半透明填充先按 alpha 与白底混色，再按感知明度取阈值。
+ */
+function inkOn(color: string, alpha = 1): string {
+  const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
+  if (!match) return 'var(--text)';
+  let hex = match[1]!;
+  if (hex.length === 3) hex = hex.replace(/./g, (c) => c + c);
+  const channels = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) * alpha + 255 * (1 - alpha));
+  const luminance = (0.299 * channels[0]! + 0.587 * channels[1]! + 0.114 * channels[2]!) / 255;
+  return luminance > 0.6 ? '#0b1220' : '#ffffff';
+}
+
 /** 每周期像素范围 */
 const PX_MIN = 0.35;
 const PX_MAX = 64;
@@ -1093,7 +1108,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             svgEl('text', {
               x: x + 3,
               y: y + h - 11,
-              style: 'font-size:10px;fill:#0f172a;fill-opacity:0.8;pointer-events:none',
+              style: `font-size:10px;font-weight:600;fill:${inkOn(item.orphan ? '#ffffff' : aborted ? COLOR.abort : color, item.orphan ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
               text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
             }),
           );
@@ -1212,9 +1227,9 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
               g.append(
                 svgEl('text', {
                   x: (left + right) / 2,
-                  y: centerY + 3.4,
+                  y: centerY + 3.6,
                   'text-anchor': 'middle',
-                  style: 'font-size:9.5px;pointer-events:none;fill:#0f172a;fill-opacity:0.85',
+                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(unknown ? '#ffffff' : color, segment.faint ? 0.15 : unknown ? 1 : 0.9)}`,
                   text: clip(formatScalarBy(segment.sample.value, format), width - 8),
                 }),
               );
