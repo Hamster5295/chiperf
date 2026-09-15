@@ -267,10 +267,26 @@ export function emptyState(message: string): HTMLElement {
 export function dataTable(headers: string[], rows: (Node | string)[][]): HTMLElement {
   return el('div', { class: 'table-wrap' }, [
     el('table', { class: 'table' }, [
-      el('thead', {}, [el('tr', {}, headers.map((h) => el('th', { text: h })))]),
-      el('tbody', {}, rows.map((cells) => el('tr', {}, cells.map((c) => (typeof c === 'string' ? el('td', { text: c }) : el('td', {}, [c])))))),
+      el('thead', {}, [tableRow(headers, 'th')]),
+      el('tbody', {}, rows.map((cells) => tableRow(cells))),
     ]),
   ]);
+}
+
+/**
+ * 造一行表格。**单元格必须经由这里或 `<td>`/`<th>` 产生** ——
+ * 直接把文本/节点 append 到 `<tr>` 上时浏览器不会把它们当单元格，整张表会挤在最左边。
+ */
+export function tableRow(values: (Node | string | number | null)[], tag: 'td' | 'th' = 'td'): HTMLTableRowElement {
+  const row = el('tr', {});
+  for (const value of values) {
+    if (value === null) {
+      row.append(el(tag, {}));
+      continue;
+    }
+    row.append(value instanceof Node ? el(tag, {}, [value]) : el(tag, { text: String(value) }));
+  }
+  return row;
 }
 
 /** 数值轴：左侧刻度 + 网格线（返回绘图区几何） */

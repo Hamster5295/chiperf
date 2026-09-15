@@ -17,6 +17,7 @@ import {
   statTile,
   svgEl,
   svgRoot,
+  tableRow,
 } from '../charts.ts';
 import { fmtBytes, fmtCompact, fmtInt, fmtNs, type View, type ViewContext } from '../view.ts';
 
@@ -184,10 +185,8 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     rows.length > 0
       ? el('div', { class: 'table-wrap' }, [
           el('table', { class: 'table' }, [
-            el('thead', {}, [
-              el('tr', {}, ['域', '周期', '上升沿', '下降沿', '周期(ns)', '频率', '声明', '记录范围'].map((h) => el('th', { text: h }))),
-            ]),
-            el('tbody', {}, rows.map((cells) => el('tr', {}, cells))),
+            el('thead', {}, [tableRow(['域', '周期', '上升沿', '下降沿', '周期(ns)', '频率', '声明', '记录范围'], 'th')]),
+            el('tbody', {}, rows.map((cells) => tableRow(cells))),
           ]),
         ])
       : emptyState('没有时钟域'),
@@ -223,10 +222,8 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     trackRows.length > 0
       ? el('div', { class: 'table-wrap' }, [
           el('table', { class: 'table' }, [
-            el('thead', {}, [
-              el('tr', {}, ['轨道', '域', '条目', '完成', '撤销', '未闭合', '延迟 最小/平均/最大', '气泡周期'].map((h) => el('th', { text: h }))),
-            ]),
-            el('tbody', {}, trackRows.map((cells) => el('tr', {}, cells))),
+            el('thead', {}, [tableRow(['轨道', '域', '条目', '完成', '撤销', '未闭合', '延迟 最小/平均/最大', '气泡周期'], 'th')]),
+            el('tbody', {}, trackRows.map((cells) => tableRow(cells))),
           ]),
         ])
       : emptyState('这份轨迹没有 pip 轨道'),
