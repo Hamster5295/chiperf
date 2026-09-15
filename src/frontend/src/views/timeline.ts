@@ -514,6 +514,11 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     currentRow: null,
   };
 
+  // 网格线先画：它在泳道之下，不会盖住波形（选中/悬停高光仍在最上层）
+  const underlay = svgEl('g', { 'pointer-events': 'none' });
+  drawGrid(underlay, plot);
+  svg.append(underlay);
+
   const gutter = el('div', {
     style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--border)`,
   });
@@ -532,11 +537,6 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     gutter.append(gutterCell(row, h, ctx));
     y += h + ROW_GAP;
   }
-
-  // 网格线画在泳道之上，避免被泳道底色冲淡
-  const grid = svgEl('g', { 'pointer-events': 'none' });
-  drawGrid(grid, plot);
-  svg.append(grid);
 
   // 选中 / 悬停标记（覆盖层）
   const overlay = svgEl('g', { 'pointer-events': 'none' });
@@ -660,7 +660,6 @@ function axisGutterCell(plot: Plot): HTMLElement {
     },
     [
       el('span', { style: 'font-size:11px;font-weight:600', text: '周期' }),
-      el('span', { class: 'muted', style: 'font-size:10px', text: `${countLabel(plot.from)} – ${countLabel(plot.to)} · ${plot.pxPerCycle.toFixed(2)} px/周期` }),
     ],
   );
 }
