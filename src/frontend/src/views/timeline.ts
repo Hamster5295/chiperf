@@ -118,6 +118,14 @@ const TAG_BUDGET = 1200;
 /** 低于这个像素密度就不画每周期柱（改用聚合折线） */
 const BAR_MIN_PX = 2;
 
+/**
+ * 内容型六边形色块的填充不透明度。
+ * 只作用于"实色内容块"（流水线条目、状态机状态段、数值/计数器块）；
+ * 空心与推断类标记另有更淡的值：气泡 0.08、推断段 0.15、未闭合的空心/表面色，
+ * 冲刷条目干脆不填充 —— 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
+ */
+const BLOCK_FILL = 0.6;
+
 /** 时钟泳道的颜色：默认域用绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
 const clockColor = (domain: string): string => (domain === 'default' ? CLOCK_COLOR : colorFor(domain));
@@ -1224,7 +1232,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
         const right = Math.max(left + 1.5, reg.plot.scale(to));
         const color = colorFor(seg.state);
         const open = seg.open === true;
-        const alpha = open ? 0.45 : 0.9;
+        const alpha = BLOCK_FILL;
         const shape = svgEl('path', {
           d: hexPath(left + 0.5, right - 0.5, y + 4, y + h - 5, 5),
           fill: color,
@@ -1376,7 +1384,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             ? { fill: 'var(--surface)' }
             : aborted
               ? { fill: 'none' }
-              : { fill: color, 'fill-opacity': open ? 0.3 : 0.88 }),
+              : { fill: color, 'fill-opacity': BLOCK_FILL }),
           stroke: item.orphan ? COLOR.orphan : aborted ? COLOR.abort : color,
           'stroke-width': aborted ? 1 : 1.2,
           'stroke-linejoin': 'round',
@@ -1426,7 +1434,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             svgEl('text', {
               x: x + 3,
               y: y + h - 11,
-              style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? null : color, hollow ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
+              style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? null : color, hollow ? 1 : BLOCK_FILL)};pointer-events:none`,
               text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
             }),
           );
@@ -1567,7 +1575,7 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
               svgEl('path', {
                 d: hexPath(left, right, centerY - blockH / 2, centerY + blockH / 2, 5),
                 fill: segment.unknown ? 'var(--surface)' : cfg.color,
-                'fill-opacity': segment.faint ? 0.15 : segment.unknown ? 1 : 0.9,
+                'fill-opacity': segment.faint ? 0.15 : segment.unknown ? 1 : BLOCK_FILL,
                 stroke: cfg.color,
                 'stroke-width': 1.1,
                 'stroke-linejoin': 'round',
@@ -1581,7 +1589,7 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
                   x: (left + right) / 2,
                   y: centerY + 3.6,
                   'text-anchor': 'middle',
-                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(segment.unknown ? null : cfg.color, segment.unknown ? 1 : segment.faint ? 0.15 : 0.9)}`,
+                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(segment.unknown ? null : cfg.color, segment.unknown ? 1 : segment.faint ? 0.15 : BLOCK_FILL)}`,
                   text: clip(formatScalarBy(segment.value, format), width - 8),
                 }),
               );
