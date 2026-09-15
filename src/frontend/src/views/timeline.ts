@@ -190,7 +190,6 @@ interface LaneRow {
   key: string;
   domain: string;
   label: string;
-  note: string;
   color: string;
   height: number;
   /** 行头里的附加控件（例如数值行的显示格式选择） */
@@ -687,13 +686,8 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
         text: row.label,
       }),
       row.controls
-        ? el('span', { style: 'margin-left:auto;flex:0 0 auto;display:flex;align-items:center' }, [row.controls])
+        ? el('span', { style: 'margin-left:auto;flex:0 0 auto;display:flex;align-items:center;gap:3px' }, [row.controls])
         : null,
-      el('span', {
-        class: 'muted nowrap',
-        style: `${row.controls ? '' : 'margin-left:auto;'}font-size:10px;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis`,
-        text: row.note,
-      }),
     ],
   );
   if (row.select) node.addEventListener('click', () => ctx.selection.set(row.select ?? null));
@@ -900,7 +894,6 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
     group: 'clock',
     domain: d.name,
     label: d.name,
-    note: `${countLabel(d.cycles)} 周期`,
     color: colorFor(d.name),
     height: H.clk,
     hover: { kind: 'cycle', domain: d.name, cycle: Math.max(1, d.firstCycle) },
@@ -974,7 +967,6 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     group: 'pipeline',
     domain: track.domain,
     label: track.name,
-    note: truncated ? `${shown.length}/${sorted.length} 条目` : `${track.items.length} 条目`,
     color: colorFor(track.name),
     height: H.pip,
     hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
@@ -1114,7 +1106,6 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
     key: `val:${track.key}`,
     domain: track.domain,
     label: track.name,
-    note: `${track.samples.length} 采样 · ${track.changes.length} 次变化`,
     color,
     height: H.value,
     hover: { kind: 'value', key: track.key },
@@ -1285,7 +1276,6 @@ function eventLane(
     group: 'event',
     domain,
     label: name,
-    note: `${samples.length} 次`,
     color: colorFor(key),
     height: H.evt,
     hover: { kind: 'cycle', domain, cycle: samples.length > 0 ? samples[0]!.pos.cycle : 1 },
@@ -1337,7 +1327,6 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
     key: 'msg:all',
     domain: messages[0]!.pos.domain,
     label: '消息',
-    note: `${messages.length} 条`,
     color: COLOR.msg,
     height: H.evt,
     draw(g, reg, y, h) {
@@ -1388,7 +1377,6 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
     key: 'async:all',
     domain: records[0]!.pos.domain,
     label: '异步事件',
-    note: `${records.length} 条`,
     color: COLOR.async,
     height: H.evt,
     draw(g, reg, y, h) {
