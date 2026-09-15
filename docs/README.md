@@ -69,12 +69,12 @@ AGENT.md 列出的追踪能力与记录类型的对应关系：
 
 | 目录 | 内容 |
 | --- | --- |
-| [`src/parser`](../src/parser/README.md) | chiperf 1.0 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
+| [`src/parser`](../src/parser/README.md) | chiperf 1.x 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
 | [`src/frontend`](../src/frontend/README.md) | 可视化前端：源码 + 构建脚本（`bun run build`） |
 | [`dist/`](../dist) | **构建产物**：`index.html`（独立单文件页面，双击可开）+ `app.js`（HTTP 服务器，`bun dist/app.js` 启动后对外提供该页面） |
 
 ## 状态
 
-- 规范版本：`1.0`（已冻结；`async=` 属性为定稿修订）
+- 规范版本：`1.1`（1.0 已冻结；`async=` 属性为 1.0 定稿修订，`rst` 为 1.1 新增，见 spec §7.8）
 - 解析器：99 个测试通过（含对 [`examples.md`](examples.md) 全部公开数字的一致性断言）；`cd src/parser && bun test`
 - 前端：改完源码后 `cd src/frontend && bun run build` 重新生成 `dist/`；产物契约由 `bun test` 断言（页面自包含、服务器路由与内容一致）
