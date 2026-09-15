@@ -15,6 +15,7 @@ chiperf 是一种用于硬件微架构**性能分析与可视化**的通用文�
 | 文档 | 内容 |
 | --- | --- |
 | [`spec.md`](spec.md) | **规范正文（规范性）**：词法、语法、时间模型、事件语义、派生量、鲁棒性、一致性 |
+| [`events.md`](events.md) | **事件手册（非规范性）**：每种记录的语法、该怎么写、选型对照、常见写法模板 |
 | [`examples.md`](examples.md) | 示例逐条推导走查：每条记录的位置、每项派生量怎么算出来的 |
 | [`design-notes.md`](design-notes.md) | 设计取舍、与 VCD/FST/JSONL 的对比、被否决的方案、演进路线 |
 | [`examples/`](examples/) | 一致性测试语料（`.chiperf` 文件）：最小示例、流水线、多时钟域、错误注入、截断 |
@@ -69,7 +70,7 @@ AGENT.md 列出的追踪能力与记录类型的对应关系：
 
 | 目录 | 内容 |
 | --- | --- |
-| [`src/parser`](../src/parser/README.md) | chiperf 1.x 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
+| [`src/parser`](../src/parser/README.md) | chiperf 2.0 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
 | [`src/frontend`](../src/frontend/README.md) | 可视化前端：源码 + 构建脚本（`bun run build`） |
 | [`dist/`](../dist) | **构建产物**：`index.html`（独立单文件页面，双击可开）+ `app.js`（HTTP 服务器，`bun dist/app.js` 启动后对外提供该页面） |
 
