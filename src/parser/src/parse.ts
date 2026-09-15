@@ -30,11 +30,7 @@ export class UnsupportedVersionError extends Error {
     readonly major: number,
     readonly minor: number,
   ) {
-    super(
-      major === 1
-        ? `chiperf ${major}.${minor} 是 v1.x：v2.0 起 [pip] 不再有 I/O/X 方向（改为直接写该级的新值或 bubble），两版不兼容，请迁移文件；如需尽力解析请设置 ignoreVersion`
-        : `chiperf ${major}.${minor} 的主版本不受支持（本解析器实现 2.x）；如需尽力解析请设置 ignoreVersion`,
-    );
+    super(`chiperf ${major}.${minor} 的主版本不受支持（本解析器实现 1.x）；如需尽力解析请设置 ignoreVersion`);
     this.name = 'UnsupportedVersionError';
   }
 }
@@ -76,7 +72,7 @@ export class ChiperfParser {
   private bytes = 0;
   private pending = '';
   private truncatedTail: string | null = null;
-  private version = { major: 2, minor: 0, explicit: false, raw: undefined as string | undefined };
+  private version = { major: 1, minor: 0, explicit: false, raw: undefined as string | undefined };
   private endSeen = false;
   private hasAtOverride = false;
   private readonly atDomains = new Set<string>();
@@ -167,7 +163,7 @@ export class ChiperfParser {
       const m = /^chiperf[ \t]+(\d+)\.(\d+)$/.exec(bare);
       if (m) {
         this.version = { major: Number(m[1]), minor: Number(m[2]), explicit: true, raw: bare };
-        if (this.version.major !== 2 && !this.ignoreVersion) {
+        if (this.version.major !== 1 && !this.ignoreVersion) {
           throw new UnsupportedVersionError(this.version.major, this.version.minor);
         }
         return;
@@ -415,12 +411,12 @@ export class ChiperfParser {
     }
 
     if (kind === 'pip') {
-      // spec §7.4（v2.0）：`[pip] <轨>, <值>` 或 `[pip] <轨>, bubble`；没有记录则保持上一值。
+      // spec §7.4（v1.0）：`[pip] <轨>, <值>` 或 `[pip] <轨>, bubble`；没有记录则保持上一值。
       // `I`/`O`/`X` 是 v1.x 的方向，留在这个位置当"值"读会静默改变含义 —— 直接判非法并给迁移提示。
       const second = positional[1]?.value;
       if (second !== undefined && second.kind === 'sym' && (second.text === 'I' || second.text === 'O' || second.text === 'X')) {
-        this.skip('invalid_record', this.lineNo, line, `pip 不再有方向：v2.0 起第 2 个位置参数是新值，空写 bubble（收到方向 ${second.text}）`);
-        this.diag('pip_legacy_direction', this.lineNo, `[pip] 的 I/O/X 方向在 v2.0 已移除：直接写该级的新值，空写 bubble（v1.x 文件需迁移）`);
+        this.skip('invalid_record', this.lineNo, line, `pip 不再有方向：第 2 个位置参数是该级的新值，空写 bubble（收到方向 ${second.text}）`);
+        this.diag('pip_legacy_direction', this.lineNo, `[pip] 的 I/O/X 方向是早期草案的写法、v1.0 已移除：直接写该级的新值，空写 bubble`);
         return;
       }
       if (positional.length !== 2) {

@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta tool="chiperf-postproc" note="后处理工具输出的轨迹：没有 clk 记录，时间轴完全由 at= 给出"
 # 位置全部显式：cycle + 可选相位字母（缺省 p）。
 # 解析器不得因缺少 clk 记录而拒绝该文件，也不得让 at= 影响域的时钟状态。

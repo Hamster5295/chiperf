@@ -116,7 +116,7 @@ export function sampleTrace(): string {
     at(cycle, line);
   };
 
-  push('chiperf 2.0');
+  push('chiperf 1.0');
   push('@meta design="rv32i-demo" tool="chiperf frontend sample" date="2026-09-15" note="内置示例：双时钟域 + 5 级流水 + 异步中断"');
   push('@domain default, period=1.0ns, note="主时钟 1GHz（隐式默认域）"');
   push('@domain mem, freq=800MHz, note="内存时钟 800MHz"');
@@ -139,7 +139,7 @@ export function sampleTrace(): string {
     put(index, slot.ifIn, `[cnt] "core.icache.access"`);
     put(index, slot.ifIn, `[val] "core.if.pc", ${tag}`);
     put(index, slot.ifIn, `[val] "core.if.valid", 1`);
-    // pip 记录不在这里逐级配对：v2.0 起 [pip] 是"该级的新值或 bubble"，
+    // pip 记录不在这里逐级配对：[pip] 是"该级的新值或 bubble"，
     // 下面统一按"每级每拍持有谁、值变了才写一条"生成（保持型，spec §7.4）
     put(index, slot.idIn, `[val] "core.id.instr", ${instr.enc}`);
     if (instr.pc === PROGRAM[1]!.pc) put(index, slot.idIn, `[val] "core.id.disasm", "${instr.disasm}"`);

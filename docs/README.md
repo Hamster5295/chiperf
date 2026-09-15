@@ -23,7 +23,7 @@ chiperf 是一种用于硬件微架构**性能分析与可视化**的通用文�
 ## 60 秒上手
 
 ```chiperf
-chiperf 2.0
+chiperf 1.0
 @meta design="rv32i-core"
 @domain core, period=1.0ns
 
@@ -70,12 +70,12 @@ AGENT.md 列出的追踪能力与记录类型的对应关系：
 
 | 目录 | 内容 |
 | --- | --- |
-| [`src/parser`](../src/parser/README.md) | chiperf 2.0 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
+| [`src/parser`](../src/parser/README.md) | chiperf 1.0 解析器（TypeScript / Bun）：流式、前缀封闭、自带 inflate |
 | [`src/frontend`](../src/frontend/README.md) | 可视化前端：源码 + 构建脚本（`bun run build`） |
 | [`dist/`](../dist) | **构建产物**：`index.html`（独立单文件页面，双击可开）+ `app.js`（HTTP 服务器，`bun dist/app.js` 启动后对外提供该页面） |
 
 ## 状态
 
-- 规范版本：`2.0`（`pip` 改为保持型取值，不兼容 `1.x`；`async=` 属性为 1.0 定稿修订，`rst` 为 1.1 新增，见 spec §7.8 与 §12.5）
+- 规范版本：`1.0`（第一个正式版本；`[pip]` 定为保持型取值，更早的草案用的是进出配对，见 spec §7.4 与 §12.5）
 - 解析器：99 个测试通过（含对 [`examples.md`](examples.md) 全部公开数字的一致性断言）；`cd src/parser && bun test`
 - 前端：改完源码后 `cd src/frontend && bun run build` 重新生成 `dist/`；产物契约由 `bun test` 断言（页面自包含、服务器路由与内容一致）

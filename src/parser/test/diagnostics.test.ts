@@ -1,7 +1,7 @@
 /**
  * 诊断与边界语义测试（spec §9.4 跨域锚定 / §10.4 语义异常 / §10.5 未闭合）
  *
- * v2.0 起 `[pip]` 是"直接指定该级的新值或 bubble"，没有 I/O/X 方向，
+ * `[pip]` 是"直接指定该级的新值或 bubble"，没有 I/O/X 方向，
  * 所以这里的 fixture 全部改成新语法。
  */
 import { describe, expect, test } from 'bun:test';
@@ -141,8 +141,8 @@ describe('§8.2 时间换算', () => {
 
 describe('指令字段的分隔符（spec §8）', () => {
   test('空白分隔的 @meta 与逗号分隔等价', () => {
-    const spaces = parseChiperf(['chiperf 2.1', '@meta design="x" tool="y"', '@end', ''].join('\n'));
-    const commas = parseChiperf(['chiperf 2.1', '@meta design="x", tool="y"', '@end', ''].join('\n'));
+    const spaces = parseChiperf(['chiperf 1.1', '@meta design="x" tool="y"', '@end', ''].join('\n'));
+    const commas = parseChiperf(['chiperf 1.1', '@meta design="x", tool="y"', '@end', ''].join('\n'));
     expect(spaces.meta).toEqual({ design: 'x', tool: 'y' });
     expect(commas.meta).toEqual(spaces.meta);
     expect(spaces.diagnostics.length).toBe(0);
@@ -150,13 +150,13 @@ describe('指令字段的分隔符（spec §8）', () => {
   });
 
   test('空白分隔的 @domain 也能解析出 period', () => {
-    const trace = parseChiperf(['chiperf 2.1', '@domain core, period=2.5ns note="主时钟"', '@end', ''].join('\n'));
+    const trace = parseChiperf(['chiperf 1.1', '@domain core, period=2.5ns note="主时钟"', '@end', ''].join('\n'));
     expect(trace.domains.get('core')!.periodNs).toBe(2.5);
     expect(trace.domains.get('core')!.note).toBe('主时钟');
   });
 
   test('记录仍然只认逗号：空白分隔的属性是非法记录', () => {
-    const trace = parseChiperf(['chiperf 2.1', '[clk] p, dom=core note="x"', '@end', ''].join('\n'));
+    const trace = parseChiperf(['chiperf 1.1', '[clk] p, dom=core note="x"', '@end', ''].join('\n'));
     expect(trace.records.length).toBe(0);
     expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
   });

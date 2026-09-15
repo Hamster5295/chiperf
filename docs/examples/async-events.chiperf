@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta design="async demo" note="async=1：事件不是时钟沿采样得到的，可视化落在两个时钟沿之间"
 @domain core, period=1.0ns
 

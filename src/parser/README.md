@@ -1,6 +1,6 @@
 # @chiperf/parser
 
-chiperf 2.0 的 TypeScript 实现（Bun 工具链）。规范见 [`../../docs/spec.md`](../../docs/spec.md)。
+chiperf 1.0 的 TypeScript 实现（Bun 工具链）。规范见 [`../../docs/spec.md`](../../docs/spec.md)。
 
 ## 用法
 

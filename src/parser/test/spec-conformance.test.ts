@@ -96,7 +96,7 @@ describe('rv32i-pipeline.chiperf（docs/examples.md §2）', () => {
 
   test('所有条目驻留均为 1 周期；条目数 = 已结束数；无未闭合', async () => {
     const trace = await loadAsync('rv32i-pipeline');
-    // v2.0 起没有"完成/撤销"之分：被后续记录改掉的条目一律算结束，
+    // 没有"完成/撤销"之分：被后续记录改掉的条目一律算结束，
     // 所以旧模型里那 2 条 X（冲刷）的驻留也进延迟分布（各 1 周期）
     for (const name of ['core.if', 'core.id', 'core.ex', 'core.mem', 'core.wb']) {
       const t = track(trace, name);
@@ -297,7 +297,7 @@ describe('future-version.chiperf（docs/examples.md §8）', () => {
     const trace = parseChiperf(text, { ignoreVersion: true });
     expect(trace.records.length).toBe(2);
     expect(trace.endSeen).toBe(true);
-    expect(trace.version).toMatchObject({ major: 3, minor: 0, explicit: true });
+    expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: true });
   });
 });
 
@@ -316,7 +316,7 @@ describe('§9.4 延迟统计（中位 / 方差）', () => {
       at(cycle + latency, '[pip] "T", bubble');
       cycle += latency + 1;
     });
-    const lines = ['chiperf 2.0'];
+    const lines = ['chiperf 1.0'];
     for (let c = 1; c <= cycle; c++) lines.push('[clk] p', ...(plan.get(c) ?? []), '[clk] n');
     lines.push('@end');
     return parseChiperf(`${lines.join('\n')}\n`);
@@ -345,7 +345,7 @@ describe('§9.4 延迟统计（中位 / 方差）', () => {
   });
 
   test('没有已完成条目时返回全 0 而不是 NaN', () => {
-    const trace = parseChiperf('chiperf 2.0\n[clk] p\n[pip] "T", 0xa\n[clk] n\n@end\n');
+    const trace = parseChiperf('chiperf 1.0\n[clk] p\n[pip] "T", 0xa\n[clk] n\n@end\n');
     const stats = latencyStats(track(trace, 'T'));
     expect(stats).toMatchObject({ count: 0, min: 0, max: 0, avg: 0, median: 0, variance: 0, histogram: [] });
     expect(Number.isNaN(stats.variance)).toBe(false);
@@ -400,7 +400,7 @@ describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
 
   test('复位后把该级设成空：窗口内没有条目，只有一个气泡（不再有 orphan_exit）', () => {
     const trace = parseChiperf(
-      ['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[rst]', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
+      ['chiperf 1.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[rst]', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
     );
     expect(trace.records.length).toBe(3);
     const t = track(trace, 'T');
@@ -410,7 +410,7 @@ describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
   });
 
   test('[rst] 不接受任何参数', () => {
-    const trace = parseChiperf(['chiperf 2.0', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
+    const trace = parseChiperf(['chiperf 1.0', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
     expect(trace.records.length).toBe(1);
     expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
   });
@@ -424,7 +424,7 @@ describe('连续空泡段长度（§9.4 气泡 + describeSamples）', () => {
    */
   const trace = parseChiperf(
     [
-      'chiperf 2.0',
+      'chiperf 1.0',
       '[clk] p', '[pip] "T", 0xa', '[clk] n',
       '[clk] p', '[pip] "T", bubble', '[clk] n',
       '[clk] p', '[clk] n',
@@ -455,14 +455,14 @@ describe('连续空泡段长度（§9.4 气泡 + describeSamples）', () => {
   });
 
   test('全程有内容时没有气泡段（未闭合条目一直占着）', () => {
-    const dense = parseChiperf(['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '@end', ''].join('\n'));
+    const dense = parseChiperf(['chiperf 1.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '@end', ''].join('\n'));
     expect(bubbleStats(track(dense, 'T'))).toMatchObject({ count: 0, histogram: [] });
   });
 
   test('以结束记录收尾的轨道，最后一拍按 §9.4 算气泡', () => {
     // 结束记录落在第 2 拍：条目占的是 [1, 2)，所以第 2 拍该轨道没有内容
     const closed = parseChiperf(
-      ['chiperf 2.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
+      ['chiperf 1.0', '[clk] p', '[pip] "T", 0xa', '[clk] n', '[clk] p', '[pip] "T", bubble', '[clk] n', '@end', ''].join('\n'),
     );
     const t2 = track(closed, 'T');
     expect(t2.bubbleRanges).toEqual([{ start: 2, end: 2 }]);

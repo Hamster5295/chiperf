@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta design="robustness fixture" note="故意注入未知类型/未知指令/未知属性/非法记录/语义异常"
 @domain core, period=1.0ns, note="声明了 core；文件里故意把一条写成 cor 来触发域拼写诊断"
 # 期望的解析结果见 docs/examples.md（每个注入点标注了期望诊断）

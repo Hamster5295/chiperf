@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta design="dual-clock demo" note="两个时钟域 + 跨时钟域轨道 + 同名不同域的独立计数"
 @domain core, period=1.0ns, note="主时钟 1GHz"
 @domain mem, freq=800MHz, note="内存时钟 800MHz（周期 1.25ns）"

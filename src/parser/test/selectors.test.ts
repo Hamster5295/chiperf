@@ -7,7 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import { equalRuns, eventCounters, parseChiperf, scanValue } from '../src/index.ts';
 
-const SOURCE = `chiperf 2.0
+const SOURCE = `chiperf 1.0
 @domain default, period=1.0ns
 [clk] p
 [evt] "retire", 0x1
@@ -72,7 +72,7 @@ describe('eventCounters', () => {
   });
 
   test('没有 evt 记录时返回空列表', () => {
-    expect(eventCounters(parseChiperf('chiperf 2.0\n[cnt] "x"\n'))).toEqual([]);
+    expect(eventCounters(parseChiperf('chiperf 1.0\n[cnt] "x"\n'))).toEqual([]);
   });
 });
 

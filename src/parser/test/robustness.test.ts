@@ -106,14 +106,14 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
     ['[val] "PC"', 'val 缺值'],
     ['[val] "PC", "unterminated', '字符串未闭合'],
     ['[pip] "IF"', 'pip 缺新值'],
-    ['[pip] "IF", I', 'pip 仍是 v1.x 的方向字（v2.0 起这个词被保留）'],
+    ['[pip] "IF", I', 'pip 值位置写了早期草案的方向字（这个词被保留）'],
     ['[pip] "IF", 1, 2', 'pip 位置参数过多'],
     ['[fsm] "ctrl"', 'fsm 缺状态'],
     ['[val] "PC", 1, dom=123', 'dom 不是域名'],
     ['[val] "PC", 1, async=yes', 'async 不是 0/1'],
     ['[val] "PC", 1, at=1.5p', 'at 值非法'],
     ['[val] "PC", 1, dom=core, 2', '位置参数出现在属性之后'],
-    ['chiperf 2.0', '版本行出现在中间'],
+    ['chiperf 1.0', '版本行出现在中间'],
     ['garbage line', '行首非法'],
   ];
 
@@ -130,21 +130,21 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
 describe('§5.4 版本行', () => {
   test('缺失版本行 ⇒ 按 1.0 解释', () => {
     const trace = parseChiperf('[clk] p\n@end\n');
-    expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: false });
+    expect(trace.version).toMatchObject({ major: 1, minor: 0, explicit: false });
   });
 
   test('未知次版本号被接受', () => {
-    const trace = parseChiperf('chiperf 2.7\n[clk] p\n@end\n');
-    expect(trace.version).toMatchObject({ major: 2, minor: 7, explicit: true });
+    const trace = parseChiperf('chiperf 1.7\n[clk] p\n@end\n');
+    expect(trace.version).toMatchObject({ major: 1, minor: 7, explicit: true });
   });
 
   test('未知主版本默认拒绝，ignoreVersion 时可解析', () => {
-    expect(() => parseChiperf('chiperf 3.0\n[clk] p\n')).toThrow(UnsupportedVersionError);
+    expect(() => parseChiperf('chiperf 2.0\n[clk] p\n')).toThrow(UnsupportedVersionError);
     expect(parseChiperf('chiperf 2.0\n[clk] p\n', { ignoreVersion: true }).records.length).toBe(1);
   });
 
   test('空文件与仅注释文件是合法空轨迹，且不报"可能被截断"', () => {
-    for (const text of ['', '\n\n', '# 只有注释\n', 'chiperf 2.0\n']) {
+    for (const text of ['', '\n\n', '# 只有注释\n', 'chiperf 1.0\n']) {
       const trace = parseChiperf(text);
       expect(trace.records.length).toBe(0);
       expect(trace.diagnosticCounts.get('eof_without_end_marker') ?? 0).toBe(0);
@@ -159,7 +159,7 @@ describe('§5.4 版本行', () => {
 
 describe('§3.2 编码与行终止', () => {
   test('CRLF 被容忍', () => {
-    const trace = parseChiperf('chiperf 2.0\r\n[clk] p\r\n[cnt] "a"\r\n@end\r\n');
+    const trace = parseChiperf('chiperf 1.0\r\n[clk] p\r\n[cnt] "a"\r\n@end\r\n');
     expect(trace.records.length).toBe(2);
     expect(trace.diagnostics.length).toBe(0);
   });
@@ -167,8 +167,8 @@ describe('§3.2 编码与行终止', () => {
   // 注释对**所有**行生效（spec §4.1）：版本行与 @ 指令也不例外
   // （曾经只对事件记录生效，结果 `@domain core, period=1.0ns  # 主时钟` 整行被跳过、域声明静默丢失）
   test('版本行与 @ 指令上的行尾注释不被当成内容', () => {
-    const trace = parseChiperf('chiperf 2.0   # 版本行\n@meta design="x" # 元数据\n@domain core, period=1.0ns # 主时钟\n[clk] p, dom=core\n@end # 完\n');
-    expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: true, raw: 'chiperf 2.0' });
+    const trace = parseChiperf('chiperf 1.0   # 版本行\n@meta design="x" # 元数据\n@domain core, period=1.0ns # 主时钟\n[clk] p, dom=core\n@end # 完\n');
+    expect(trace.version).toMatchObject({ major: 1, minor: 0, explicit: true, raw: 'chiperf 1.0' });
     expect(trace.meta).toEqual({ design: 'x' });
     expect(trace.domains.get('core')!.periodNs).toBe(1);
     expect(trace.skipped).toEqual([]);

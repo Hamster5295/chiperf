@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta design="truncation fixture" note="模拟仿真崩溃：末尾记录只写了一半，且没有 @end"
 [clk] p
 [cnt] "Retired"

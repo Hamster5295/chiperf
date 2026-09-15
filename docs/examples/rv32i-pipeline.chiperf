@@ -1,4 +1,4 @@
-chiperf 2.0
+chiperf 1.0
 @meta design="rv32i-demo" tool="hand-written" note="演示轨迹：覆盖 7 种记录类型，非时序精确模型"
 @domain default, period=1.0ns, note="单一时钟，只插桩上升沿"
 # 指令表（tag 即 PC）：
