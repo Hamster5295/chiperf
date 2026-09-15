@@ -293,3 +293,51 @@ describe('future-version.chiperf（docs/examples.md §8）', () => {
     expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: true });
   });
 });
+
+describe('§9.4 延迟统计（中位 / 方差）', () => {
+  /** 造一条只有一个轨道 T 的轨迹：入都在周期 1，出按给定的延迟落在各自周期 */
+  const traceWithLatencies = (latencies: number[]): Trace => {
+    const lines = ['chiperf 1.0', '[clk] p'];
+    latencies.forEach((_, index) => lines.push(`[pip] "T", I, 0x${(index + 10).toString(16)}`));
+    lines.push('[clk] n');
+    const max = Math.max(...latencies);
+    for (let cycle = 2; cycle <= 1 + max; cycle++) {
+      lines.push('[clk] p');
+      latencies.forEach((latency, index) => {
+        if (latency === cycle - 1) lines.push(`[pip] "T", O, 0x${(index + 10).toString(16)}`);
+      });
+      lines.push('[clk] n');
+    }
+    lines.push('@end');
+    return parseChiperf(`${lines.join('\n')}\n`);
+  };
+
+  test('奇数个样本：中位数取中间那个', () => {
+    const stats = latencyStats(track(traceWithLatencies([1, 1, 3]), 'T'));
+    expect(stats.count).toBe(3);
+    expect(stats.median).toBe(1);
+    expect(stats.avg).toBeCloseTo(5 / 3, 10);
+    expect(stats.variance).toBeCloseTo(8 / 9, 10);
+  });
+
+  test('偶数个样本：中位数取中间两个的平均', () => {
+    const stats = latencyStats(track(traceWithLatencies([1, 2]), 'T'));
+    expect(stats.median).toBe(1.5);
+    expect(stats.avg).toBe(1.5);
+    expect(stats.variance).toBeCloseTo(0.25, 10);
+  });
+
+  test('延迟全部相同：方差为 0，直方图只有一档', () => {
+    const stats = latencyStats(track(traceWithLatencies([2, 2, 2]), 'T'));
+    expect(stats.median).toBe(2);
+    expect(stats.variance).toBeCloseTo(0, 10);
+    expect(stats.histogram).toEqual([{ latency: 2, count: 3 }]);
+  });
+
+  test('没有已完成条目时返回全 0 而不是 NaN', () => {
+    const trace = parseChiperf('chiperf 1.0\n[clk] p\n[pip] "T", I, 0xa\n[clk] n\n@end\n');
+    const stats = latencyStats(track(trace, 'T'));
+    expect(stats).toMatchObject({ count: 0, min: 0, max: 0, avg: 0, median: 0, variance: 0, histogram: [] });
+    expect(Number.isNaN(stats.variance)).toBe(false);
+  });
+});

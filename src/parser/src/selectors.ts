@@ -146,27 +146,43 @@ export function occupancySeries(track: TrackInfo, from: number, to: number): num
 }
 
 /** 延迟统计（同域完成条目，spec §9.4） */
+/**
+ * 延迟统计（同域完成条目，spec §9.4）。
+ *
+ * 中位数与方差是**总体**口径（除以 n）：轨迹里的条目就是全部样本，不是抽样。
+ * 方差用 `E[x²] − E[x]²` 一次遍历算出，避免先求平均再回头扫一遍。
+ */
 export function latencyStats(track: TrackInfo): {
   count: number;
   min: number;
   max: number;
   avg: number;
+  /** 中位数：偶数个取中间两个的平均 */
+  median: number;
+  /** 总体方差（单位是周期²）；开方得标准差 */
+  variance: number;
   histogram: { latency: number; count: number }[];
 } {
   const xs = track.latencies;
-  if (xs.length === 0) return { count: 0, min: 0, max: 0, avg: 0, histogram: [] };
+  if (xs.length === 0) return { count: 0, min: 0, max: 0, avg: 0, median: 0, variance: 0, histogram: [] };
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
   let sum = 0;
+  let sumSquares = 0;
   const bins = new Map<number, number>();
   for (const x of xs) {
     min = Math.min(min, x);
     max = Math.max(max, x);
     sum += x;
+    sumSquares += x * x;
     bins.set(x, (bins.get(x) ?? 0) + 1);
   }
+  const avg = sum / xs.length;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const median = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
   const histogram = [...bins].sort((a, b) => a[0] - b[0]).map(([latency, count]) => ({ latency, count }));
-  return { count: xs.length, min, max, avg: sum / xs.length, histogram };
+  return { count: xs.length, min, max, avg, median, variance: sumSquares / xs.length - avg * avg, histogram };
 }
 
 /** 计数器之间的比率（如命中率）：两条 `delta_between` 相除（spec §9.2） */
