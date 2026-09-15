@@ -219,7 +219,7 @@ interface Surface {
 interface Registry extends Surface {
   lanes: LaneRegistration[];
   itemBoxes: Map<string, Box>;
-  /** 形状收集器：实色条目交给画布（WebGPU / Canvas2D），文字与空心/虚线标记仍留在 SVG */
+  /** 形状收集器：实色条目交给画布（Canvas2D），文字与空心/虚线标记仍留在 SVG */
   shapes: ShapeSink | null;
   selLine: SVGLineElement;
   selBox: SVGRectElement;
@@ -664,7 +664,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   axisLayer(svg, plot, primary, ctx);
 
   // 画布：和 SVG 同尺寸、绝对定位在它下面（形状在下、文字/悬停在上），随滚动一起移动。
-  // 每次重建都新建 canvas 会让"后端绑定在旧画布上"（WebGPU 的 context 不能换），
+  // 每次重建都新建 canvas 会让"后端绑定在旧画布上"（context 一旦取过就换不了），
   // 所以整个视图共用一个 canvas，只改尺寸。
   // 画布是**视口大小**的：绘图区可能有几万像素宽，而 GPU 纹理边长通常只有 8k~16k ——
   // 按整幅图开画布会让整条管线校验失败、什么都不出来（Canvas2D 因为不挑尺寸，反倒看不出来）。
@@ -784,7 +784,12 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   latestScene = scene;
   pendingRows_ = pendingRows;
   rasterPlot = { wrap: plotWrap, scroll };
+  const isLoad = buildingForLoad && !hasBuilt;
+  buildingForLoad = false;
+  hasBuilt = true;
   paintRowsChunked(pendingRows, reg, ctx, {
+    load: isLoad,
+    reveal: plotWrap,
     onDone: () => {
       applyRasterFrame();
     },
@@ -844,9 +849,8 @@ function applyRasterFrame(): void {
 /**
  * 交给画布画一帧，并把"画布自己坏了"挡在这里。
  *
- * WebGPU 出错的方式很讨厌：管线校验失败时 `draw` 可能抛错，也可能只是不再出图 ——
- * 两种都会让波形看起来"缺一块/错位"。所以一旦抛错就整体退回 SVG 路径并重画一次，
- * 宁可慢一点，也不要留着半张错的图。
+ * 画布出错的方式很讨厌：`draw` 可能抛错，也可能只是不再出图 —— 两种都会让波形看起来
+ * "缺一块/错位"。所以一旦抛错就整体退回 SVG 路径并重画一次：宁可慢一点，也不要留着半张错的图。
  */
 function drawRaster(scene: RasterScene): void {
   const backend = rasterState.backend;
@@ -878,9 +882,9 @@ function scheduleRasterFrame(): void {
 
 /**
  * 形状层实际用的后端：界面左上角显示一枚小 chip。
- * 画布路径与 GPU 有关，用户需要一眼看出"到底走的是哪条"（`?gpu=0` 强制 Canvas2D、`?gpu=1` 强制 WebGPU）。
+ * 画布在个别环境下会拿不到（老浏览器、被策略禁用……），所以把实际走的那条路显示出来。
  */
-function markBackend(kind: 'webgpu' | 'canvas2d' | 'svg'): void {
+function markBackend(kind: 'canvas2d' | 'svg'): void {
   const host = document.querySelector('#main .view-head') ?? document.querySelector('#main');
   if (host === null) return;
   let node = host.querySelector<HTMLElement>('.raster-kind');
@@ -888,9 +892,13 @@ function markBackend(kind: 'webgpu' | 'canvas2d' | 'svg'): void {
     node = el('span', { class: 'chip raster-kind', style: 'margin-left:8px' });
     host.append(node);
   }
-  node.textContent = kind === 'svg' ? '形状层：SVG（画布不可用）' : `形状层：${kind === 'webgpu' ? 'WebGPU' : 'Canvas2D'}`;
-  node.title = '波形形状由画布绘制（文字与悬停仍在 SVG）。?gpu=0 强制 Canvas2D，?gpu=1 强制 WebGPU';
+  node.textContent = kind === 'svg' ? '形状层：SVG（画布不可用）' : '形状层：Canvas2D';
+  node.title = '波形形状由 Canvas2D 绘制（文字与悬停仍在 SVG）';
 }
+
+/** 这一轮 build 是不是"刚载入文件"（分片画 + 画完才揭开）；交互重建走同步一遍过 */
+let buildingForLoad = false;
+let hasBuilt = false;
 
 /** 视图共用的画布元素（后端与它绑定，见 ensureRaster） */
 let sharedCanvas: HTMLCanvasElement | null = null;
@@ -909,8 +917,7 @@ function rasterCanvas(): HTMLCanvasElement {
 let latestScene: RasterScene | null = null;
 
 /**
- * 画布后端：进程内只建一次（请求 adapter 是异步的），失败则整条路径退回 SVG。
- * `?gpu=0` 强制 Canvas2D、`?gpu=1` 强制 WebGPU（两者在 raster.ts 里处理）。
+ * 画布后端：进程内只建一次，失败则整条路径退回 SVG（形状回到 SVG 节点上）。
  */
 const rasterState: { ok: boolean; backend: RasterBackend | null } = { ok: true, backend: null };
 let rasterStarted = false;
@@ -1014,30 +1021,47 @@ function paintRowsChunked(
   pending: { g: SVGGElement; row: LaneRow; y: number; h: number }[],
   reg: Registry,
   ctx: ViewContext,
-  hooks: { onDone?: () => void } = {},
+  hooks: { onDone?: () => void; load?: boolean; reveal?: HTMLElement | null } = {},
 ): void {
   if (pending.length === 0) return;
+  const paintOne = (i: number): void => {
+    const { g, row, y, h } = pending[i]!;
+    // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
+    reg.currentRow = { key: row.key, y, h, color: row.color };
+    row.draw(g, reg, y, h);
+    reg.currentRow = null;
+  };
+  const finish = (): void => {
+    // 揭开：整帧画完之前一直藏着，所以不会看到"画了一半"的波形
+    if (hooks.reveal != null) hooks.reveal.style.visibility = '';
+    applyState();
+    hooks.onDone?.();
+  };
+
+  // 交互重建（缩放/拖动/改选项）：**一次画完**。宁可这一帧多花几十毫秒，也不要分帧填出半成品 ——
+  // 滚轮已经被合并成"一帧最多重建一次"，所以这里的耗时就是用户感知到的那一下。
+  if (hooks.load !== true) {
+    for (let i = 0; i < pending.length; i++) paintOne(i);
+    finish();
+    return;
+  }
+
+  // 首次载入：分片画（大文件几十个泳道，一次画完会卡住首屏），但期间**藏着**，画完再揭开
   const token = abortable();
   paintToken?.abort();
   paintToken = token;
+  if (hooks.reveal != null) hooks.reveal.style.visibility = 'hidden';
   void runChunked(
     pending.length,
     (from, to) => {
-      for (let i = from; i < to; i++) {
-        const { g, row, y, h } = pending[i]!;
-        // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
-        reg.currentRow = { key: row.key, y, h, color: row.color };
-        row.draw(g, reg, y, h);
-        reg.currentRow = null;
-      }
+      for (let i = from; i < to; i++) paintOne(i);
     },
     {
       signal: token.signal,
       budgetMs: 8,
       onProgress: (done, total) => {
         if (done !== total) return;
-        applyState();
-        hooks.onDone?.();
+        finish();
       },
     },
   );
@@ -2575,7 +2599,29 @@ function rebuild(keepScroll: boolean, center: number | null): void {
  * Ctrl/⌘ + 滚轮：以指针所在周期为锚点缩放；普通滚轮保持浏览器原生滚动，
  * 免得横向拖动轨迹时被缩放打断。
  */
+/**
+ * `Ctrl/⌘ + 滚轮` 缩放。**一帧最多重建一次**：触控板一次拨动会连着来十几个 wheel 事件，
+ * 每个都重建一遍所有泳道的话，既浪费又会明显掉帧 —— 这里只累乘倍数，等到下一帧再动手。
+ */
 function installWheelZoom(scroll: HTMLElement): void {
+  let factor = 1;
+  let anchor = 0;
+  let scheduled = false;
+  let settleTimer = 0;
+
+  const flush = (): void => {
+    scheduled = false;
+    const applied = factor;
+    factor = 1;
+    if (applied === 1) return;
+    const plot = registry?.plot;
+    if (!plot) return;
+    fitWidth = false;
+    ctxRef!.options.zoom = Number((plot.pxPerCycle * applied).toFixed(4));
+    // 一次拨动可能跨多帧：重建期间先不显示"画到一半"的内容，画完再揭开（见 paintRowsChunked）
+    rebuild(false, anchor);
+  };
+
   scroll.addEventListener(
     'wheel',
     (event) => {
@@ -2585,14 +2631,23 @@ function installWheelZoom(scroll: HTMLElement): void {
       const reg = registry;
       const plot = reg?.plot;
       if (!reg || !plot) return;
+      const step = wheel.deltaY < 0 ? 1.2 : 1 / 1.2;
+      const next = plot.pxPerCycle * factor * step;
+      if (!Number.isFinite(next) || next <= 0 || Math.abs(next - plot.pxPerCycle * factor) < 1e-6) return;
       const box = reg.svg.getBoundingClientRect();
       const userX = box.width > 0 ? (wheel.clientX - box.left) * (plot.width / box.width) : plot.x0;
-      const anchor = clamp(Math.round(plot.scale.invert(clamp(userX, plot.x0, plot.x1))), plot.from, plot.to);
-      const next = plot.pxPerCycle * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2);
-      if (!Number.isFinite(next) || next <= 0 || Math.abs(next - plot.pxPerCycle) < 1e-6) return;
-      fitWidth = false;
-      ctxRef!.options.zoom = Number(next.toFixed(4));
-      rebuild(false, anchor);
+      anchor = clamp(Math.round(plot.scale.invert(clamp(userX, plot.x0, plot.x1))), plot.from, plot.to);
+      factor *= step;
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(flush);
+      }
+      // 停下来之后补一次：这一帧里可能还有没合并进来的
+      if (settleTimer !== 0) clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(() => {
+        settleTimer = 0;
+        if (factor !== 1) flush();
+      }, 80);
     },
     { passive: false },
   );
@@ -2747,6 +2802,9 @@ export const timelineView: View = {
     unsub?.();
     hostEl = container;
     ctxRef = ctx;
+    buildingForLoad = true; // 挂载 = 换文件：这一轮分片画、画完才揭开
+    // 交互重建（滚轮/按钮/选项）走同步一遍过，别把半成品露出来
+    hasBuilt = false;
     // 画布是 fixed 定位的视口层：窗口滚动/缩放时要重新摆位并重画（元素自身的横向滚动见 build）
     window.addEventListener('scroll', scheduleRasterFrame, { passive: true });
     window.addEventListener('resize', scheduleRasterFrame);

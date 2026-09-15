@@ -190,17 +190,30 @@ export function tooltip(): {
     document.body.append(tooltipNode);
   }
   const node = tooltipNode;
+  // 悬停每帧都在发生：内容没变就只挪位置，不重写 DOM、更不量尺寸。
+  // （`innerHTML = …` + `getBoundingClientRect()` 会在每次 mousemove 上强制一次布局 ——
+  //   这正是"鼠标一动就卡"的来源。）
+  let shown = '';
+  let width = 0;
+  let height = 0;
   return {
     show(html, x, y) {
-      node.innerHTML = html;
+      if (html !== shown) {
+        shown = html;
+        node.innerHTML = html;
+        const rect = node.getBoundingClientRect();
+        width = rect.width;
+        height = rect.height;
+      }
       node.classList.add('is-visible');
-      const rect = node.getBoundingClientRect();
-      const left = Math.min(window.innerWidth - rect.width - 8, Math.max(8, x + 12));
-      const top = Math.max(8, y - rect.height - 12);
+      const left = Math.min(window.innerWidth - width - 8, Math.max(8, x + 12));
+      const top = Math.max(8, y - height - 12);
       node.style.transform = `translate(${left}px, ${top}px)`;
     },
     hide() {
+      if (!node.classList.contains('is-visible')) return;
       node.classList.remove('is-visible');
+      shown = '';
     },
   };
 }

@@ -7,7 +7,7 @@
  * 布局、命中测试、可访问性都还靠 DOM。
  *
  * 本文件只放：公共类型、纯函数（顶点构造 / 颜色解析 / 轮廓）、后端选择。
- * 具体实现见 raster-webgpu.ts 与 raster-canvas2d.ts。
+ * 实现见 raster-canvas2d.ts。
  * 模块顶层不做任何事（不建 canvas、不请求 adapter、不读 location），import 无副作用。
  *
  * 坐标系：一律是**设备像素**（调用方按 DPR 设好 canvas.width/height 后传 scene.width/height），
@@ -17,7 +17,6 @@ import { parseCssColor } from './contrast.ts';
 import { createCanvas2DBackend } from './raster-canvas2d.ts';
 // 后端模块反过来 import 本文件（类型 + 纯函数），构成循环引用：
 // 两个后端都**只在函数体内**用本文件的绑定，顶层不碰，所以求值顺序不影响结果。
-import { createWebGpuBackend } from './raster-webgpu.ts';
 
 // ------------------------------------------------------------------ 契约类型
 
@@ -41,7 +40,7 @@ export interface RasterScene {
   paths: RasterPath[];
 }
 export interface RasterBackend {
-  readonly kind: 'webgpu' | 'canvas2d';
+  readonly kind: 'canvas2d';
   /** 把整个场景重画一遍（调用方每帧构造新 scene，不做增量） */
   draw(scene: RasterScene): void;
   destroy(): void;
@@ -315,35 +314,13 @@ export function buildVertices(scene: RasterScene, reuse?: RasterVertices): Raste
 
 // ------------------------------------------------------------------ 后端选择
 
-/** `?gpu=` 的三态：默认自动，`?gpu=0` 强制 Canvas2D，`?gpu=1` 强制 WebGPU */
-type GpuMode = 'auto' | 'off' | 'on';
-
-function gpuMode(): GpuMode {
-  if (typeof globalThis.location === 'undefined') return 'auto';
-  const value = new URLSearchParams(globalThis.location.search).get('gpu');
-  if (value === '0') return 'off';
-  if (value === '1') return 'on';
-  return 'auto';
-}
-
 /**
- * 优先 WebGPU，不可用/初始化失败时回退 Canvas2D；**默认绝不抛错**。
+ * 造形状层后端。**只用 Canvas2D**。
  *
- * - 默认：`navigator.gpu` 存在 → `requestAdapter()` → `requestDevice()`，任一步失败都静默回退；
- * - `?gpu=0`：直接用 Canvas2D（有 GPU 也不用 —— 对比性能、或是怀疑驱动有问题时排查用）；
- * - `?gpu=1`：只接受 WebGPU，拿不到就抛 —— 用来确认"到底有没有走 GPU"，而不是被静默回退骗了。
- *
- * 注意 `?gpu=1` 下 `requestDevice()` 失败也可能是**异步**的（device lost），
- * 那种情况由 WebGPU 后端自己处理成 draw 空操作，见 raster-webgpu.ts。
+ * 曾经有过一条 WebGPU 路径：它在"画布按整幅图开"的用法下必然超纹理上限、整条管线校验失败，
+ * 表现是形状画错或干脆不出图（Canvas2D 不挑尺寸，所以只有 GPU 路径会暴露）。既然收益没有兑现、
+ * 失败模式又难查，就整条回退掉 —— 形状层是否用 GPU 不是这个工具的核心问题。
  */
 export async function createRasterBackend(canvas: HTMLCanvasElement): Promise<RasterBackend> {
-  const mode = gpuMode();
-  if (mode === 'off') return createCanvas2DBackend(canvas);
-  if (mode === 'on') return createWebGpuBackend(canvas);
-  try {
-    return await createWebGpuBackend(canvas);
-  } catch {
-    // 静默回退：GPU 只是加速手段，拿不到也得能画
-    return createCanvas2DBackend(canvas);
-  }
+  return createCanvas2DBackend(canvas);
 }

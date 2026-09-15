@@ -1,5 +1,5 @@
 /**
- * Canvas2D 后端 —— WebGPU 不可用时的兜底（老浏览器、软件渲染、驱动出问题……）
+ * 形状层的唯一后端：Canvas2D。
  *
  * 形状同样是"一帧画完、不建 DOM 节点"：这里的瓶颈是 CPU 光栅化，但节点数不再随数据增长，
  * 几万个块也只是几十万次路径填充，比往 DOM 里塞 4 万个节点（每次缩放 1.7 秒）快得多。
@@ -7,7 +7,7 @@
  * 两个实现细节：
  * - 切角自己用 moveTo/lineTo 画：`roundRect` 不是所有环境都有，而且它只支持圆角、不支持切角；
  * - 折线直接 `stroke`：跟原来 SVG 里的阶梯波形一个画法（lineJoin/lineCap = round），
- *   线宽、端点圆头都交给 canvas，不用像 WebGPU 那样在 CPU 上展开三角形。
+ *   线宽、端点圆头都交给 canvas，不必在 CPU 上展开三角形。
  *
  * 颜色和 alpha 原样交给 canvas（`fillStyle`/`globalAlpha`）：CSS 颜色它自己认识，
  * `#rrggbbaa` 里的 alpha 也会跟 `globalAlpha` 相乘，这里不用解析。
@@ -31,7 +31,7 @@ export function createCanvas2DBackend(canvas: HTMLCanvasElement): RasterBackend 
 
     draw(scene: RasterScene): void {
       context.clearRect(0, 0, scene.width, scene.height);
-      // 与 WebGPU 后端同一套坐标：形状坐标减去可见区原点（滚动偏移）
+      // 形状坐标减去可见区原点（滚动偏移），与滚动位置对齐
       context.translate(-(scene.offsetX ?? 0), -(scene.offsetY ?? 0));
 
       for (const box of scene.boxes) {
