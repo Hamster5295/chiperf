@@ -25,9 +25,11 @@ import type {
   ValueTrack,
 } from '../../../parser/src/index.ts';
 import {
+  counterTotalAt,
   formatPosition,
   stateSegments,
   valueAt,
+  type CounterTrack,
   type FsmTrack,
 } from '../../../parser/src/index.ts';
 import {
@@ -69,7 +71,7 @@ const AXIS_H = 30;
 /** 绘图区左右内边距（px） */
 const SIDE = 8;
 /** 泳道高度（px） */
-const H = { clk: 34, fsm: 30, pip: 30, value: 36, evt: 26 } as const;
+const H = { clk: 34, fsm: 30, pip: 30, cnt: 36, value: 36, evt: 26 } as const;
 /** 行间距（px）：行之间留白，靠间距而不是分隔线区分行 */
 const ROW_GAP = 9;
 /**
@@ -204,22 +206,24 @@ interface Registry extends Surface {
   currentRow: { key: string; y: number; h: number; color: string } | null;
 }
 
+/** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
+type LaneGroup = 'clock' | 'fsm' | 'pipeline' | 'counter' | 'value' | 'event';
+
 /** 行分组 → 中文名（"已隐藏的行"菜单里标出来源） */
 const GROUP_NAME: Record<LaneGroup, string> = {
   clock: '时钟',
   fsm: '状态机',
   pipeline: '流水线',
+  counter: '计数器',
   value: '数值',
   event: '事件',
 };
-
-/** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
-type LaneGroup = 'clock' | 'fsm' | 'pipeline' | 'value' | 'event';
 
 const GROUP_TINT: Record<LaneGroup, string> = {
   clock: 'color-mix(in srgb, var(--accent) 16%, transparent)',
   fsm: 'color-mix(in srgb, #0d9488 15%, transparent)',
   pipeline: 'var(--surface-2)',
+  counter: 'color-mix(in srgb, #0891b2 14%, transparent)',
   value: 'color-mix(in srgb, #7c3aed 13%, transparent)',
   event: 'color-mix(in srgb, #d97706 14%, transparent)',
 };
@@ -233,8 +237,8 @@ interface LaneRow {
   label: string;
   color: string;
   height: number;
-  /** 右键菜单可配置的内容（显示格式 / 显示模式） */
-  menu?: { formatKey?: string; formatWidth?: number; modeKey?: string };
+  /** 右键菜单可配置的内容（显示格式 / 显示模式；`row` 一节里还有"隐藏此行"） */
+  menu?: { formatKey?: string; formatWidth?: number; modeKey?: string; defaultMode?: ValueMode; allowRv?: boolean };
   /** 标签列点击 / 悬停时广播的选中态 */
   select?: Selection;
   hover?: Selection;
@@ -946,6 +950,11 @@ function buildRows(
     if (visible(track.domain)) rows.push(pipLane(track, ctx));
   }
 
+  // 计数器：累计值是普通数值序列（默认折线），与数值行共用一套画法
+  for (const track of trace.counters.values()) {
+    if (visible(track.domain)) rows.push(counterLane(track, ctx));
+  }
+
   // 数值：保持型阶梯（采样后一直保持到下一条），变化点单独标出来
   for (const track of trace.values.values()) {
     if (visible(track.domain)) rows.push(valueLane(track, ctx));
@@ -1360,30 +1369,56 @@ function numericOf(value: ScalarValue): number | null {
   return null;
 }
 
-function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
-  const color = colorFor(track.key);
-  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
-  const format = valueFormatOf(track.key);
-  const mode = valueModeOf(track.key);
+/** 采样序列泳道的差异点：几何画法共用，取数与提示各管各的 */
+interface SeriesConfig {
+  /** 行键（也是隐藏/记忆用的键，如 `val:core.ipc` / `cnt:core.retired`） */
+  key: string;
+  name: string;
+  domain: string;
+  group: LaneGroup;
+  color: string;
+  height: number;
+  hover: Selection;
+  /** 有数值的采样点（按文件顺序） */
+  points: { pos: Position; async: boolean; value: ScalarValue; numeric: number; unknown: boolean }[];
+  /** 没有数值时的"变化点"（字符串/符号轨） */
+  marks: { pos: Position; async: boolean }[];
+  defaultMode: ValueMode;
+  /** 是否提供 rv32/rv64（计数器这类非指令流不给） */
+  allowRv: boolean;
+  tip: (cycle: number, format: ValueFormat) => string;
+}
+
+/**
+ * 一条"采样序列"泳道：数值轨与计数器轨共用。
+ * 三种显示模式（六边形块 / 折线 / 保持型阶梯）的画法只写在这里一份。
+ */
+function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
+  const format = valueFormatOf(cfg.key);
+  const mode = valueModeOf(cfg.key, cfg.defaultMode);
   return {
     kind: 'lane',
-    group: 'value',
-    key: `val:${track.key}`,
-    domain: track.domain,
-    label: track.name,
-    color,
-    height: H.value,
-    hover: { kind: 'value', key: track.key },
-    menu: valueMenu(track),
+    group: cfg.group,
+    key: cfg.key,
+    domain: cfg.domain,
+    label: cfg.name,
+    color: cfg.color,
+    height: cfg.height,
+    hover: cfg.hover,
+    menu: {
+      formatKey: cfg.key,
+      formatWidth: widthOf(cfg.points.map((point) => point.value)),
+      modeKey: cfg.key,
+      defaultMode: cfg.defaultMode,
+      allowRv: cfg.allowRv,
+    },
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const pad = 7;
       const top = y + pad;
       const bottom = y + h - pad;
-      const numeric = shown
-        .map((sample) => ({ sample, value: numericOf(sample.value) }))
-        .filter((entry): entry is { sample: (typeof shown)[number]; value: number } => entry.value !== null);
-      const values = numeric.map((entry) => entry.value);
+      const numeric = cfg.points;
+      const values = numeric.map((entry) => entry.numeric);
       const min = values.length > 0 ? Math.min(...values) : 0;
       const max = values.length > 0 ? Math.max(...values) : 1;
       const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
@@ -1392,38 +1427,44 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       if (numeric.length > 0) {
         const first = numeric[0]!;
         const last = numeric[numeric.length - 1]!;
-        const firstX = xOf(first.sample.pos, first.sample.async);
-        const lastX = xOf(last.sample.pos, last.sample.async);
-        const points = numeric.map((entry) => [xOf(entry.sample.pos, entry.sample.async), yOf(entry.value)] as [number, number]);
+        const firstX = xOf(first.pos, first.async);
+        const lastX = xOf(last.pos, last.async);
+        const points = numeric.map((entry) => [xOf(entry.pos, entry.async), yOf(entry.numeric)] as [number, number]);
         if (mode === 'blocks') {
           // 六边形块：每个采样到下一个采样之间一段，块里直接写出格式化后的值
           const blockH = clamp(h - 14, 12, 24);
-          const segments: { left: number; right: number; value: number | null; sample: (typeof numeric)[number]['sample']; faint: boolean }[] = [];
-          if (firstX > reg.plot.x0 + 0.5) segments.push({ left: reg.plot.x0, right: firstX, value: first.value, sample: first.sample, faint: true });
+          const segments: { left: number; right: number; value: ScalarValue; numeric: number; unknown: boolean; faint: boolean }[] = [];
+          if (firstX > reg.plot.x0 + 0.5) {
+            segments.push({ left: reg.plot.x0, right: firstX, value: first.value, numeric: first.numeric, unknown: first.unknown, faint: true });
+          }
           for (let index = 0; index < numeric.length; index++) {
             const entry = numeric[index]!;
             const next = numeric[index + 1];
-            const left = xOf(entry.sample.pos, entry.sample.async);
-            const right = next ? xOf(next.sample.pos, next.sample.async) : reg.plot.x1;
-            segments.push({ left, right, value: entry.value, sample: entry.sample, faint: false });
+            segments.push({
+              left: xOf(entry.pos, entry.async),
+              right: next ? xOf(next.pos, next.async) : reg.plot.x1,
+              value: entry.value,
+              numeric: entry.numeric,
+              unknown: entry.unknown,
+              faint: false,
+            });
           }
           for (const segment of segments) {
             const left = clamp(segment.left, reg.plot.x0, reg.plot.x1);
             const right = clamp(segment.right, reg.plot.x0, reg.plot.x1);
             if (right - left < 1) continue;
-            const unknown = segment.sample.value.hasXZ === true;
             // 六边形块只管"这一段是这个值"，不承担数值高低的表达：一律竖直居中，
             // 否则同一行里块会随数值上下跳，反而不利于对比相邻的取值
             const centerY = (top + bottom) / 2;
             g.append(
               svgEl('path', {
                 d: hexPath(left, right, centerY - blockH / 2, centerY + blockH / 2, 5),
-                fill: unknown ? 'var(--surface)' : color,
-                'fill-opacity': segment.faint ? 0.15 : unknown ? 1 : 0.9,
-                stroke: color,
+                fill: segment.unknown ? 'var(--surface)' : cfg.color,
+                'fill-opacity': segment.faint ? 0.15 : segment.unknown ? 1 : 0.9,
+                stroke: cfg.color,
                 'stroke-width': 1.1,
                 'stroke-linejoin': 'round',
-                ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
+                ...(segment.unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
               }),
             );
             const width = right - left;
@@ -1433,24 +1474,24 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
                   x: (left + right) / 2,
                   y: centerY + 3.6,
                   'text-anchor': 'middle',
-                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(unknown ? null : color, unknown ? 1 : segment.faint ? 0.15 : 0.9)}`,
-                  text: clip(formatScalarBy(segment.sample.value, format), width - 8),
+                  style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(segment.unknown ? null : cfg.color, segment.unknown ? 1 : segment.faint ? 0.15 : 0.9)}`,
+                  text: clip(formatScalarBy(segment.value, format), width - 8),
                 }),
               );
             }
           }
         } else if (mode === 'line') {
-          // 折线：直接连采样点（两端各补到画布边界，线不断开），适合看数值趋势
+          // 折线：直接连采样点（两端各补到画布边界，线不断开），适合看趋势
           const polyline: [number, number][] = [[reg.plot.x0, points[0]![1]], ...points, [reg.plot.x1, points[points.length - 1]![1]]];
-          g.append(svgEl('path', { d: linePath(polyline), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
+          g.append(svgEl('path', { d: linePath(polyline), fill: 'none', stroke: cfg.color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         } else {
           // 波形：保持型阶梯；首个采样之前用更淡的实线补出（推断段），最后一个采样之后保持到画布右边
           if (firstX > reg.plot.x0 + 0.5) {
             g.append(
               svgEl('path', {
-                d: `M${reg.plot.x0},${yOf(first.value)}L${firstX},${yOf(first.value)}`,
+                d: `M${reg.plot.x0},${yOf(first.numeric)}L${firstX},${yOf(first.numeric)}`,
                 fill: 'none',
-                stroke: color,
+                stroke: cfg.color,
                 'stroke-width': 1.7,
                 'stroke-opacity': 0.45,
               }),
@@ -1459,58 +1500,134 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
           if (lastX < reg.plot.x1 - 0.5) {
             g.append(
               svgEl('path', {
-                d: `M${lastX},${yOf(last.value)}L${reg.plot.x1},${yOf(last.value)}`,
+                d: `M${lastX},${yOf(last.numeric)}L${reg.plot.x1},${yOf(last.numeric)}`,
                 fill: 'none',
-                stroke: color,
+                stroke: cfg.color,
                 'stroke-width': 1.7,
               }),
             );
           }
-          g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
+          g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: cfg.color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         }
         // 采样点标记：块的边界本身就是采样位置，块里也写着值，所以六边形块模式不画点
         if (mode !== 'blocks') {
           for (const entry of numeric) {
-            const x = xOf(entry.sample.pos, entry.sample.async);
-            const unknown = entry.sample.value.hasXZ === true;
             g.append(
               svgEl('circle', {
-                cx: x,
-                cy: yOf(entry.value),
-                r: unknown ? 2.6 : 1.8,
-                fill: unknown ? 'var(--surface)' : color,
-                stroke: color,
+                cx: xOf(entry.pos, entry.async),
+                cy: yOf(entry.numeric),
+                r: entry.unknown ? 2.6 : 1.8,
+                fill: entry.unknown ? 'var(--surface)' : cfg.color,
+                stroke: cfg.color,
                 'stroke-width': 1.1,
-                ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
+                ...(entry.unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
               }),
             );
           }
         }
       } else {
         // 非数值（字符串/符号）：只标变化点，值写在提示里
-        for (const change of shown) {
+        for (const change of cfg.marks) {
           const x = xOf(change.pos, change.async);
-          g.append(svgEl('line', { x1: x, x2: x, y1: top, y2: bottom, stroke: color, 'stroke-width': 1.2, 'stroke-opacity': 0.6 }));
+          g.append(svgEl('line', { x1: x, x2: x, y1: top, y2: bottom, stroke: cfg.color, 'stroke-width': 1.2, 'stroke-opacity': 0.6 }));
         }
         g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: '非数值轨：只标变化点' }));
       }
 
-      cycleSurface(hit, reg, track.domain, ctx, (probe) => {
-        const current = valueAt(track, probe.cycle);
+      cycleSurface(hit, reg, cfg.domain, ctx, (probe) => cfg.tip(probe.cycle, format));
+    },
+  };
+}
+
+/** 数值轨：保持型采样序列，默认按六边形块画（每段一个值） */
+function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
+  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
+  const points = shown
+    .map((sample) => ({ sample, numeric: numericOf(sample.value) }))
+    .filter((entry): entry is { sample: (typeof shown)[number]; numeric: number } => entry.numeric !== null)
+    .map((entry) => ({
+      pos: entry.sample.pos,
+      async: entry.sample.async,
+      value: entry.sample.value,
+      numeric: entry.numeric,
+      unknown: entry.sample.value.hasXZ === true,
+    }));
+  const range = points.map((point) => point.numeric);
+  return seriesLane(
+    {
+      key: `val:${track.key}`,
+      name: track.name,
+      domain: track.domain,
+      group: 'value',
+      color: colorFor(track.key),
+      height: H.value,
+      hover: { kind: 'value', key: track.key },
+      points,
+      marks: shown,
+      defaultMode: 'wave',
+      allowRv: true,
+      tip: (cycle, format) => {
+        const current = valueAt(track, cycle);
         const numericNow = current === null ? null : numericOf(current);
         return [
           `数值 ${track.name}（域 ${track.domain}）`,
-          cycleLabel(probe.cycle),
+          cycleLabel(cycle),
           `该周期末取值 ${current === null ? '（尚未采样）' : formatScalarBy(current, format)}`,
-          numericNow === null ? '' : `区间 ${fmtCompact(min)} – ${fmtCompact(max)}`,
+          numericNow === null || range.length === 0 ? '' : `区间 ${fmtCompact(Math.min(...range))} – ${fmtCompact(Math.max(...range))}`,
           `${track.samples.length} 次采样 · ${track.changes.length} 次变化`,
           current !== null && current.hasXZ === true ? '含未知位/高阻位（x/z）' : '',
         ]
           .filter((line) => line !== '')
           .join('\n');
-      });
+      },
     },
-  };
+    ctx,
+  );
+}
+
+/** 计数器轨：累计值是一条普通数值序列，默认按折线画 */
+function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
+  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
+  const points = shown.map((sample) => ({
+    pos: sample.pos,
+    async: sample.async,
+    value: intScalar(sample.total),
+    numeric: sample.total,
+    unknown: false,
+  }));
+  return seriesLane(
+    {
+      key: `cnt:${track.key}`,
+      name: track.name,
+      domain: track.domain,
+      group: 'counter',
+      color: colorFor(track.key),
+      height: H.cnt,
+      hover: { kind: 'counter', key: track.key },
+      points,
+      marks: [],
+      defaultMode: 'line',
+      allowRv: false,
+      tip: (cycle, format) => {
+        const total = counterTotalAt(track, cycle);
+        const delta = track.deltaByCycle.get(cycle) ?? 0;
+        return [
+          `计数器 ${track.name}（域 ${track.domain}）`,
+          cycleLabel(cycle),
+          `该周期末累计 ${total === null ? '（尚未采样）' : formatScalarBy(intScalar(total), format)}`,
+          `本周期增量 ${delta === 0 ? '0' : `${delta > 0 ? '+' : ''}${fmtInt(delta)}`}`,
+          `${track.samples.length} 条记录 · 终值 ${fmtInt(track.total)}`,
+        ].join('\n');
+      },
+    },
+    ctx,
+  );
+}
+
+/** 计数器这类整数 → ScalarValue：让 dec/hex/oct/bin 的格式选择同样生效 */
+function intScalar(value: number): ScalarValue {
+  const whole = Math.trunc(value);
+  return { kind: 'int', text: String(whole), raw: String(whole), big: BigInt(whole) };
 }
 
 /** 每行数值的显示格式（dec/hex/oct/bin/rv32/rv64），按行记忆，默认 hex */
@@ -1527,8 +1644,9 @@ const VALUE_MODES: { id: ValueMode; label: string; glyph: string }[] = [
 
 const valueModes = new Map<string, ValueMode>();
 
-function valueModeOf(key: string): ValueMode {
-  return valueModes.get(key) ?? 'wave';
+/** 显示模式：用户选过就用用户的，否则用该行类型的默认（数值=六边形块、计数器=折线） */
+function valueModeOf(key: string, fallback: ValueMode = 'wave'): ValueMode {
+  return valueModes.get(key) ?? fallback;
 }
 
 /** 宽度估计：声明宽度 / 实际位数，按行取最大值 */
@@ -1631,9 +1749,14 @@ function menuSectionsFor(row: LaneRow): MenuSection[] {
   if (menu?.formatKey !== undefined) {
     const key = menu.formatKey;
     const width = menu.formatWidth ?? 32;
+    const allowRv = menu.allowRv !== false;
     sections.push({
       title: '显示格式',
-      items: VALUE_FORMATS.filter((item) => (item.id !== 'rv32' && item.id !== 'rv64') || width <= 32).map((item) => ({
+      items: VALUE_FORMATS.filter((item) => {
+        const isRv = item.id === 'rv32' || item.id === 'rv64';
+        // rv32/rv64 只对"≤32 位的指令流"有意义；计数器这类整数值不提供
+        return isRv ? allowRv && width <= 32 : true;
+      }).map((item) => ({
         label: item.label,
         checked: valueFormatOf(key) === item.id,
         pick: () => {
@@ -1645,11 +1768,12 @@ function menuSectionsFor(row: LaneRow): MenuSection[] {
   }
   if (menu?.modeKey !== undefined) {
     const key = menu.modeKey;
+    const fallback = menu.defaultMode ?? 'wave';
     sections.push({
       title: '显示模式',
       items: VALUE_MODES.map((mode) => ({
         label: `${mode.glyph}  ${mode.label}`,
-        checked: valueModeOf(key) === mode.id,
+        checked: valueModeOf(key, fallback) === mode.id,
         pick: () => {
           valueModes.set(key, mode.id);
           rerenderTimeline();
