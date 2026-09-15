@@ -1012,17 +1012,15 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const left = clamp(reg.plot.scale(range.start), reg.plot.x0, reg.plot.x1);
         const right = clamp(reg.plot.scale(range.end + 1), reg.plot.x0, reg.plot.x1);
         const width = Math.max(3, right - left);
-        const box = svgEl('rect', {
-          x: left + 0.5,
-          y: y + 4,
-          width: Math.max(2, width - 1),
-          height: h - 9,
-          rx: 3,
+        // 与条目同一种形状（六边形），只是空心虚线：一眼能看出这是「占位/无内容」
+        const box = svgEl('path', {
+          d: hexPath(left + 0.5, left + 0.5 + Math.max(2, width - 1), y + 4, y + h - 5, 4),
           fill: COLOR.bubble,
           'fill-opacity': 0.08,
           stroke: COLOR.bubble,
           'stroke-width': 1,
           'stroke-dasharray': '4 3',
+          'stroke-linejoin': 'round',
         });
         hoverTarget(
           box,
