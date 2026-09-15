@@ -35,8 +35,6 @@ import {
   type FsmTrack,
 } from '../../../parser/src/index.ts';
 import { abortable, runChunked } from '../chunk.ts';
-import { createRasterBackend, type RasterBackend, type RasterScene } from '../raster.ts';
-import { hideTooltip, showTooltip } from '../charts.ts';
 import {
   axisTicks,
   card,
@@ -219,8 +217,6 @@ interface Surface {
 interface Registry extends Surface {
   lanes: LaneRegistration[];
   itemBoxes: Map<string, Box>;
-  /** 形状收集器：实色条目交给画布（Canvas2D），文字与空心/虚线标记仍留在 SVG */
-  shapes: ShapeSink | null;
   selLine: SVGLineElement;
   selBox: SVGRectElement;
   hoverBox: SVGRectElement;
@@ -231,19 +227,6 @@ interface Registry extends Surface {
   hoverTag: SVGTextElement;
   /** 渲染循环在调用 row.draw 前写入，供 cycleSurface 捕获（不改各泳道的绘制签名） */
   currentRow: { key: string; y: number; h: number; color: string } | null;
-}
-
-/**
- * 形状收集器：把"实色内容块"收进画布场景，而不是变成 SVG 节点。
- *
- * 大文件的时间轴里，光流水线条目就能堆出上万个 `<path>` —— 每个节点都带自己的悬停处理，
- * 缩放一次要重建它们全部（实测 1.7 秒）。形状改由画布一遍画完后，
- * 节点数与重建开销与条目数**无关**；文字标签、空心/虚线标记（气泡、未闭合）仍画在 SVG 上，
- * 因为那几样数量很小，而且需要 DOM 才有的交互与虚线描边。
- */
-interface ShapeSink {
-  /** 左右切角的实色块（`hexPath` 的等价物）：画布坐标系 = SVG 用户坐标系 */
-  box(x0: number, x1: number, top: number, bottom: number, chamfer: number, color: string, alpha: number): void;
 }
 
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
@@ -663,38 +646,11 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   const svg = svgRoot(plot.width, plot.height, { style: 'flex:0 0 auto' });
   axisLayer(svg, plot, primary, ctx);
 
-  // 画布：和 SVG 同尺寸、绝对定位在它下面（形状在下、文字/悬停在上），随滚动一起移动。
-  // 每次重建都新建 canvas 会让"后端绑定在旧画布上"（context 一旦取过就换不了），
-  // 所以整个视图共用一个 canvas，只改尺寸。
-  // 画布是**视口大小**的：绘图区可能有几万像素宽，而 GPU 纹理边长通常只有 8k~16k ——
-  // 按整幅图开画布会让整条管线校验失败、什么都不出来（Canvas2D 因为不挑尺寸，反倒看不出来）。
-  // 坐标一律乘 DPR 变成设备像素（契约要求），滚动只改 scene.offset，顶点数据不用重打包。
-  const dpr = rasterDpr();
-  const scene: RasterScene = { width: 1, height: 1, offsetX: 0, offsetY: 0, boxes: [], paths: [] };
-  const canvas = rasterCanvas();
-  const raster = ensureRaster(canvas);
-  const shapes: ShapeSink | null = raster.ok
-    ? {
-        box: (x0, x1, top, bottom, chamfer, color, alpha) => {
-          scene.boxes.push({
-            x: x0 * dpr,
-            y: top * dpr,
-            w: Math.max(0.6, (x1 - x0) * dpr),
-            h: Math.max(0.6, (bottom - top) * dpr),
-            color: c2hex(color),
-            alpha,
-            chamfer: chamfer * dpr,
-          });
-        },
-      }
-    : null;
-
   const reg: Registry = {
     svg,
     plot,
     lanes: [],
     itemBoxes: new Map(),
-    shapes,
     selLine: svgEl('line', {}),
     selBox: svgEl('rect', {}),
     hoverBox: svgEl('rect', {}),
@@ -773,242 +729,23 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   installWheelZoom(scroll);
   installDragZoom(svg);
-  scroll.addEventListener('scroll', scheduleRasterFrame, { passive: true });
   scrollEl = scroll;
   registry = reg;
   chartAvail = scroll.clientWidth;
   lastHostW = host.clientWidth;
-  // 画布上的条目没有 DOM 节点可挂事件，命中测试统一用 reg.itemBoxes（矩形仍然逐条登记）
-  installCanvasItemHover(svg, ctx);
-  // 形状画完之后贴上去（分片绘制期间画布是空的，避免"半成品"闪一下）
-  latestScene = scene;
-  pendingRows_ = pendingRows;
-  rasterPlot = { wrap: plotWrap, scroll };
   const isLoad = buildingForLoad && !hasBuilt;
   buildingForLoad = false;
   hasBuilt = true;
   paintRowsChunked(pendingRows, reg, ctx, {
     load: isLoad,
     reveal: plotWrap,
-    onDone: () => {
-      applyRasterFrame();
-    },
+    onDone: () => {},
   });
-  applyRasterFrame();
-}
-
-/** 当前这一帧的形状（滚动/缩放时复用，不必重新收集） */
-let pendingRows_: { g: SVGGElement; row: LaneRow; y: number; h: number }[] = [];
-let rasterPlot: { wrap: HTMLElement; scroll: HTMLElement } | null = null;
-let rasterRaf = 0;
-
-/** 视口 DPR（形状坐标乘它变成设备像素；页面移动/缩放后按窗口 resize 重画） */
-function rasterDpr(): number {
-  return typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
-}
-
-/**
- * 把画布摆到"绘图区与窗口视口的交集"上，并按滚动偏移重画。
- *
- * 这样一块视口大小的纹理就够了：滚动只是改 scene.offset（着色器里减掉），
- * 顶点数据原样复用 —— 大轨迹横向拖动的帧率因此与全图宽度无关。
- */
-function applyRasterFrame(): void {
-  const scene = latestScene;
-  const plot = rasterPlot;
-  const canvas = sharedCanvas;
-  if (scene === null || plot === null || canvas === null) return;
-  const rect = plot.wrap.getBoundingClientRect();
-  const visibleLeft = Math.max(rect.left, 0);
-  const visibleTop = Math.max(rect.top, 0);
-  const visibleRight = Math.min(rect.right, window.innerWidth);
-  const visibleBottom = Math.min(rect.bottom, window.innerHeight);
-  const cssW = Math.floor(visibleRight - visibleLeft);
-  const cssH = Math.floor(visibleBottom - visibleTop);
-  if (cssW <= 0 || cssH <= 0) {
-    canvas.style.display = 'none';
-    return;
-  }
-  const dpr = rasterDpr();
-  const devW = Math.max(1, Math.round(cssW * dpr));
-  const devH = Math.max(1, Math.round(cssH * dpr));
-  if (canvas.width !== devW || canvas.height !== devH) {
-    canvas.width = devW;
-    canvas.height = devH;
-  }
-  canvas.style.display = '';
-  canvas.style.cssText = `position:fixed;left:${visibleLeft}px;top:${visibleTop}px;width:${cssW}px;height:${cssH}px;pointer-events:none;z-index:1`;
-  scene.width = devW;
-  scene.height = devH;
-  // 画布左上角对应的"绘图坐标系"位置（乘 DPR 变成设备像素，与形状坐标同一套）
-  scene.offsetX = (visibleLeft - rect.left) * dpr;
-  scene.offsetY = (visibleTop - rect.top) * dpr;
-  drawRaster(scene);
-}
-
-/**
- * 交给画布画一帧，并把"画布自己坏了"挡在这里。
- *
- * 画布出错的方式很讨厌：`draw` 可能抛错，也可能只是不再出图 —— 两种都会让波形看起来
- * "缺一块/错位"。所以一旦抛错就整体退回 SVG 路径并重画一次：宁可慢一点，也不要留着半张错的图。
- */
-function drawRaster(scene: RasterScene): void {
-  const backend = rasterState.backend;
-  if (backend === null) return;
-  try {
-    backend.draw(scene);
-  } catch (err) {
-    rasterState.ok = false;
-    rasterState.backend = null;
-    try {
-      backend.destroy();
-    } catch {
-      // 已经坏掉的上下文再销毁一次会抛：忽略，反正不再用了
-    }
-    markBackend('svg');
-    console.warn('画布绘制失败，形状退回 SVG：', err);
-    rebuild(false, currentCenterCycle());
-  }
-}
-
-/** 滚动/改变窗口大小：只重画，不重排 */
-function scheduleRasterFrame(): void {
-  if (rasterRaf !== 0) return;
-  rasterRaf = requestAnimationFrame(() => {
-    rasterRaf = 0;
-    if (latestScene !== null && rasterState.backend !== null) applyRasterFrame();
-  });
-}
-
-/**
- * 形状层实际用的后端：界面左上角显示一枚小 chip。
- * 画布在个别环境下会拿不到（老浏览器、被策略禁用……），所以把实际走的那条路显示出来。
- */
-function markBackend(kind: 'canvas2d' | 'svg'): void {
-  const host = document.querySelector('#main .view-head') ?? document.querySelector('#main');
-  if (host === null) return;
-  let node = host.querySelector<HTMLElement>('.raster-kind');
-  if (node === null) {
-    node = el('span', { class: 'chip raster-kind', style: 'margin-left:8px' });
-    host.append(node);
-  }
-  node.textContent = kind === 'svg' ? '形状层：SVG（画布不可用）' : '形状层：Canvas2D';
-  node.title = '波形形状由 Canvas2D 绘制（文字与悬停仍在 SVG）';
 }
 
 /** 这一轮 build 是不是"刚载入文件"（分片画 + 画完才揭开）；交互重建走同步一遍过 */
 let buildingForLoad = false;
 let hasBuilt = false;
-
-/** 视图共用的画布元素（后端与它绑定，见 ensureRaster） */
-let sharedCanvas: HTMLCanvasElement | null = null;
-function rasterCanvas(): HTMLCanvasElement {
-  if (sharedCanvas === null) {
-    sharedCanvas = document.createElement('canvas');
-    sharedCanvas.className = 'tl-raster';
-    // fixed 定位的视口层：挂到 body，避免被卡片的布局/overflow 裁剪
-    sharedCanvas.style.display = 'none';
-    document.body.append(sharedCanvas);
-  }
-  return sharedCanvas;
-}
-
-/** 最近一帧的场景：后端异步就绪后补画一次，不用整页重排 */
-let latestScene: RasterScene | null = null;
-
-/**
- * 画布后端：进程内只建一次，失败则整条路径退回 SVG（形状回到 SVG 节点上）。
- */
-const rasterState: { ok: boolean; backend: RasterBackend | null } = { ok: true, backend: null };
-let rasterStarted = false;
-function ensureRaster(canvas: HTMLCanvasElement): { ok: boolean; backend: RasterBackend | null } {
-  if (!rasterStarted) {
-    rasterStarted = true;
-    void createRasterBackend(canvas)
-      .then((backend) => {
-        rasterState.backend = backend;
-        // 后端是异步就绪的：把当前这一帧补画到画布上（不重排 DOM）
-        markBackend(backend.kind);
-        if (latestScene !== null) applyRasterFrame();
-      })
-      .catch((err: unknown) => {
-        // 画布起不来 ⇒ 后面的渲染把形状交回 SVG；重画一次把这一帧（画布版）补成 SVG 版
-        rasterState.ok = false;
-        rasterState.backend = null;
-        markBackend('svg');
-        console.warn('画布后端不可用，形状退回 SVG：', err);
-        rebuild(false, currentCenterCycle());
-      });
-  }
-  return rasterState;
-}
-
-/**
- * 画布条目的悬停/点击：形状搬进画布后，`itemBoxes` 里登记的矩形就是唯一的命中依据。
- * 命中后再从对应轨道取回条目，复用与 SVG 条目完全一样的提示与选中行为。
- */
-function installCanvasItemHover(svg: SVGSVGElement, ctx: ViewContext): void {
-  let current: string | null = null;
-  const pick = (event: MouseEvent): { key: string; item: PipelineItem; track: TrackInfo } | null => {
-    const reg = registry;
-    if (!reg) return null;
-    // 指针压在 SVG 条目上时由它自己的处理器负责，这里不重复弹提示
-    if ((event.target as Element | null)?.closest?.('[data-item]') !== null && event.target !== svg) {
-      const el0 = event.target as Element;
-      if (el0.closest('[data-item]')) return null;
-    }
-    const box = svg.getBoundingClientRect();
-    if (box.width === 0 || box.height === 0) return null;
-    const x = (event.clientX - box.left) * (reg.plot.width / box.width);
-    const y = (event.clientY - box.top) * (reg.plot.height / box.height);
-    for (const [key, b] of reg.itemBoxes) {
-      if (x < b.x || x > b.x + b.w || y < b.y || y > b.y + b.h) continue;
-      const [trackName, seq] = key.split('\u0000');
-      const track = ctx.trace.tracks.get(trackName!);
-      const item = track?.items.find((it) => it.enterSeq === Number(seq));
-      if (track && item) return { key, item, track };
-    }
-    return null;
-  };
-  const onMove = (event: MouseEvent): void => {
-    if (dragZooming) return;
-    const found = pick(event);
-    if (found === null) {
-      if (current !== null) {
-        current = null;
-        hideTooltip();
-        broadcastHover(ctx, null);
-      }
-      return;
-    }
-    if (found.key !== current) {
-      current = found.key;
-      broadcastHover(ctx, { kind: 'item', track: found.track.name, enterSeq: found.item.enterSeq });
-    }
-    showTooltip(pipTip(found.track, found.item, found.item.close === null), event.clientX, event.clientY);
-  };
-  svg.addEventListener('mousemove', onMove);
-  svg.addEventListener('mouseleave', () => {
-    if (current === null) return;
-    current = null;
-    hideTooltip();
-    broadcastHover(ctx, null);
-  });
-  svg.addEventListener('click', (event) => {
-    const found = pick(event as MouseEvent);
-    if (found === null) return;
-    ctx.selection.set({ kind: 'item', track: found.track.name, enterSeq: found.item.enterSeq });
-  });
-}
-
-/** `#rgb`/`rgb()`/`rgba()` 归一到 `#rrggbb`（raster 那边只认十六进制） */
-function c2hex(color: string): string {
-  if (color.startsWith('#')) return color.length === 4 ? `#${color[1]}${color[1]}${color[2]}${color[2]}${color[3]}${color[3]}` : color;
-  const m = /rgba?\(([^)]+)\)/.exec(color);
-  if (!m) return '#888888';
-  const [r, g, b] = m[1]!.split(/[\s,/]+/).map((v) => Math.max(0, Math.min(255, Math.round(Number(v)))));
-  return `#${[r, g, b].map((v) => (v ?? 0).toString(16).padStart(2, '0')).join('')}`;
-}
 
 /**
  * 波形内容按行分片绘制：每片最多 8ms，片间让出一帧。
@@ -1705,41 +1442,35 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const w = Math.max(1.5, right - x);
         reg.itemBoxes.set(`${track.name}\u0000${item.enterSeq}`, { x, y: barY, w, h: barH });
 
-        // 每个条目在画布上是一个切角六边形：两端切角处就是它与相邻条目的取值分界。
-        // 已结束的条目进画布（数量最大的一类，节点数因此与条目数无关）；
-        // 未闭合条目要虚线框，画布那套只做实色块，所以留在 SVG。
+        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的取值分界。
+        // 未闭合条目（文件结束时仍持有）用虚线框；不画到域末尾之外，也不伪造结束周期。
         const hollow = false;
-        if (!open && reg.shapes !== null) {
-          reg.shapes.box(x, x + w, barY, barY + barH, 4, color, BLOCK_FILL);
-        } else {
-          const rect = svgEl('path', {
-            d: hexPath(x, x + w, barY, barY + barH, 4),
-            fill: color,
-            'fill-opacity': BLOCK_FILL,
-            stroke: color,
-            'stroke-width': 1.2,
-            'stroke-linejoin': 'round',
-            ...(open ? { 'stroke-dasharray': '4 3' } : {}),
-          });
-          rect.setAttribute('data-item', '1');
-          g.append(rect);
-          // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
-          const sliver = w < 7;
-          const target = sliver
-            ? svgEl('rect', { x: x + w / 2 - 3.5, y: barY - 1, width: 7, height: barH + 2, fill: 'transparent', style: 'pointer-events:all' })
-            : rect;
-          if (sliver) {
-            rect.setAttribute('pointer-events', 'none');
-            g.append(target);
-          }
-          hoverTarget(
-            target,
-            () => pipTip(track, item, open),
-            () => ctx.selection.set({ kind: 'item', track: track.name, enterSeq: item.enterSeq }),
-          );
-          target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
-          target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
+        const rect = svgEl('path', {
+          d: hexPath(x, x + w, barY, barY + barH, 4),
+          fill: color,
+          'fill-opacity': BLOCK_FILL,
+          stroke: color,
+          'stroke-width': 1.2,
+          'stroke-linejoin': 'round',
+          ...(open ? { 'stroke-dasharray': '4 3' } : {}),
+        });
+        g.append(rect);
+        // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
+        const sliver = w < 7;
+        const target = sliver
+          ? svgEl('rect', { x: x + w / 2 - 3.5, y: barY - 1, width: 7, height: barH + 2, fill: 'transparent', style: 'pointer-events:all' })
+          : rect;
+        if (sliver) {
+          rect.setAttribute('pointer-events', 'none');
+          g.append(target);
         }
+        hoverTarget(
+          target,
+          () => pipTip(track, item, open),
+          () => ctx.selection.set({ kind: 'item', track: track.name, enterSeq: item.enterSeq }),
+        );
+        target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
+        target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
         if (item.async) {
           g.append(
             svgEl('circle', { cx: x, cy: barY + barH / 2, r: 2.6, fill: 'var(--surface)', stroke: color, 'stroke-width': 1.2, 'pointer-events': 'none' }),
@@ -2805,9 +2536,6 @@ export const timelineView: View = {
     buildingForLoad = true; // 挂载 = 换文件：这一轮分片画、画完才揭开
     // 交互重建（滚轮/按钮/选项）走同步一遍过，别把半成品露出来
     hasBuilt = false;
-    // 画布是 fixed 定位的视口层：窗口滚动/缩放时要重新摆位并重画（元素自身的横向滚动见 build）
-    window.addEventListener('scroll', scheduleRasterFrame, { passive: true });
-    window.addEventListener('resize', scheduleRasterFrame);
     scrollEl = null;
     registry = null;
     hoverSel = null;
@@ -2842,18 +2570,6 @@ export const timelineView: View = {
     unsub = null;
     paintToken?.abort();
     paintToken = null;
-    latestScene = null;
-    if (rasterRaf !== 0) {
-      cancelAnimationFrame(rasterRaf);
-      rasterRaf = 0;
-    }
-    window.removeEventListener('scroll', scheduleRasterFrame);
-    window.removeEventListener('resize', scheduleRasterFrame);
-    if (sharedCanvas !== null) sharedCanvas.style.display = 'none';
-    rasterPlot = null;
-    window.removeEventListener('scroll', scheduleRasterFrame);
-    window.removeEventListener('resize', scheduleRasterFrame);
-    if (sharedCanvas !== null) sharedCanvas.style.display = 'none';
     resizeObs?.disconnect();
     resizeObs = null;
     hostEl = null;
