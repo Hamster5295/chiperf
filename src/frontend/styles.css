@@ -311,7 +311,19 @@ svg { display: block; max-width: 100%; }
 .drawer-body h4 { margin: 6px 0 0; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
 
 .diag-list { display: flex; flex-direction: column; gap: 4px; }
-.diag-item { display: grid; grid-template-columns: 14ch 8ch 1fr; gap: 8px; align-items: baseline; font-size: 11.5px; padding: 4px 6px; background: var(--surface-2); border-radius: var(--radius-sm); }
+.diag-item {
+  display: grid;
+  /* 列宽跟着内容走：原来第一列写死 14ch，`skipped_invalid_record` 这类长码会
+     溢出到第二列的「第 n 行」上（网格项默认不裁剪），看起来就是两列叠在一起 */
+  grid-template-columns: max-content max-content minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11.5px;
+  padding: 4px 6px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+}
+.diag-item > * { min-width: 0; overflow-wrap: anywhere; }
 .diag-item code { font-family: var(--mono); color: var(--accent); }
 .mono { font-family: var(--mono); }
 
