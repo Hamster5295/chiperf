@@ -142,6 +142,9 @@ interface LaneRegistration {
   key: string;
   domain: string;
   node: SVGGElement;
+  y: number;
+  h: number;
+  color: string;
 }
 
 interface Box {
@@ -162,21 +165,28 @@ interface Registry extends Surface {
   lanes: LaneRegistration[];
   itemBoxes: Map<string, Box>;
   selLine: SVGLineElement;
-  hoverLine: SVGLineElement;
   selBox: SVGRectElement;
   hoverBox: SVGRectElement;
   selLabel: SVGTextElement;
+  /** 悬停高亮：只画在鼠标所在那一行的、该行时钟域的当前周期上 */
+  hoverCell: SVGRectElement;
+  hoverTag: SVGTextElement;
+  /** 渲染循环在调用 row.draw 前写入，供 cycleSurface 捕获（不改各泳道的绘制签名） */
+  currentRow: { key: string; y: number; h: number; color: string } | null;
 }
 
-interface HeaderRow {
-  kind: 'header';
-  text: string;
-  right: string;
-  height: number;
-}
+/** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
+type LaneGroup = 'clock' | 'pipeline' | 'event';
+
+const GROUP_TINT: Record<LaneGroup, string> = {
+  clock: 'color-mix(in srgb, var(--accent) 16%, transparent)',
+  pipeline: 'var(--surface-2)',
+  event: 'color-mix(in srgb, #d97706 14%, transparent)',
+};
 
 interface LaneRow {
   kind: 'lane';
+  group: LaneGroup;
   /** 高亮用的泳道键：`clk:域` / `fsm:key` / `pip:轨道` / `occ:轨道` / `cnt:key` / `evt:key` … */
   key: string;
   domain: string;
@@ -190,7 +200,7 @@ interface LaneRow {
   draw(g: SVGGElement, reg: Registry, y: number, h: number, stripe: boolean): void;
 }
 
-type Row = HeaderRow | LaneRow;
+type Row = LaneRow;
 
 /** 指针探针：泳道背景用「指针位置 → 周期」而不是逐周期建节点 */
 interface Probe {
@@ -201,6 +211,8 @@ interface Probe {
 // ------------------------------------------------------------------ 模块状态
 
 let hostEl: HTMLElement | null = null;
+/** 用户拖拽后的行顺序（按 LaneRow.key）；空数组表示默认顺序 */
+let rowOrder: string[] = [];
 let scrollEl: HTMLElement | null = null;
 let ctxRef: ViewContext | null = null;
 let unsub: (() => void) | null = null;
@@ -358,25 +370,69 @@ function broadcastHover(ctx: ViewContext, sel: Selection): void {
  * 自己的 mousemove 必须先登记（`hoverTarget` 的监听器按注册顺序后触发）。
  */
 function cycleSurface(
+  // 轴带上的调用拿不到 Registry（它在轴之后才创建），轴本来也没有"所在行"，
+  // 因此这里接受 Surface，行信息按需探测
   node: SVGRectElement,
-  surface: Surface,
+  surface: Surface | Registry,
   domain: string,
   ctx: ViewContext,
   render: (probe: Probe) => string,
 ): SVGRectElement {
   const { plot, svg } = surface;
   const probe: Probe = { cycle: plot.from, half: 0 };
-  node.addEventListener('mousemove', (event) => {
-    const me = event as MouseEvent;
+  // 绘制期就从传进来的 reg 捕获所在行（不能读模块级 registry：它在这轮渲染结束前还是上一轮的）
+  const rowAt = 'currentRow' in surface ? surface.currentRow : null;
+  const currentRow = (): typeof rowAt => rowAt;
+  const onMove = (event: MouseEvent): void => {
     const box = svg.getBoundingClientRect();
-    const userX = box.width > 0 ? (me.clientX - box.left) * (plot.width / box.width) : plot.x0;
+    const userX = box.width > 0 ? (event.clientX - box.left) * (plot.width / box.width) : plot.x0;
     const raw = plot.scale.invert(clamp(userX, plot.x0, plot.x1));
     probe.cycle = clamp(Math.floor(raw), plot.from, plot.to);
     probe.half = raw - probe.cycle < 0.5 ? 0 : 1;
     broadcastHover(ctx, { kind: 'cycle', domain, cycle: probe.cycle });
-  });
+    showHoverCycle(domain, probe.cycle, currentRow(), ctx);
+  };
+  // 高亮挂在这一行的**分组**上：鼠标压在条目/标记上时也要能高亮当前周期
+  // （提示气泡仍然各管各的：条目有条目自己的，泳道空白处才有泳道的）
+  const host = node.parentElement !== null && node.parentElement.tagName !== 'svg' ? node.parentElement : node;
+  host.addEventListener('mousemove', onMove as EventListener);
+  host.addEventListener('mouseleave', () => hideHoverCycle());
   node.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', domain, cycle: probe.cycle }));
   return hoverTarget(node, () => render(probe));
+}
+
+/**
+ * 悬停高亮：把「鼠标所在行 + 该行所属时钟域的当前周期」框出来。
+ * 行头/泳道都可以拖拽排序，所以这里刻意不画横跨全图的竖线，避免误读成"全局时刻"。
+ */
+function showHoverCycle(domain: string, cycle: number, rowAt: { key: string; y: number; h: number; color: string } | null, ctx: ViewContext): void {
+  const reg = registry;
+  if (!reg) return;
+  const plot = reg.plot;
+  const target = rowAt ?? reg.lanes.find((lane) => lane.key === `clk:${domain}`) ?? null;
+  if (target === null || cycle < plot.from || cycle > plot.to) {
+    hideHoverCycle();
+    return;
+  }
+  const x0 = plot.scale(cycle);
+  const x1 = plot.scale(cycle + 1);
+  const width = Math.max(2, x1 - x0);
+  reg.hoverCell.setAttribute('x', String(x0));
+  reg.hoverCell.setAttribute('y', String(target.y + 1.5));
+  reg.hoverCell.setAttribute('width', String(width));
+  reg.hoverCell.setAttribute('height', String(Math.max(2, target.h - 3)));
+  reg.hoverCell.setAttribute('stroke', target.color);
+  reg.hoverCell.setAttribute('display', '');
+  reg.hoverTag.setAttribute('x', String(x1 + 6));
+  reg.hoverTag.setAttribute('y', String(target.y + target.h / 2 + 3.5));
+  reg.hoverTag.setAttribute('fill', target.color);
+  reg.hoverTag.textContent = `${domain} · ${cycleTime(ctx.trace.domains.get(domain), cycle, ctx.options.useTimeAxis)}`;
+  reg.hoverTag.setAttribute('display', '');
+}
+
+function hideHoverCycle(): void {
+  registry?.hoverCell.setAttribute('display', 'none');
+  registry?.hoverTag.setAttribute('display', 'none');
 }
 
 /** 泳道底：透明命中矩形 + 底部分隔线 */
@@ -445,10 +501,12 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     lanes: [],
     itemBoxes: new Map(),
     selLine: svgEl('line', {}),
-    hoverLine: svgEl('line', {}),
     selBox: svgEl('rect', {}),
     hoverBox: svgEl('rect', {}),
     selLabel: svgEl('text', {}),
+    hoverCell: svgEl('rect', {}),
+    hoverTag: svgEl('text', {}),
+    currentRow: null,
   };
 
   const gutter = el('div', {
@@ -460,29 +518,13 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   let stripe = false;
   for (const row of rows) {
     const h = rowHeight(row);
-    if (row.kind === 'header') {
-      svg.append(svgEl('rect', { x: plot.x0, y, width: plot.x1 - plot.x0, height: h, fill: 'var(--surface-2)', 'fill-opacity': 0.8 }));
-      gutter.append(
-        el(
-          'div',
-          {
-            style:
-              'height:' +
-              h +
-              'px;display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 8px;min-width:0;overflow:hidden;background:var(--surface-2);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;color:var(--text-muted);border-bottom:1px solid var(--border)',
-          },
-          [el('span', { text: row.text }), el('span', { text: row.right })],
-        ),
-      );
-      stripe = false;
-      // 分节表头同样占一行高度：漏掉这一句会让右侧泳道整体上移（左侧标签列却照常堆叠）
-      y += h;
-      continue;
-    }
     const g = svgEl('g', {});
     svg.append(g);
+    // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
+    reg.currentRow = { key: row.key, y, h, color: row.color };
     row.draw(g, reg, y, h, stripe);
-    reg.lanes.push({ key: row.key, domain: row.domain, node: g });
+    reg.currentRow = null;
+    reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
     gutter.append(gutterCell(row, h, ctx));
     stripe = !stripe;
     y += h;
@@ -496,11 +538,13 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   // 选中 / 悬停标记（覆盖层）
   const overlay = svgEl('g', { 'pointer-events': 'none' });
   reg.selLine = svgEl('line', { y1: plot.top, y2: plot.bottom, stroke: 'var(--accent)', 'stroke-width': 1, 'stroke-dasharray': '4 3', display: 'none' });
-  reg.hoverLine = svgEl('line', { y1: plot.top, y2: plot.bottom, stroke: COLOR.async, 'stroke-width': 1, 'stroke-dasharray': '2 3', display: 'none' });
+  // 悬停：只框出"鼠标所在行的那一个周期"，不再画横跨全图的竖线
+  reg.hoverCell = svgEl('rect', { fill: 'none', 'stroke-width': 2, rx: 2, 'fill-opacity': 0.1, display: 'none' });
+  reg.hoverTag = svgEl('text', { class: 'axis-label', 'text-anchor': 'start', display: 'none' });
   reg.selBox = svgEl('rect', { fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, rx: 3, display: 'none' });
   reg.hoverBox = svgEl('rect', { fill: 'none', stroke: COLOR.async, 'stroke-width': 1.5, 'stroke-dasharray': '3 2', rx: 3, display: 'none' });
   reg.selLabel = svgEl('text', { class: 'axis-label', 'text-anchor': 'middle', y: AXIS_H - 9, display: 'none' });
-  overlay.append(reg.hoverBox, reg.selBox, reg.hoverLine, reg.selLine, reg.selLabel);
+  overlay.append(reg.hoverCell, reg.hoverBox, reg.selBox, reg.selLine, reg.selLabel, reg.hoverTag);
   svg.append(overlay);
 
   // 卡片
@@ -616,9 +660,13 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
   const node = el(
     'div',
     {
-      style: `height:${h}px;display:flex;align-items:center;gap:6px;padding:0 8px;border-bottom:1px solid var(--border);overflow:hidden;min-width:0;${row.select ? 'cursor:pointer' : ''}`,
+      class: 'tl-gutter-cell',
+      draggable: 'true',
+      title: '拖动可调整行顺序',
+      style: `height:${h}px;display:flex;align-items:center;gap:6px;padding:0 8px;border-bottom:1px solid var(--border);overflow:hidden;min-width:0;cursor:grab;background:${GROUP_TINT[row.group]};${row.select ? 'cursor:pointer' : ''}`,
     },
     [
+      el('span', { class: 'tl-drag-handle', text: '⠿' }),
       el('i', { style: `flex:0 0 auto;width:8px;height:8px;border-radius:2px;background:${row.color}` }),
       el('span', {
         class: 'mono',
@@ -638,7 +686,51 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
     node.addEventListener('mouseenter', () => ctx.selection.hover(sel));
     node.addEventListener('mouseleave', () => ctx.selection.hover(null));
   }
+  installRowDrag(node, row);
   return node;
+}
+
+/** 行头拖拽排序：拖到目标行的上半 → 插到它前面，下半 → 插到它后面 */
+let draggingKey: string | null = null;
+
+function installRowDrag(node: HTMLElement, row: LaneRow): void {
+  const clearMarks = (): void => {
+    document.querySelectorAll('.tl-drop-before, .tl-drop-after').forEach((n) => n.classList.remove('tl-drop-before', 'tl-drop-after'));
+  };
+  node.addEventListener('dragstart', (event) => {
+    draggingKey = row.key;
+    node.classList.add('tl-dragging');
+    event.dataTransfer?.setData('text/plain', row.key);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+  });
+  node.addEventListener('dragend', () => {
+    draggingKey = null;
+    node.classList.remove('tl-dragging');
+    clearMarks();
+  });
+  node.addEventListener('dragover', (event) => {
+    if (draggingKey === null || draggingKey === row.key) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    const box = node.getBoundingClientRect();
+    const after = event.clientY > box.top + box.height / 2;
+    for (const other of document.querySelectorAll('.tl-drop-before, .tl-drop-after')) {
+      if (other !== node) other.classList.remove('tl-drop-before', 'tl-drop-after');
+    }
+    node.classList.toggle('tl-drop-after', after);
+    node.classList.toggle('tl-drop-before', !after);
+  });
+  node.addEventListener('dragleave', () => node.classList.remove('tl-drop-before', 'tl-drop-after'));
+  node.addEventListener('drop', (event) => {
+    event.preventDefault();
+    const box = node.getBoundingClientRect();
+    const after = event.clientY > box.top + box.height / 2;
+    const dragged = draggingKey;
+    clearMarks();
+    node.classList.remove('tl-dragging');
+    draggingKey = null;
+    if (dragged !== null) reorderRow(dragged, row.key, after);
+  });
 }
 
 // ------------------------------------------------------------------ 轴 / 网格 / defs
@@ -723,51 +815,57 @@ function buildRows(
   domains: DomainInfo[],
   scan: Scan,
   visible: (name: string) => boolean,
-): Row[] {
-  const rows: Row[] = [];
-  const group = (header: string, right: string, lanes: LaneRow[]): void => {
-    if (lanes.length === 0) return;
-    rows.push({ kind: 'header', text: header, right, height: H.header }, ...lanes);
-  };
+): LaneRow[] {
+  const rows: LaneRow[] = [];
 
-  const clkLanes = domains.map((d) => clockLane(d, ctx, scan));
-  group('时钟', `${domains.length} 域`, clkLanes);
+  for (const d of domains) rows.push(clockLane(d, ctx, scan));
 
-  const fsmLanes: LaneRow[] = [];
-  for (const fsm of trace.fsms.values()) {
-    if (visible(fsm.domain)) fsmLanes.push(fsmLane(fsm, ctx));
-  }
-  group('状态机', `${fsmLanes.length} 台`, fsmLanes);
-
-  const pipLanes: LaneRow[] = [];
   for (const track of trace.tracks.values()) {
-    if (visible(track.domain)) pipLanes.push(pipLane(track, ctx));
+    if (visible(track.domain)) rows.push(pipLane(track, ctx));
   }
-  group('流水线', `${pipLanes.length} 轨道`, pipLanes);
 
-  const occLanes: LaneRow[] = [];
-  for (const track of trace.tracks.values()) {
-    if (visible(track.domain)) occLanes.push(occupancyLane(track, ctx));
-  }
-  group('占用度', '半开区间 [enter, close)', occLanes);
-
-  const cntLanes: LaneRow[] = [];
-  for (const counter of trace.counters.values()) {
-    if (visible(counter.domain)) cntLanes.push(counterLane(counter, ctx));
-  }
-  group('计数器', `${cntLanes.length} 个`, cntLanes);
-
-  const evtLanes: LaneRow[] = [];
+  // 事件：evt 轨 + msg + （合并进来的）其它类型的异步记录 —— 不再单独占一节
   for (const track of trace.events.values()) {
-    if (visible(track.domain)) evtLanes.push(eventLane(track.name, track.domain, track.key, track.samples, ctx));
+    if (visible(track.domain)) rows.push(eventLane(track.name, track.domain, track.key, track.samples, ctx));
   }
   const messages = trace.messages.filter((m) => visible(m.pos.domain));
-  if (messages.length > 0) evtLanes.push(messageLane(messages, ctx));
-  group('事件', `${evtLanes.length} 条`, evtLanes);
+  if (messages.length > 0) rows.push(messageLane(messages, ctx));
+  const otherAsync = scan.asyncRecords.filter((r) => r.kind !== 'evt' && visible(r.pos.domain));
+  if (otherAsync.length > 0) rows.push(asyncLane(otherAsync, ctx));
 
-  if (scan.asyncRecords.length > 0) group('异步事件', `${scan.asyncRecords.length} 条`, [asyncLane(scan.asyncRecords, ctx)]);
+  return applyRowOrder(rows);
+}
 
-  return rows;
+/** 用户拖拽后的行顺序：未出现在顺序表里的行按默认顺序排在后面 */
+function applyRowOrder(rows: LaneRow[]): LaneRow[] {
+  if (rowOrder.length === 0) return rows;
+  const rank = new Map(rowOrder.map((key, index) => [key, index]));
+  return [...rows].sort((a, b) => (rank.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.key) ?? Number.MAX_SAFE_INTEGER));
+}
+
+/** 重画时间轴（拖拽排序后调用；顺序存在 rowOrder 里，刷新视图也不会丢） */
+function rerenderTimeline(): void {
+  const host = hostEl;
+  const ctx = ctxRef;
+  if (!host || !ctx) return;
+  host.replaceChildren();
+  build(host, ctx);
+  if (registry !== null && registry.lanes.length > 0) applyState();
+}
+
+/** 拖拽结束：把被拖的行插到目标行的前/后，并记住顺序 */
+function reorderRow(draggedKey: string, targetKey: string, after: boolean): void {
+  const ctx = ctxRef;
+  if (!ctx || draggedKey === targetKey) return;
+  const current = rowOrder.length > 0 ? [...rowOrder] : registry?.lanes.map((lane) => lane.key) ?? [];
+  const keys = current.includes(draggedKey) ? current : [...current, draggedKey];
+  const from = keys.indexOf(draggedKey);
+  keys.splice(from, 1);
+  const targetIndex = keys.indexOf(targetKey);
+  if (targetIndex < 0) return;
+  keys.splice(after ? targetIndex + 1 : targetIndex, 0, draggedKey);
+  rowOrder = keys;
+  rerenderTimeline();
 }
 
 // ------------------------------ 时钟
@@ -779,6 +877,7 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
   return {
     kind: 'lane',
     key: `clk:${d.name}`,
+    group: 'clock',
     domain: d.name,
     label: d.name,
     note: `${countLabel(d.cycles)} 周期`,
@@ -841,85 +940,6 @@ function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number):
 
 // ------------------------------ 状态机
 
-function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
-  const segments = stateSegments(fsm);
-  return {
-    kind: 'lane',
-    key: `fsm:${fsm.key}`,
-    domain: fsm.domain,
-    label: fsm.name,
-    note: `${fsm.stateSet.length} 状态`,
-    color: COLOR.neutral,
-    height: H.fsm,
-    select: { kind: 'fsm', key: fsm.key },
-    hover: { kind: 'fsm', key: fsm.key },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
-      cycleSurface(hit, reg, fsm.domain, ctx, (probe) => {
-        const at = segments.find((s) => probe.cycle >= s.start && probe.cycle <= s.end);
-        return [
-          `状态机 ${fsm.name}（域 ${fsm.domain}）`,
-          cycleTime(ctx.trace.domains.get(fsm.domain), probe.cycle, true),
-          at ? `该周期状态：${at.state}（区段 ${at.start} – ${at.end}）` : '该周期没有状态记录',
-          `状态集 {${fsm.stateSet.join(', ')}} · 转换 ${fsm.transitions.length} 次 · 采样 ${fsm.samples.length} 条`,
-        ].join('\n');
-      });
-      const last = segments[segments.length - 1];
-      let drawn = 0;
-      for (const seg of segments) {
-        if (drawn >= MAX_ITEMS) break;
-        // 区段是半开区间 [start, 下一采样)；最后一段收在自己的周期里
-        const segEnd = seg === last ? seg.end + 1 : seg.end;
-        const from = Math.max(seg.start, reg.plot.from);
-        const to = Math.min(segEnd, reg.plot.to + 1);
-        if (to <= from) continue;
-        const x0 = reg.plot.scale(from);
-        const x1 = reg.plot.scale(to);
-        const rect = svgEl('rect', {
-          x: x0 + 0.5,
-          y: y + 3,
-          width: Math.max(1, x1 - x0 - 1),
-          height: h - 8,
-          rx: 2,
-          fill: colorFor(seg.state),
-          'fill-opacity': seg.open === true ? 0.45 : 0.82,
-          ...(seg.open === true ? { 'stroke-dasharray': '3 2', stroke: colorFor(seg.state), 'stroke-width': 1.5 } : {}),
-        });
-        const dwell = fsm.dwellCycles.get(seg.state) ?? 0;
-        hoverTarget(
-          rect,
-          () =>
-            [
-              `状态机 ${fsm.name}（域 ${fsm.domain}）`,
-              `状态 ${seg.state}`,
-              `周期 ${seg.start} → ${segEnd}（跨 ${segEnd - seg.start} 周期）`,
-              `结束于 ${cycleTime(ctx.trace.domains.get(fsm.domain), segEnd, true)}`,
-              `该状态驻留合计 ${countLabel(dwell)} 周期`,
-              `转换 ${fsm.transitions.length} 次 · 状态集 {${fsm.stateSet.join(', ')}}`,
-              seg.open === true ? '最后一段：驻留周期数不可确定（spec §9.5），画成开放的浅色虚线段' : '',
-            ]
-              .filter((line) => line !== '')
-              .join('\n'),
-          () => ctx.selection.set({ kind: 'fsm', key: fsm.key }),
-        );
-        g.append(rect);
-        const width = x1 - x0;
-        if (width >= 26) {
-          g.append(
-            svgEl('text', {
-              x: x0 + 4,
-              y: y + h - 10,
-              style: 'font-size:10px;fill:#0f172a;fill-opacity:0.78;pointer-events:none',
-              text: clip(seg.state, width),
-            }),
-          );
-        }
-        drawn++;
-      }
-      if (drawn === 0) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 10, class: 'axis-label', text: '没有状态记录' }));
-    },
-  };
-}
 
 // ------------------------------ 流水线
 
@@ -931,6 +951,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
   return {
     kind: 'lane',
     key: `pip:${track.name}`,
+    group: 'pipeline',
     domain: track.domain,
     label: track.name,
     note: truncated ? `${shown.length}/${sorted.length} 条目` : `${track.items.length} 条目`,
@@ -1050,169 +1071,9 @@ function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
 
 // ------------------------------ 占用度
 
-function occupancyLane(track: TrackInfo, ctx: ViewContext): LaneRow {
-  const maxOcc = Math.max(1, ...track.occupancy.values());
-  return {
-    kind: 'lane',
-    key: `occ:${track.name}`,
-    domain: track.domain,
-    label: `${track.name} 占用`,
-    note: `峰 ${maxOcc} · 气泡 ${track.bubbles.length}`,
-    color: colorFor(track.name),
-    height: H.occ,
-    hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
-      const plot = reg.plot;
-      const base = y + h - 4;
-      const inner = h - 9;
-      const from = Math.max(plot.from, track.firstCycle);
-      const to = Math.min(plot.to, track.lastCycle);
-      if (to >= from) {
-        if (plot.pxPerCycle >= BAR_MIN_PX && to - from <= 3000) {
-          for (let c = from; c <= to; c++) {
-            const v = track.occupancy.get(c) ?? 0;
-            if (v <= 0) continue;
-            const x0 = plot.scale(c);
-            const height = Math.max(1, (v / maxOcc) * inner);
-            g.append(
-              svgEl('rect', {
-                x: x0 + 0.5,
-                y: base - height,
-                width: Math.max(1, plot.scale(c + 1) - x0 - 1),
-                height,
-                fill: heatColor(v / maxOcc),
-                'pointer-events': 'none',
-              }),
-            );
-          }
-        } else {
-          const pts: [number, number][] = [];
-          for (let c = from; c <= to; c++) pts.push([plot.scale(c), base - ((track.occupancy.get(c) ?? 0) / maxOcc) * inner]);
-          if (pts.length > 0) {
-            g.append(svgEl('path', { d: stepPath(pts), fill: 'none', stroke: colorFor(track.name), 'stroke-width': 1.2, 'pointer-events': 'none' }));
-          }
-        }
-      }
-      // 气泡周期：占用度为 0 的活跃周期，用醒目颜色
-      for (const range of track.bubbleRanges) {
-        const b0 = Math.max(range.start, plot.from);
-        const b1 = Math.min(range.end + 1, plot.to + 1);
-        if (b1 <= b0) continue;
-        const x0 = plot.scale(b0);
-        g.append(
-          svgEl('rect', {
-            x: x0,
-            y: y + 3,
-            width: Math.max(1, plot.scale(b1) - x0),
-            height: h - 7,
-            fill: COLOR.bubble,
-            'fill-opacity': 0.3,
-            stroke: COLOR.bubble,
-            'stroke-opacity': 0.8,
-            'stroke-width': 0.8,
-            'pointer-events': 'none',
-          }),
-        );
-      }
-      cycleSurface(hit, reg, track.domain, ctx, (probe) => {
-        const c = probe.cycle;
-        const occ = track.occupancy.get(c) ?? 0;
-        const lines = [
-          `轨道 ${track.name} 占用度（域 ${track.domain}）`,
-          cycleTime(ctx.trace.domains.get(track.domain), c, true),
-          `占用 ${occ}（峰值 ${maxOcc}）· 半开区间 [enter, close)`,
-          `到达 ${track.arrivals.get(c) ?? 0} · 离开 ${track.departures.get(c) ?? 0} · 撤销 ${track.aborts.get(c) ?? 0}`,
-        ];
-        const range = track.bubbleRanges.find((r) => c >= r.start && c <= r.end);
-        if (range) lines.push(`气泡周期（气泡区间 ${range.start} – ${range.end}）`);
-        lines.push(`轨道活跃区间 ${track.firstCycle} – ${track.lastCycle} · 气泡 ${track.bubbles.length} 个周期`);
-        return lines.join('\n');
-      });
-      if (track.occupancy.size === 0) g.append(svgEl('text', { x: plot.x0 + 6, y: y + h - 10, class: 'axis-label', text: '没有在飞条目' }));
-    },
-  };
-}
 
 // ------------------------------ 计数器
 
-function counterLane(counter: CounterTrack, ctx: ViewContext): LaneRow {
-  return {
-    kind: 'lane',
-    key: `cnt:${counter.key}`,
-    domain: counter.domain,
-    label: counter.name,
-    note: `终值 ${fmtCompact(counter.total)}`,
-    color: colorFor(counter.key),
-    height: H.cnt,
-    select: { kind: 'counter', key: counter.key },
-    hover: { kind: 'counter', key: counter.key },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
-      const plot = reg.plot;
-      const inner = h - 12;
-      const base = y + h - 4;
-      const maxTotal = Math.max(1, counter.total);
-      const maxDelta = Math.max(1, ...counter.deltaByCycle.values());
-      const color = colorFor(counter.key);
-
-      // 每周期增量柱（放得下时）
-      if (plot.pxPerCycle >= 3) {
-        for (const [c, delta] of counter.deltaByCycle) {
-          if (c < plot.from || c > plot.to || delta <= 0) continue;
-          const x0 = plot.scale(c);
-          const dh = Math.max(1, (delta / maxDelta) * (inner * 0.55));
-          g.append(
-            svgEl('rect', { x: x0 + 0.5, y: base - dh, width: Math.max(1, plot.scale(c + 1) - x0 - 1), height: dh, fill: color, 'fill-opacity': 0.45, 'pointer-events': 'none' }),
-          );
-        }
-      }
-      // 累计总量阶梯
-      const changes = counter.changeCycles.filter((c) => c >= plot.from && c <= plot.to);
-      const pts: [number, number][] = [];
-      let lastValue = 0;
-      const lead = counterTotalAt(counter, plot.from);
-      if (lead !== null) {
-        lastValue = lead;
-        pts.push([plot.scale(plot.from), base - clamp(lead / maxTotal, 0, 1) * inner]);
-      }
-      for (const c of changes) {
-        const v = counter.totalByCycle.get(c) ?? 0;
-        lastValue = v;
-        pts.push([plot.scale(c), base - clamp(v / maxTotal, 0, 1) * inner]);
-      }
-      if (pts.length > 0) {
-        pts.push([plot.scale(plot.to + 1), base - clamp(lastValue / maxTotal, 0, 1) * inner]);
-        g.append(svgEl('path', { d: stepPath(pts), fill: 'none', stroke: color, 'stroke-width': 1.4, 'pointer-events': 'none' }));
-      }
-      // `abs=` 回读：只置总量、不贡献增量（spec §9.2），用空心点标出
-      for (const sample of counter.samples) {
-        if (sample.abs === null) continue;
-        const c = sample.pos.cycle;
-        if (c < plot.from || c > plot.to) continue;
-        g.append(
-          svgEl('circle', { cx: plot.scale(c + phaseOffset(sample.pos, sample.async)), cy: y + 5, r: 3, fill: 'var(--surface)', stroke: color, 'stroke-width': 1.2, 'pointer-events': 'none' }),
-        );
-      }
-      cycleSurface(hit, reg, counter.domain, ctx, (probe) => {
-        const c = probe.cycle;
-        const total = counterTotalAt(counter, c);
-        const delta = counterDeltaBetween(counter, c - 1, c);
-        const lines = [
-          `计数器 ${counter.name}（域 ${counter.domain}）`,
-          cycleTime(ctx.trace.domains.get(counter.domain), c, true),
-          `周期末总量：${total === null ? '—（尚无采样）' : fmtInt(total)}`,
-          `本周期增量：${delta === null ? '—' : delta >= 0 ? `+${fmtInt(delta)}` : fmtInt(delta)}`,
-          `终值 ${fmtInt(counter.total)} · 采样 ${counter.samples.length} 条 · 变化周期 ${counter.changeCycles.length} 个`,
-          `本周期有 ${counter.samples.filter((s) => s.pos.cycle === c).length} 条记录`,
-        ];
-        const absCount = counter.samples.filter((s) => s.abs !== null).length;
-        if (absCount > 0) lines.push(`其中 abs= 回读 ${absCount} 条（只置总量，不贡献增量）`);
-        return lines.join('\n');
-      });
-    },
-  };
-}
 
 // ------------------------------ 事件 / 消息
 
@@ -1227,6 +1088,7 @@ function eventLane(
   return {
     kind: 'lane',
     key: `evt:${key}`,
+    group: 'event',
     domain,
     label: name,
     note: `${samples.length} 次`,
@@ -1277,6 +1139,7 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
   const shown = messages.length > MAX_MARKS ? messages.slice(0, MAX_MARKS) : messages;
   return {
     kind: 'lane',
+    group: 'event',
     key: 'msg:all',
     domain: messages[0]!.pos.domain,
     label: '消息',
@@ -1327,6 +1190,7 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
   const shown = records.length > MAX_MARKS ? records.slice(0, MAX_MARKS) : records;
   return {
     kind: 'lane',
+    group: 'event',
     key: 'async:all',
     domain: records[0]!.pos.domain,
     label: '异步事件',
@@ -1414,7 +1278,7 @@ function applyState(): void {
   for (const lane of reg.lanes) lane.node.style.opacity = String(opacity.get(lane.key) ?? 1);
 
   placeCycleMark(reg.selLine, reg.selLabel, sel, ctx);
-  placeCycleMark(reg.hoverLine, null, hoverSel, ctx);
+  if (hoverSel === null) hideHoverCycle();
   placeBox(reg.selBox, sel, reg, true);
   placeBox(reg.hoverBox, hoverSel, reg, false);
 }

@@ -292,6 +292,15 @@ svg { display: block; max-width: 100%; }
 .diag-item code { font-family: var(--mono); color: var(--accent); }
 .mono { font-family: var(--mono); }
 
+/* 时间轴行头：拖拽排序 */
+.tl-gutter-cell { transition: background 120ms ease; }
+.tl-gutter-cell:hover { filter: brightness(0.985); }
+.tl-drag-handle { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); opacity: 0.45; cursor: grab; letter-spacing: -1px; }
+.tl-gutter-cell:hover .tl-drag-handle { opacity: 0.85; }
+.tl-dragging { opacity: 0.45; }
+.tl-drop-before { box-shadow: inset 0 2px 0 0 var(--accent); }
+.tl-drop-after { box-shadow: inset 0 -2px 0 0 var(--accent); }
+
 /* 状态机视图：卡片内的小节标题 */
 .fsm-section { margin: 12px 0 2px; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
 .fsm-section:first-child { margin-top: 0; }
