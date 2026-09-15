@@ -31,6 +31,8 @@ export function createCanvas2DBackend(canvas: HTMLCanvasElement): RasterBackend 
 
     draw(scene: RasterScene): void {
       context.clearRect(0, 0, scene.width, scene.height);
+      // 与 WebGPU 后端同一套坐标：形状坐标减去可见区原点（滚动偏移）
+      context.translate(-(scene.offsetX ?? 0), -(scene.offsetY ?? 0));
 
       for (const box of scene.boxes) {
         if (box.w <= 0 || box.h <= 0) continue; // 退化的块连路径都不用建
@@ -63,6 +65,7 @@ export function createCanvas2DBackend(canvas: HTMLCanvasElement): RasterBackend 
 
       // 用完复位：下次画块时不带上这次折线的 alpha，也不用让每个块自己设一遍
       context.globalAlpha = 1;
+      context.restore(); // 还原滚动偏移的 translate（2D 变换会累积）
     },
 
     destroy(): void {

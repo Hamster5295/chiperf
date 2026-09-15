@@ -25,7 +25,21 @@ import { createWebGpuBackend } from './raster-webgpu.ts';
 export interface RasterBox { x: number; y: number; w: number; h: number; color: string; alpha: number; chamfer: number; }
 /** 一条折线（设备像素坐标），例如阶梯波形；width = 线宽 */
 export interface RasterPath { points: number[]; width: number; color: string; alpha: number; }
-export interface RasterScene { width: number; height: number; boxes: RasterBox[]; paths: RasterPath[]; }
+/**
+ * 一帧要画的东西。**画布是视口大小的**，所以坐标有两套：
+ * 形状坐标仍是"绘图坐标系"（与 SVG 用户坐标一致），`offsetX/offsetY` 表示这块可见区域
+ * 在绘图坐标系里的左上角 —— 即滚动位置。滚动时只要改偏移重画，顶点数据可以原样留着。
+ */
+export interface RasterScene {
+  /** 视口尺寸（设备像素） */
+  width: number;
+  height: number;
+  /** 可见区左上角在绘图坐标系里的位置（默认 0,0） */
+  offsetX?: number;
+  offsetY?: number;
+  boxes: RasterBox[];
+  paths: RasterPath[];
+}
 export interface RasterBackend {
   readonly kind: 'webgpu' | 'canvas2d';
   /** 把整个场景重画一遍（调用方每帧构造新 scene，不做增量） */

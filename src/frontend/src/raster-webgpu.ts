@@ -28,7 +28,7 @@ import { BOX_INSTANCE_FLOATS, BOX_QUAD_TEMPLATE, BOX_QUAD_VERTEX_COUNT, BOX_TEMP
 const WGSL = /* wgsl */ `
 struct Globals {
   screen: vec2<f32>,
-  pad: vec2<f32>,
+  offset: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -56,9 +56,12 @@ fn vs_box(
   let localX = (corner.x - corner.z * unit) * (rect.z * 2.0);
   let localY = (corner.y * 2.0 - 1.0) * rect.w;
   var out: Vertex;
+  // 形状坐标是"绘图坐标系"，减掉可见区原点（滚动偏移）后才是视口坐标
+  let viewX = rect.x + localX - rect.z - globals.offset.x;
+  let viewY = rect.y + localY - rect.w - globals.offset.y;
   out.position = vec4<f32>(
-    (rect.x + localX - rect.z) / globals.screen.x * 2.0 - 1.0,
-    1.0 - (rect.y + localY - rect.w) / globals.screen.y * 2.0,
+    viewX / globals.screen.x * 2.0 - 1.0,
+    1.0 - viewY / globals.screen.y * 2.0,
     0.0,
     1.0,
   );
@@ -72,9 +75,11 @@ fn vs_line(
   @location(1) color: vec4<f32>,
 ) -> Vertex {
   var out: Vertex;
+  let viewX = pos.x - globals.offset.x;
+  let viewY = pos.y - globals.offset.y;
   out.position = vec4<f32>(
-    pos.x / globals.screen.x * 2.0 - 1.0,
-    1.0 - pos.y / globals.screen.y * 2.0,
+    viewX / globals.screen.x * 2.0 - 1.0,
+    1.0 - viewY / globals.screen.y * 2.0,
     0.0,
     1.0,
   );
@@ -218,7 +223,7 @@ export async function createWebGpuBackend(canvas: HTMLCanvasElement): Promise<Ra
     entries: [{ binding: 0, visibility: SHADER_STAGE_VERTEX, buffer: { type: 'uniform' } }],
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-  const screen = new Float32Array([1, 1, 0, 0]);
+  const screen = new Float32Array([1, 1, 0, 0]); // [screen.x, screen.y, offset.x, offset.y]
   const uniformBuffer = device.createBuffer({ size: screen.byteLength, usage: BUFFER_USAGE_COPY_DST | BUFFER_USAGE_UNIFORM });
   const bindGroup = device.createBindGroup({ layout: bindGroupLayout, entries: [{ binding: 0, resource: { buffer: uniformBuffer } }] });
 
@@ -282,6 +287,7 @@ export async function createWebGpuBackend(canvas: HTMLCanvasElement): Promise<Ra
   let geometry: RasterVertices | undefined;
   let lost = false;
   let disposed = false;
+  let warnedSize = false;
 
   void device.lost.then((info) => {
     if (disposed) return;
@@ -307,6 +313,9 @@ export async function createWebGpuBackend(canvas: HTMLCanvasElement): Promise<Ra
     device.queue.writeBuffer(uniformBuffer, 0, screen);
   };
 
+  /** 视口尺寸上限：超过就整条 GPU 路径不可用（宁可退回 Canvas2D，也不要画出一帧错的） */
+  const maxDimension = (device as unknown as { limits?: { maxTextureDimension2D?: number } }).limits?.maxTextureDimension2D ?? 8192;
+
   /** 场景大了就把缓冲换大的，平时原样复用（每帧重新建 buffer 太浪费） */
   const ensureInstanceBuffer = (bytes: number): void => {
     if (instanceBuffer !== null && instanceBytes >= bytes) return;
@@ -331,7 +340,22 @@ export async function createWebGpuBackend(canvas: HTMLCanvasElement): Promise<Ra
       const nextHeight = Math.floor(scene.height);
       // 画布被折叠成 0 尺寸时 getCurrentTexture() 会抛，直接跳过这一帧
       if (nextWidth <= 0 || nextHeight <= 0) return;
+      if (nextWidth > maxDimension || nextHeight > maxDimension) {
+        if (!warnedSize) {
+          warnedSize = true;
+          console.warn(`[raster] 视口 ${nextWidth}×${nextHeight} 超过 GPU 纹理上限 ${maxDimension}，形状层停止绘制`);
+        }
+        return;
+      }
       if (nextWidth !== width || nextHeight !== height) resize(nextWidth, nextHeight);
+      const offsetX = scene.offsetX ?? 0;
+      const offsetY = scene.offsetY ?? 0;
+      if (offsetX !== screen[2] || offsetY !== screen[3]) {
+        // 滚动只改这两个数：顶点数据不用重打包，这是"滚动不掉帧"的关键
+        screen[2] = offsetX;
+        screen[3] = offsetY;
+        device.queue.writeBuffer(uniformBuffer, 0, screen);
+      }
 
       const vertices = buildVertices(scene, geometry);
       geometry = vertices; // 数组留着当下帧的复用缓冲
@@ -353,8 +377,9 @@ export async function createWebGpuBackend(canvas: HTMLCanvasElement): Promise<Ra
             // 透明清屏：形状层只画形状，底色由页面给
             clearValue: { r: 0, g: 0, b: 0, a: 0 },
             loadOp: 'clear',
-            // MSAA 纹理只用来 resolve，不必写回显存（关掉省带宽）
-            storeOp: 'discard',
+            // 用 'store'：resolve 到画布的行为与 storeOp 关系在实现间有差异，'store' 最稳，
+            // 代价是这一次 MSAA 写回（视口大小的纹理，可忽略）
+            storeOp: 'store',
           },
         ],
       });

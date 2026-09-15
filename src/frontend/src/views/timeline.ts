@@ -666,16 +666,25 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   // 画布：和 SVG 同尺寸、绝对定位在它下面（形状在下、文字/悬停在上），随滚动一起移动。
   // 每次重建都新建 canvas 会让"后端绑定在旧画布上"（WebGPU 的 context 不能换），
   // 所以整个视图共用一个 canvas，只改尺寸。
-  const scene: RasterScene = { width: plot.width, height: plot.height, boxes: [], paths: [] };
+  // 画布是**视口大小**的：绘图区可能有几万像素宽，而 GPU 纹理边长通常只有 8k~16k ——
+  // 按整幅图开画布会让整条管线校验失败、什么都不出来（Canvas2D 因为不挑尺寸，反倒看不出来）。
+  // 坐标一律乘 DPR 变成设备像素（契约要求），滚动只改 scene.offset，顶点数据不用重打包。
+  const dpr = rasterDpr();
+  const scene: RasterScene = { width: 1, height: 1, offsetX: 0, offsetY: 0, boxes: [], paths: [] };
   const canvas = rasterCanvas();
-  canvas.width = Math.max(1, Math.round(plot.width));
-  canvas.height = Math.max(1, Math.round(plot.height));
-  canvas.style.cssText = `position:absolute;left:0;top:0;width:${plot.width}px;height:${plot.height}px;pointer-events:none`;
   const raster = ensureRaster(canvas);
   const shapes: ShapeSink | null = raster.ok
     ? {
         box: (x0, x1, top, bottom, chamfer, color, alpha) => {
-          scene.boxes.push({ x: x0, y: top, w: Math.max(0.6, x1 - x0), h: Math.max(0.6, bottom - top), color: c2hex(color), alpha, chamfer });
+          scene.boxes.push({
+            x: x0 * dpr,
+            y: top * dpr,
+            w: Math.max(0.6, (x1 - x0) * dpr),
+            h: Math.max(0.6, (bottom - top) * dpr),
+            color: c2hex(color),
+            alpha,
+            chamfer: chamfer * dpr,
+          });
         },
       }
     : null;
@@ -757,13 +766,14 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     ]),
   );
   const scroll = el('div', { class: 'chart-scroll', style: 'max-width:100%' });
-  const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [canvas, svg]);
+  const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [svg]);
   scroll.append(el('div', { style: 'display:flex;align-items:flex-start;min-width:max-content' }, [gutter, plotWrap]));
   cardNode.body.append(scroll);
   host.append(cardNode.root);
 
   installWheelZoom(scroll);
   installDragZoom(svg);
+  scroll.addEventListener('scroll', scheduleRasterFrame, { passive: true });
   scrollEl = scroll;
   registry = reg;
   chartAvail = scroll.clientWidth;
@@ -772,12 +782,114 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   installCanvasItemHover(svg, ctx);
   // 形状画完之后贴上去（分片绘制期间画布是空的，避免"半成品"闪一下）
   latestScene = scene;
+  pendingRows_ = pendingRows;
+  rasterPlot = { wrap: plotWrap, scroll };
   paintRowsChunked(pendingRows, reg, ctx, {
     onDone: () => {
-      raster.backend?.draw(scene);
+      applyRasterFrame();
     },
   });
-  if (raster.backend !== null) raster.backend.draw(scene);
+  applyRasterFrame();
+}
+
+/** 当前这一帧的形状（滚动/缩放时复用，不必重新收集） */
+let pendingRows_: { g: SVGGElement; row: LaneRow; y: number; h: number }[] = [];
+let rasterPlot: { wrap: HTMLElement; scroll: HTMLElement } | null = null;
+let rasterRaf = 0;
+
+/** 视口 DPR（形状坐标乘它变成设备像素；页面移动/缩放后按窗口 resize 重画） */
+function rasterDpr(): number {
+  return typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
+}
+
+/**
+ * 把画布摆到"绘图区与窗口视口的交集"上，并按滚动偏移重画。
+ *
+ * 这样一块视口大小的纹理就够了：滚动只是改 scene.offset（着色器里减掉），
+ * 顶点数据原样复用 —— 大轨迹横向拖动的帧率因此与全图宽度无关。
+ */
+function applyRasterFrame(): void {
+  const scene = latestScene;
+  const plot = rasterPlot;
+  const canvas = sharedCanvas;
+  if (scene === null || plot === null || canvas === null) return;
+  const rect = plot.wrap.getBoundingClientRect();
+  const visibleLeft = Math.max(rect.left, 0);
+  const visibleTop = Math.max(rect.top, 0);
+  const visibleRight = Math.min(rect.right, window.innerWidth);
+  const visibleBottom = Math.min(rect.bottom, window.innerHeight);
+  const cssW = Math.floor(visibleRight - visibleLeft);
+  const cssH = Math.floor(visibleBottom - visibleTop);
+  if (cssW <= 0 || cssH <= 0) {
+    canvas.style.display = 'none';
+    return;
+  }
+  const dpr = rasterDpr();
+  const devW = Math.max(1, Math.round(cssW * dpr));
+  const devH = Math.max(1, Math.round(cssH * dpr));
+  if (canvas.width !== devW || canvas.height !== devH) {
+    canvas.width = devW;
+    canvas.height = devH;
+  }
+  canvas.style.display = '';
+  canvas.style.cssText = `position:fixed;left:${visibleLeft}px;top:${visibleTop}px;width:${cssW}px;height:${cssH}px;pointer-events:none;z-index:1`;
+  scene.width = devW;
+  scene.height = devH;
+  // 画布左上角对应的"绘图坐标系"位置（乘 DPR 变成设备像素，与形状坐标同一套）
+  scene.offsetX = (visibleLeft - rect.left) * dpr;
+  scene.offsetY = (visibleTop - rect.top) * dpr;
+  drawRaster(scene);
+}
+
+/**
+ * 交给画布画一帧，并把"画布自己坏了"挡在这里。
+ *
+ * WebGPU 出错的方式很讨厌：管线校验失败时 `draw` 可能抛错，也可能只是不再出图 ——
+ * 两种都会让波形看起来"缺一块/错位"。所以一旦抛错就整体退回 SVG 路径并重画一次，
+ * 宁可慢一点，也不要留着半张错的图。
+ */
+function drawRaster(scene: RasterScene): void {
+  const backend = rasterState.backend;
+  if (backend === null) return;
+  try {
+    backend.draw(scene);
+  } catch (err) {
+    rasterState.ok = false;
+    rasterState.backend = null;
+    try {
+      backend.destroy();
+    } catch {
+      // 已经坏掉的上下文再销毁一次会抛：忽略，反正不再用了
+    }
+    markBackend('svg');
+    console.warn('画布绘制失败，形状退回 SVG：', err);
+    rebuild(false, currentCenterCycle());
+  }
+}
+
+/** 滚动/改变窗口大小：只重画，不重排 */
+function scheduleRasterFrame(): void {
+  if (rasterRaf !== 0) return;
+  rasterRaf = requestAnimationFrame(() => {
+    rasterRaf = 0;
+    if (latestScene !== null && rasterState.backend !== null) applyRasterFrame();
+  });
+}
+
+/**
+ * 形状层实际用的后端：界面左上角显示一枚小 chip。
+ * 画布路径与 GPU 有关，用户需要一眼看出"到底走的是哪条"（`?gpu=0` 强制 Canvas2D、`?gpu=1` 强制 WebGPU）。
+ */
+function markBackend(kind: 'webgpu' | 'canvas2d' | 'svg'): void {
+  const host = document.querySelector('#main .view-head') ?? document.querySelector('#main');
+  if (host === null) return;
+  let node = host.querySelector<HTMLElement>('.raster-kind');
+  if (node === null) {
+    node = el('span', { class: 'chip raster-kind', style: 'margin-left:8px' });
+    host.append(node);
+  }
+  node.textContent = kind === 'svg' ? '形状层：SVG（画布不可用）' : `形状层：${kind === 'webgpu' ? 'WebGPU' : 'Canvas2D'}`;
+  node.title = '波形形状由画布绘制（文字与悬停仍在 SVG）。?gpu=0 强制 Canvas2D，?gpu=1 强制 WebGPU';
 }
 
 /** 视图共用的画布元素（后端与它绑定，见 ensureRaster） */
@@ -786,6 +898,9 @@ function rasterCanvas(): HTMLCanvasElement {
   if (sharedCanvas === null) {
     sharedCanvas = document.createElement('canvas');
     sharedCanvas.className = 'tl-raster';
+    // fixed 定位的视口层：挂到 body，避免被卡片的布局/overflow 裁剪
+    sharedCanvas.style.display = 'none';
+    document.body.append(sharedCanvas);
   }
   return sharedCanvas;
 }
@@ -806,12 +921,14 @@ function ensureRaster(canvas: HTMLCanvasElement): { ok: boolean; backend: Raster
       .then((backend) => {
         rasterState.backend = backend;
         // 后端是异步就绪的：把当前这一帧补画到画布上（不重排 DOM）
-        if (latestScene !== null) backend.draw(latestScene);
+        markBackend(backend.kind);
+        if (latestScene !== null) applyRasterFrame();
       })
       .catch((err: unknown) => {
         // 画布起不来 ⇒ 后面的渲染把形状交回 SVG；重画一次把这一帧（画布版）补成 SVG 版
         rasterState.ok = false;
         rasterState.backend = null;
+        markBackend('svg');
         console.warn('画布后端不可用，形状退回 SVG：', err);
         rebuild(false, currentCenterCycle());
       });
@@ -2630,6 +2747,9 @@ export const timelineView: View = {
     unsub?.();
     hostEl = container;
     ctxRef = ctx;
+    // 画布是 fixed 定位的视口层：窗口滚动/缩放时要重新摆位并重画（元素自身的横向滚动见 build）
+    window.addEventListener('scroll', scheduleRasterFrame, { passive: true });
+    window.addEventListener('resize', scheduleRasterFrame);
     scrollEl = null;
     registry = null;
     hoverSel = null;
@@ -2665,6 +2785,17 @@ export const timelineView: View = {
     paintToken?.abort();
     paintToken = null;
     latestScene = null;
+    if (rasterRaf !== 0) {
+      cancelAnimationFrame(rasterRaf);
+      rasterRaf = 0;
+    }
+    window.removeEventListener('scroll', scheduleRasterFrame);
+    window.removeEventListener('resize', scheduleRasterFrame);
+    if (sharedCanvas !== null) sharedCanvas.style.display = 'none';
+    rasterPlot = null;
+    window.removeEventListener('scroll', scheduleRasterFrame);
+    window.removeEventListener('resize', scheduleRasterFrame);
+    if (sharedCanvas !== null) sharedCanvas.style.display = 'none';
     resizeObs?.disconnect();
     resizeObs = null;
     hostEl = null;
