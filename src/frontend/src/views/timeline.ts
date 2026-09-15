@@ -26,7 +26,9 @@ import type {
 } from '../../../parser/src/index.ts';
 import {
   formatPosition,
+  stateSegments,
   valueAt,
+  type FsmTrack,
 } from '../../../parser/src/index.ts';
 import {
   axisTicks,
@@ -67,7 +69,7 @@ const AXIS_H = 30;
 /** 绘图区左右内边距（px） */
 const SIDE = 8;
 /** 泳道高度（px） */
-const H = { clk: 34, pip: 30, value: 36, evt: 26 } as const;
+const H = { clk: 34, fsm: 30, pip: 30, value: 36, evt: 26 } as const;
 /** 行间距（px）：行之间留白，靠间距而不是分隔线区分行 */
 const ROW_GAP = 9;
 /**
@@ -203,10 +205,11 @@ interface Registry extends Surface {
 }
 
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
-type LaneGroup = 'clock' | 'pipeline' | 'value' | 'event';
+type LaneGroup = 'clock' | 'fsm' | 'pipeline' | 'value' | 'event';
 
 const GROUP_TINT: Record<LaneGroup, string> = {
   clock: 'color-mix(in srgb, var(--accent) 16%, transparent)',
+  fsm: 'color-mix(in srgb, #0d9488 15%, transparent)',
   pipeline: 'var(--surface-2)',
   value: 'color-mix(in srgb, #7c3aed 13%, transparent)',
   event: 'color-mix(in srgb, #d97706 14%, transparent)',
@@ -873,6 +876,11 @@ function buildRows(
 
   for (const d of domains) rows.push(clockLane(d, ctx, scan));
 
+  // 状态机：紧跟时钟之后 —— 它讲的是"这一拍这台机器在哪个状态"
+  for (const fsm of trace.fsms.values()) {
+    if (visible(fsm.domain)) rows.push(fsmLane(fsm, ctx));
+  }
+
   for (const track of trace.tracks.values()) {
     if (visible(track.domain)) rows.push(pipLane(track, ctx));
   }
@@ -998,6 +1006,92 @@ function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number):
 
 // ------------------------------ 状态机
 
+/**
+ * 状态机：每个状态驻留段画成**六边形**（与流水线条目、数值块同一套形状语言），
+ * 两端切角正好落在状态切换处 —— 于是"这一拍是什么状态、哪一拍换的"一条泳道看完。
+ * 每台状态机一条泳道（`[fsm] "名字", 状态` 的名字）。
+ */
+function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
+  const segments = stateSegments(fsm);
+  return {
+    kind: 'lane',
+    group: 'fsm',
+    key: `fsm:${fsm.key}`,
+    domain: fsm.domain,
+    label: fsm.name,
+    color: COLOR.neutral,
+    height: H.fsm,
+    select: { kind: 'fsm', key: fsm.key },
+    hover: { kind: 'fsm', key: fsm.key },
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
+      cycleSurface(hit, reg, fsm.domain, ctx, (probe) => {
+        const at = segments.find((s) => probe.cycle >= s.start && probe.cycle <= s.end);
+        return [
+          `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+          cycleLabel(probe.cycle),
+          at ? `该周期状态：${at.state}（区段 ${at.start} – ${at.end}）` : '该周期没有状态记录',
+          `状态集 {${fsm.stateSet.join(', ')}} · 转换 ${fsm.transitions.length} 次 · 采样 ${fsm.samples.length} 条`,
+        ].join('\n');
+      });
+      const last = segments[segments.length - 1];
+      let drawn = 0;
+      for (const seg of segments) {
+        if (drawn >= MAX_ITEMS) break;
+        // 区段是半开区间 [start, 下一采样)；最后一段收在自己的周期里
+        const segEnd = seg === last ? seg.end + 1 : seg.end;
+        const from = Math.max(seg.start, reg.plot.from);
+        const to = Math.min(segEnd, reg.plot.to + 1);
+        if (to <= from) continue;
+        const left = reg.plot.scale(from);
+        const right = Math.max(left + 1.5, reg.plot.scale(to));
+        const color = colorFor(seg.state);
+        const open = seg.open === true;
+        const alpha = open ? 0.45 : 0.9;
+        const shape = svgEl('path', {
+          d: hexPath(left + 0.5, right - 0.5, y + 4, y + h - 5, 5),
+          fill: color,
+          'fill-opacity': alpha,
+          stroke: color,
+          'stroke-width': 1.1,
+          'stroke-linejoin': 'round',
+          ...(open ? { 'stroke-dasharray': '3 2' } : {}),
+        });
+        const dwell = fsm.dwellCycles.get(seg.state) ?? 0;
+        hoverTarget(
+          shape,
+          () =>
+            [
+              `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+              `状态 ${seg.state}`,
+              `周期 ${seg.start} → ${segEnd}（跨 ${segEnd - seg.start} 周期）`,
+              `该状态驻留合计 ${countLabel(dwell)} 周期`,
+              `转换 ${fsm.transitions.length} 次 · 状态集 {${fsm.stateSet.join(', ')}}`,
+              open ? '最后一段：驻留周期数不可确定（spec §9.5），画成开放的浅色虚线段' : '',
+            ]
+              .filter((line) => line !== '')
+              .join('\n'),
+          () => ctx.selection.set({ kind: 'fsm', key: fsm.key }),
+        );
+        g.append(shape);
+        const width = right - left;
+        if (width >= 26) {
+          g.append(
+            svgEl('text', {
+              x: (left + right) / 2,
+              y: y + h / 2 + 3.6,
+              'text-anchor': 'middle',
+              style: `font-size:10px;font-weight:600;pointer-events:none;fill:${inkOn(color, alpha)}`,
+              text: clip(seg.state, width - 6),
+            }),
+          );
+        }
+        drawn++;
+      }
+      if (drawn === 0) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 10, class: 'axis-label', text: '没有状态记录' }));
+    },
+  };
+}
 
 // ------------------------------ 流水线
 
