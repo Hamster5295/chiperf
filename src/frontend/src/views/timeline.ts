@@ -550,7 +550,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   svg.append(underlay);
 
   const gutter = el('div', {
-    style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--border)`,
+    // padding 让每行的圆角色块与左右两条边线（画布外沿 / 分隔线）留白，不贴着线
+    style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--border);padding:0 8px;box-sizing:border-box`,
   });
   gutter.append(axisGutterCell(plot));
 
