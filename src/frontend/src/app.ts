@@ -50,6 +50,9 @@ export function startApp(views: View[], sample: { name: string; text: string }):
   const hash = location.hash.replace(/^#\/?/, '');
   state.currentId = views.some((v) => v.id === hash) ? hash : views[0]!.id;
   renderShell();
+  // 主区要显式渲染一次：以前是靠"自动载入示例"走到 renderMain 的，
+  // 现在启动时没有轨迹，这一次渲染画出来的就是"打开 / 拖拽文件"页
+  renderMain();
   window.addEventListener('hashchange', () => {
     const id = location.hash.replace(/^#\/?/, '');
     if (views.some((v) => v.id === id) && id !== state.currentId) {
@@ -58,7 +61,8 @@ export function startApp(views: View[], sample: { name: string; text: string }):
       renderNav();
     }
   });
-  void loadSample(sample);
+  // 启动时不自动载入示例：先让用户看到"打开 / 拖拽文件"页（示例仍在头部按钮里，一键可载）
+  sampleText = sample.text;
 }
 
 // ------------------------------------------------------------------ 外壳
@@ -312,13 +316,27 @@ function applyTrace(trace: Trace, source: { name: string; bytes: number; gzip: b
 
 // ------------------------------------------------------------------ 面板
 
+/** 首次进入（还没载入任何文件）时的主区：把"打开 / 拖拽"做成一件事就能完成的页面 */
 function buildDropzone(): HTMLElement {
-  const zone = el('div', { class: 'dropzone' }, [
+  const input = el('input', {
+    type: 'file',
+    accept: '.chiperf,.gz,.chiperf.gz,application/gzip,text/plain',
+    style: 'display:none',
+  });
+  const openBtn = el('button', { class: 'btn btn-primary', text: '打开 .chiperf' });
+  openBtn.addEventListener('click', () => input.click());
+  input.addEventListener('change', () => {
+    const file = input.files?.[0];
+    if (file) void loadFile(file);
+  });
+  const sampleBtn = el('button', { class: 'btn', text: '载入示例' });
+  sampleBtn.addEventListener('click', () => void loadSampleInternal());
+  return el('div', { class: 'dropzone' }, [
     el('div', { class: 'dropzone-icon', text: '⌄' }),
     el('h3', { text: '把 .chiperf / .chiperf.gz 拖到这里' }),
-    el('p', { class: 'muted', text: '或者点击右上角的"打开 .chiperf"。文件只在本地解析，不会上传。' }),
+    el('div', { style: 'display:flex;gap:8px;justify-content:center;margin:10px 0 4px' }, [openBtn, sampleBtn, input]),
+    el('p', { class: 'muted', text: '文件只在本地解析，不会上传；示例是内置生成的，不读磁盘。' }),
   ]);
-  return zone;
 }
 
 export function installGlobalDropzone(): void {
