@@ -1564,7 +1564,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       hover: { kind: 'value', key: track.key },
       points,
       marks: shown,
-      defaultMode: 'wave',
+      defaultMode: 'blocks',
       allowRv: true,
       tip: (cycle, format) => {
         const current = valueAt(track, cycle);
