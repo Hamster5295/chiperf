@@ -152,18 +152,26 @@ export function occupancySeries(track: TrackInfo, from: number, to: number): num
  * 中位数与方差是**总体**口径（除以 n）：轨迹里的条目就是全部样本，不是抽样。
  * 方差用 `E[x²] − E[x]²` 一次遍历算出，避免先求平均再回头扫一遍。
  */
-export function latencyStats(track: TrackInfo): {
+/** 一维整数样本的描述统计（延迟、气泡段长度等共用一个口径） */
+export interface Distribution {
   count: number;
   min: number;
   max: number;
   avg: number;
-  /** 中位数：偶数个取中间两个的平均 */
+  /** 中位数：偶数个样本取中间两个的平均 */
   median: number;
-  /** 总体方差（单位是周期²）；开方得标准差 */
+  /** 总体方差（除以 n，单位是"周期²"）；开方得标准差 */
   variance: number;
-  histogram: { latency: number; count: number }[];
-} {
-  const xs = track.latencies;
+  /** 按取值升序的频次表 */
+  histogram: { value: number; count: number }[];
+}
+
+/**
+ * 对一组整数样本做描述统计。
+ * 中位数与方差都是**总体**口径（除以 n）：轨迹里的样本就是全部样本，不是抽样。
+ * 方差用 `E[x²] − E[x]²` 一次遍历算出，不必先求平均再回头扫一遍。
+ */
+export function describeSamples(xs: readonly number[]): Distribution {
   if (xs.length === 0) return { count: 0, min: 0, max: 0, avg: 0, median: 0, variance: 0, histogram: [] };
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
@@ -181,11 +189,25 @@ export function latencyStats(track: TrackInfo): {
   const sorted = [...xs].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   const median = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
-  const histogram = [...bins].sort((a, b) => a[0] - b[0]).map(([latency, count]) => ({ latency, count }));
+  const histogram = [...bins].sort((a, b) => a[0] - b[0]).map(([value, count]) => ({ value, count }));
   return { count: xs.length, min, max, avg, median, variance: sumSquares / xs.length - avg * avg, histogram };
 }
 
-/** 计数器之间的比率（如命中率）：两条 `delta_between` 相除（spec §9.2） */
+/** 延迟统计（同域完成条目，spec §9.4） */
+export function latencyStats(track: TrackInfo): Distribution {
+  return describeSamples(track.latencies);
+}
+
+/**
+ * 连续空泡段长度的分布（spec §9.4 的气泡定义）。
+ *
+ * 一段"气泡"= 该轨道上连续的若干周期没有在飞内容；这里统计**每段有多长**，
+ * 而不是"一共有多少个气泡周期"——后者是 `bubbles.length`，两者不重复：
+ * 10 个周期可能是"10 段各 1 拍"，也可能是"1 段 10 拍"。
+ */
+export function bubbleStats(track: TrackInfo): Distribution {
+  return describeSamples(track.bubbleRanges.map((range) => range.end - range.start + 1));
+}
 export function ratioBetween(num: CounterTrack, den: CounterTrack, c1: number, c2: number): number | null {
   const n = counterDeltaBetween(num, c1, c2);
   const d = counterDeltaBetween(den, c1, c2);

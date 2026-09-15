@@ -4,7 +4,12 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
-import { parseChiperf, occupancyAt, latencyStats } from '../src/index.ts';
+import {
+  parseChiperf,
+  bubbleStats,
+  occupancyAt,
+  latencyStats,
+} from '../src/index.ts';
 import type { Trace } from '../src/types.ts';
 
 const EXAMPLES = join(import.meta.dir, '../../../docs/examples');
@@ -331,7 +336,7 @@ describe('§9.4 延迟统计（中位 / 方差）', () => {
     const stats = latencyStats(track(traceWithLatencies([2, 2, 2]), 'T'));
     expect(stats.median).toBe(2);
     expect(stats.variance).toBeCloseTo(0, 10);
-    expect(stats.histogram).toEqual([{ latency: 2, count: 3 }]);
+    expect(stats.histogram).toEqual([{ value: 2, count: 3 }]);
   });
 
   test('没有已完成条目时返回全 0 而不是 NaN', () => {
@@ -402,5 +407,59 @@ describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
     const trace = parseChiperf(['chiperf 1.1', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
     expect(trace.records.length).toBe(1);
     expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
+  });
+});
+
+describe('连续空泡段长度（§9.4 气泡 + describeSamples）', () => {
+  /**
+   * 轨道 T 的活跃区间是周期 1–7：
+   *   1 有内容 → 2/3/4/5 连续空 4 拍 → 6 有内容 → 7 空 1 拍
+   * 也就是"一段 4 拍"加"一段 1 拍"，用来验证统计的是**段长**而不是拍数。
+   */
+  const trace = parseChiperf(
+    [
+      'chiperf 1.1',
+      '[clk] p', '[pip] "T", I, 0xa', '[clk] n',
+      '[clk] p', '[pip] "T", O, 0xa', '[clk] n',
+      '[clk] p', '[clk] n',
+      '[clk] p', '[clk] n',
+      '[clk] p', '[clk] n',
+      '[clk] p', '[pip] "T", I, 0xb', '[clk] n',
+      '[clk] p', '[pip] "T", O, 0xb', '[clk] n',
+      '@end',
+      '',
+    ].join('\n'),
+  );
+  const t = track(trace, 'T');
+
+  test('气泡区间与"段长"', () => {
+    expect(t.bubbleRanges).toEqual([{ start: 2, end: 5 }, { start: 7, end: 7 }]);
+    expect(bubbleStats(t).histogram).toEqual([{ value: 1, count: 1 }, { value: 4, count: 1 }]);
+  });
+
+  test('段长分布与拍数不是一回事', () => {
+    const stats = bubbleStats(t);
+    expect(stats.count).toBe(2); // 两段
+    expect(t.bubbles.length).toBe(5); // 五拍
+    expect(stats.median).toBe(2.5);
+    expect(stats.avg).toBe(2.5);
+    expect(stats.variance).toBeCloseTo(2.25, 10);
+    expect(stats.min).toBe(1);
+    expect(stats.max).toBe(4);
+  });
+
+  test('全程有内容时没有气泡段（未闭合条目一直占着）', () => {
+    const dense = parseChiperf(['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '@end', ''].join('\n'));
+    expect(bubbleStats(track(dense, 'T'))).toMatchObject({ count: 0, histogram: [] });
+  });
+
+  test('以关闭记录收尾的轨道，最后一拍按 §9.4 算气泡', () => {
+    // 关闭记录落在第 2 拍：条目占的是 [1, 2)，所以第 2 拍该轨道没有在飞内容
+    const closed = parseChiperf(
+      ['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '[clk] p', '[pip] "T", O, 0xa', '[clk] n', '@end', ''].join('\n'),
+    );
+    const t2 = track(closed, 'T');
+    expect(t2.bubbleRanges).toEqual([{ start: 2, end: 2 }]);
+    expect(bubbleStats(t2).histogram).toEqual([{ value: 1, count: 1 }]);
   });
 });

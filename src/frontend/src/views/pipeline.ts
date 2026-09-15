@@ -13,7 +13,7 @@
  * 逐周期与逐条目的细节在时间轴视图里看。
  */
 import type { TrackInfo } from '../../../parser/src/index.ts';
-import { latencyStats } from '../../../parser/src/index.ts';
+import { bubbleStats, latencyStats, type Distribution } from '../../../parser/src/index.ts';
 import { card, countLabel, el, emptyState, hoverTarget, statTile, svgEl, svgRoot } from '../charts.ts';
 import { fmtInt, type Selection, type View, type ViewContext } from '../view.ts';
 
@@ -180,48 +180,54 @@ function occupancyMetric(track: TrackInfo, ctx: ViewContext): HTMLElement {
 
 // ------------------------------------------------------------------ 指标 2：延迟分布
 
-/** 横向柱状图：每行一个延迟值，柱长 = 出现次数 / 最多次数 */
-function latencyBars(track: TrackInfo): HTMLElement {
-  const stats = latencyStats(track);
+interface DistributionText {
+  /** 每行左侧的单位文案，如 `${value} 周期` */
+  unit: string;
+  /** 没有样本时显示的说明 */
+  empty: string;
+  /** 悬停提示 */
+  tip: (value: number, count: number, share: number) => string;
+  /** 取值种类多于 10 种时的脚注 */
+  note: (kinds: number, shown: number) => string;
+}
+
+/** 横向柱状图：每行一个取值，柱长 = 频次 / 最大频次（延迟与气泡段长度共用） */
+function distributionList(stats: Distribution, text: DistributionText): HTMLElement {
   const list = el('div', { class: 'lat-list' });
   if (stats.count === 0) {
-    list.append(emptyState('该级没有已完成条目（未闭合 / 撤销的不计入延迟分布）'));
+    list.append(emptyState(text.empty));
     return list;
   }
-  // 按出现次数取前 10 个，再按延迟升序排回来 —— 横轴读起来才顺
-  const top = [...stats.histogram].sort((a, b) => b.count - a.count || a.latency - b.latency).slice(0, 10).sort((a, b) => a.latency - b.latency);
+  // 按出现次数取前 10 个，再按取值升序排回来 —— 读起来才顺
+  const top = [...stats.histogram]
+    .sort((a, b) => b.count - a.count || a.value - b.value)
+    .slice(0, 10)
+    .sort((a, b) => a.value - b.value);
   const peak = Math.max(...top.map((bin) => bin.count));
   top.forEach((bin, index) => {
     const share = stats.count > 0 ? bin.count / stats.count : 0;
+    // 颜色跟着取值从小到大走一遍冷暖：长空泡一眼就能从颜色上看出来
     const color = rampColor(top.length > 1 ? index / (top.length - 1) : 0);
     const bar = el('i', {
       class: 'lat-bar',
       style: `width:${Math.max(2, (bin.count / peak) * 100).toFixed(1)}%;background:${color}`,
     });
     const row = el('div', { class: `lat-row${bin.count === peak ? ' is-peak' : ''}` }, [
-      el('span', { class: 'lat-key', text: `${bin.latency} 周期` }),
+      el('span', { class: 'lat-key', text: `${bin.value} ${text.unit}` }),
       el('span', { class: 'lat-track' }, [bar]),
       el('span', { class: 'lat-count', text: countLabel(bin.count) }),
     ]);
-    hoverTarget(row, () =>
-      [`延迟 ${bin.latency} 周期`, `${fmtInt(bin.count)} 条`, `占已完成条目 ${(share * 100).toFixed(1)}%`].join('\n'),
-    );
+    hoverTarget(row, () => text.tip(bin.value, bin.count, share));
     list.append(row);
   });
   if (stats.histogram.length > top.length) {
-    list.append(
-      el('div', {
-        class: 'muted',
-        style: 'font-size:10.5px;margin-top:4px',
-        text: `共 ${stats.histogram.length} 种延迟，这里取出现次数最多的 ${top.length} 种`,
-      }),
-    );
+    list.append(el('div', { class: 'muted', style: 'font-size:10.5px;margin-top:4px', text: text.note(stats.histogram.length, top.length) }));
   }
   return list;
 }
 
-function latencyMetrics(track: TrackInfo): HTMLElement {
-  const stats = latencyStats(track);
+/** 分布面板的数值行：中位 / 平均 / 方差 / 标准差 / 范围 / 样本 */
+function distributionMetrics(stats: Distribution, sampleUnit: string): HTMLElement {
   if (stats.count === 0) return el('div', {});
   const sigma = Math.sqrt(Math.max(0, stats.variance));
   return el('div', { class: 'lat-stats' }, [
@@ -230,7 +236,7 @@ function latencyMetrics(track: TrackInfo): HTMLElement {
     el('span', {}, [el('span', { class: 'muted', text: '方差 ' }), el('b', { text: stats.variance.toFixed(2) })]),
     el('span', {}, [el('span', { class: 'muted', text: '标准差 ' }), el('b', { text: sigma.toFixed(2) })]),
     el('span', {}, [el('span', { class: 'muted', text: '范围 ' }), el('b', { text: `${stats.min} – ${stats.max}` })]),
-    el('span', {}, [el('span', { class: 'muted', text: '样本 ' }), el('b', { text: `${fmtInt(stats.count)} 条` })]),
+    el('span', {}, [el('span', { class: 'muted', text: '样本 ' }), el('b', { text: `${fmtInt(stats.count)} ${sampleUnit}` })]),
   ]);
 }
 
@@ -250,13 +256,36 @@ function stageCard(track: TrackInfo, state: PipelineState): HTMLElement {
     track.name,
     `域 ${track.domain} · 周期 ${track.firstCycle}–${track.lastCycle}（${countLabel(cycles)} 周期）· ${countLabel(track.items.length)} 条目`,
   );
+  const bubbles = bubbleStats(track);
   node.body.append(
     el('div', { class: 'stage-grid' }, [
       metric('占用 vs 空泡', `${countLabel(track.bubbles.length)} 个气泡周期`, [occupancyMetric(track, state.ctx)]),
       metric(
         '延迟分布',
         stats.count === 0 ? '没有已完成条目' : `同域完成 ${fmtInt(stats.count)} 条 · 按次数取前 10`,
-        [latencyBars(track), latencyMetrics(track)],
+        [
+          distributionList(stats, {
+            unit: '周期',
+            empty: '该级没有已完成条目（未闭合 / 撤销的不计入延迟分布）',
+            tip: (value, count, share) => [`延迟 ${value} 周期`, `${fmtInt(count)} 条`, `占已完成条目 ${(share * 100).toFixed(1)}%`].join('\n'),
+            note: (kinds, shown) => `共 ${kinds} 种延迟，这里取出现次数最多的 ${shown} 种`,
+          }),
+          distributionMetrics(stats, '条'),
+        ],
+      ),
+      metric(
+        '连续空泡数分布',
+        bubbles.count === 0 ? '没有气泡' : `${fmtInt(bubbles.count)} 段 · 合计 ${countLabel(bubbles.count * bubbles.avg)} 周期`,
+        [
+          distributionList(bubbles, {
+            unit: '周期',
+            empty: '该级没有气泡（活跃区间内全程有内容）',
+            tip: (value, count, share) =>
+              [`连续 ${value} 周期空泡`, `${fmtInt(count)} 段`, `占全部气泡段 ${(share * 100).toFixed(1)}%`, '一段 = 该级连续若干周期没有在飞内容'].join('\n'),
+            note: (kinds, shown) => `共 ${kinds} 种长度，这里取出现次数最多的 ${shown} 种`,
+          }),
+          distributionMetrics(bubbles, '段'),
+        ],
       ),
     ]),
   );
