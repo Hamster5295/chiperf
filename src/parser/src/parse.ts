@@ -18,6 +18,7 @@ import type {
   ScalarValue,
   SkippedLine,
   Trace,
+  ResetMark,
 } from './types.ts';
 import { trackKey } from './types.ts';
 import { parseArgs, decodeAt, stripComment, type Arg } from './lexer.ts';
@@ -42,6 +43,8 @@ export interface ParseOptions {
 }
 
 const EVENT_KINDS = new Set(['clk', 'cnt', 'val', 'pip', 'fsm', 'evt', 'msg']);
+/** 控制记录（spec §7.7）：不占位置、不占 seq、不进可视化 */
+const CONTROL_KINDS = new Set(['rst']);
 
 interface DomainRuntime {
   info: DomainInfo;
@@ -59,7 +62,10 @@ export class ChiperfParser {
   private readonly meta: Record<string, string> = {};
   private readonly declared = new Set<string>();
   private readonly records: EventRecord[] = [];
-  private readonly deriver: Deriver;
+  private readonly resets: ResetMark[] = [];
+  /** 复位时要整个换掉（此前的派生状态一律作废），所以不是 readonly */
+  private deriver: Deriver;
+  private readonly deriveCtx: DeriveContext;
   private seq = 0;
   private lineNo = 0;
   private chars = 0;
@@ -76,12 +82,12 @@ export class ChiperfParser {
   constructor(opts: ParseOptions = {}) {
     this.collectRecords = opts.collectRecords ?? true;
     this.ignoreVersion = opts.ignoreVersion ?? false;
-    const ctx: DeriveContext = {
+    this.deriveCtx = {
       cyclesOf: (domain) => this.domains.get(domain)?.info.cycles ?? 0,
       domainInfo: (domain) => this.domainRuntime(domain).info,
       diag: (code, line, message) => this.diag(code, line, message),
     };
-    this.deriver = new Deriver(ctx);
+    this.deriver = new Deriver(this.deriveCtx);
   }
 
   /** 追加任意文本片段（不必按行切分）；内部缓存不完整的尾行 */
@@ -128,6 +134,7 @@ export class ChiperfParser {
       },
       domains: new Map([...this.domains].map(([name, rt]) => [name, rt.info])),
       records: this.records,
+      resets: this.resets,
       counters: this.deriver.counters,
       values: this.deriver.values,
       fsms: this.deriver.fsms,
@@ -253,6 +260,10 @@ export class ChiperfParser {
     const rest = body.slice(close + 1);
     if (kind.length === 0 || !/^[A-Za-z0-9_-]+$/.test(kind)) {
       this.skip('invalid_record', this.lineNo, line, '记录类型名不是合法裸词');
+      return;
+    }
+    if (CONTROL_KINDS.has(kind)) {
+      this.applyReset(rest, line);
       return;
     }
     if (!EVENT_KINDS.has(kind)) {
@@ -511,6 +522,41 @@ export class ChiperfParser {
   private push(rec: EventRecord): void {
     if (this.collectRecords) this.records.push(rec);
     this.deriver.onRecord(rec);
+  }
+
+  /**
+   * `[rst]` 系统复位（spec §7.7）：**丢弃此前接受的全部事件记录**，从这一行重新开始。
+   *
+   * 丢弃是"当作没发生过"，不是"画在图上"：
+   *  - 记录、派生状态（在飞条目/计数器/数值/状态机）、诊断、跳过行全部作废
+   *  - 版本行与 `@` 指令（`@meta` / `@domain` 的 period/freq…）是**声明**不是行，保留
+   *  - 周期号不重编：`cycles` 继续往前走，所以复位后的记录接着原来的周期号
+   *  - 域上的"记录范围 / 沿数"按新窗口重算（它们描述的是窗口内可观察到的东西）
+   */
+  private applyReset(rest: string, line: string): void {
+    if (stripComment(rest).trim() !== '') {
+      this.skip('invalid_record', this.lineNo, line, '[rst] 不带参数');
+      return;
+    }
+    const dropped = this.records.length;
+    this.records.length = 0;
+    this.resets.push({ line: this.lineNo, droppedRecords: dropped });
+
+    // 派生状态整个重来：新建一个 Deriver 比逐项清理更不容易漏
+    this.deriver = new Deriver(this.deriveCtx);
+
+    // 复位前的诊断/跳过行也是关于被丢弃数据的，一并作废
+    this.diagnostics.length = 0;
+    this.diagnosticCounts.clear();
+    this.skipped.length = 0;
+
+    for (const rt of this.domains.values()) {
+      rt.info.posEdges = 0;
+      rt.info.negEdges = 0;
+      rt.info.firstCycle = Number.POSITIVE_INFINITY;
+      rt.info.lastCycle = 0;
+    }
+    this.diag('rst_boundary', this.lineNo, `系统复位：丢弃此前 ${dropped} 条事件记录（版本行与 @ 指令保留）`);
   }
 
   private skip(reason: SkippedLine['reason'], line: number, raw: string, detail?: string): void {

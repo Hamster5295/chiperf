@@ -101,6 +101,11 @@ function buildHeader(): HTMLElement {
     diagChip.style.cursor = 'pointer';
     diagChip.addEventListener('click', () => openDiagnostics());
     chips.append(diagChip);
+    if (t.resets.length > 0) {
+      // 复位本身不进任何视图（spec §7.7）；这里只是说明"文件前面为什么少了一截"
+      const dropped = t.resets.reduce((sum, mark) => sum + mark.droppedRecords, 0);
+      chips.append(chip(`复位 ×${t.resets.length}（已丢弃前 ${countLabel(dropped)} 条）`, 'chip-warn'));
+    }
     if (t.truncatedTail !== null) chips.append(chip('文件被截断', 'chip-warn'));
     if (!t.endSeen) chips.append(chip('无 @end', 'chip-warn'));
   }

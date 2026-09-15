@@ -136,7 +136,8 @@ export type DiagnosticCode =
   | 'truncated_tail'
   | 'skipped_unknown_kind'
   | 'skipped_unknown_directive'
-  | 'skipped_invalid_record';
+  | 'skipped_invalid_record'
+  | 'rst_boundary';
 
 export interface Diagnostic {
   code: DiagnosticCode;
@@ -229,6 +230,17 @@ export interface FsmTrack {
   stateSet: string[];
 }
 
+/**
+ * 复位标记（spec §7.7）。
+ * `[rst]` 本身**不进记录序列**：它把此前接受的事件记录整批丢掉，只留下"在哪一行丢了什么"。
+ */
+export interface ResetMark {
+  /** `[rst]` 所在行号（从 1 开始） */
+  line: number;
+  /** 被这次复位丢弃的事件记录条数 */
+  droppedRecords: number;
+}
+
 /** 在飞条目（spec §7.4 / §9.4） */
 export interface PipelineItem {
   track: string;
@@ -313,6 +325,8 @@ export interface Trace {
   };
   domains: Map<string, DomainInfo>;
   records: EventRecord[];
+  /** `[rst]` 复位标记（spec §7.7）：复位前的事件记录已被丢弃，这里只留下"丢了什么" */
+  resets: ResetMark[];
   counters: Map<string, CounterTrack>;
   values: Map<string, ValueTrack>;
   fsms: Map<string, FsmTrack>;

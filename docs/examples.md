@@ -349,3 +349,43 @@ chiperf 1.0
 ## 8. future-version.chiperf
 
 首行是 `chiperf 2.0`。默认模式下解析器 **必须** 拒绝该文件（未知主版本）；只有在显式开启"忽略版本"模式时才按 `1.x` 尽力解析。文件里的 2 条事件记录本身是合法的，因此这个用例可以区分"版本拒绝"与"语法错误"两种失败路径。
+
+## 9. `reset.chiperf` —— 系统复位（v1.1）
+
+```
+chiperf 1.1
+@domain default, period=1.0ns
+@meta design="rst-demo"
+
+[clk] p
+[cnt] "retired"
+[val] "core.pc", 0x1000
+[pip] "core.if", I, 0x1000
+[clk] n
+[clk] p
+[cnt] "retired"
+[clk] n
+
+[rst]                                   # 复位：以上全部记录作废
+
+[clk] p
+[cnt] "retired"                         # 累计从这里重新开始（= 1，不是 3）
+[val] "core.pc", 0x8000
+[clk] n
+@end
+```
+
+逐条推导：
+
+| 项 | 结果 |
+| --- | --- |
+| 记录条数 | 复位前 8 条被丢弃；**`stats.records = 4`**（复位后的 `p`/`cnt`/`val`/`n`） |
+| 复位标记 | `resets = [{ line: 15, droppedRecords: 8 }]`；`rst` 自身不是记录，不占 `seq`、不占位置 |
+| 计数器 `retired` | 终值 **1**（复位前那次增量已随记录作废） |
+| 数值 `core.pc` | 只剩复位后的 0x8000 一次采样；复位前是 `unknown` 而不是 0x1000 |
+| 轨道 `core.if` | **不存在**：它唯一那条 `I` 在复位前，随复位一起没了 |
+| 域 `default` | `period=1.0ns` 与 `@meta` **保留**（`@` 指令是声明不是行）；沿数与记录范围按新窗口重算 |
+| 周期号 | 不重编：复位后的记录接着原来的周期号（本例第 3 个周期），时钟不"回到 0" |
+| 诊断 | 一条 `rst_boundary`（信息性）；复位前的诊断与跳过行一并作废 |
+
+复位处正在飞的条目会被销毁：若上例的 `[pip] "core.if", I` 之后（复位后）再出现 `O`，那条 `O` 在窗口内匹配不到任何入记录，解析器报 `orphan_exit` —— 这是正确诊断，不是解析器的错。

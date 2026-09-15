@@ -341,3 +341,66 @@ describe('§9.4 延迟统计（中位 / 方差）', () => {
     expect(Number.isNaN(stats.variance)).toBe(false);
   });
 });
+
+describe('reset.chiperf（docs/examples.md §9，spec §7.7/§7.8）', () => {
+  const load = async (): Promise<Trace> => parseChiperf(await Bun.file(join(EXAMPLES, 'reset.chiperf')).text());
+
+  test('复位前的记录整批作废：只有复位后的 4 条记录', async () => {
+    const trace = await load();
+    expect(trace.stats.records).toBe(4);
+    expect(trace.records.map((r) => `${r.kind}@${r.pos.cycle}`)).toEqual(['clk@3', 'cnt@3', 'val@3', 'clk@3']);
+    expect(trace.resets).toEqual([{ line: 15, droppedRecords: 8 }]);
+    // rst 自身不入记录序列，也不占 seq
+    expect(trace.records.some((r) => (r as { kind: string }).kind === 'rst')).toBe(false);
+    expect(trace.records[0]!.seq).toBe(9);
+  });
+
+  test('计数器/数值都从复位处重新开始', async () => {
+    const trace = await load();
+    expect(counter(trace, 'default', 'retired').total).toBe(1);
+    const pc = trace.values.get('default\u0000core.pc')!;
+    expect(pc.samples.map((s) => s.value.text)).toEqual(['0x8000']);
+  });
+
+  test('复位前在飞的条目随之消失（轨道整个不存在）', async () => {
+    const trace = await load();
+    expect(trace.tracks.size).toBe(0);
+  });
+
+  test('@ 指令与版本行是声明不是行：域元数据保留', async () => {
+    const trace = await load();
+    const domain = trace.domains.get('default')!;
+    expect(domain.periodNs).toBe(1);
+    expect(domain.declared).toBe(true);
+    expect(trace.meta['design']).toContain('rst-demo');
+    expect(trace.version.minor).toBe(1);
+    // 沿数与记录范围按复位后的窗口重算；周期号不重编（新窗口从第 3 个周期开始）
+    expect(domain.posEdges).toBe(1);
+    expect(domain.negEdges).toBe(1);
+    expect(domain.cycles).toBe(3);
+    expect(domain.firstCycle).toBe(3);
+    expect(domain.lastCycle).toBe(3);
+  });
+
+  test('只留下一条信息性诊断 rst_boundary', async () => {
+    const trace = await load();
+    expect(trace.diagnostics.map((d) => d.code)).toEqual(['rst_boundary']);
+    expect(trace.diagnostics[0]!.message).toContain('丢弃此前 8 条');
+  });
+
+  test('复位后关闭一个被丢弃的条目 → orphan_exit（窗口内确实匹配不到）', () => {
+    const trace = parseChiperf(
+      ['chiperf 1.1', '[clk] p', '[pip] "T", I, 0xa', '[clk] n', '[rst]', '[clk] p', '[pip] "T", O, 0xa', '[clk] n', '@end', ''].join('\n'),
+    );
+    expect(trace.records.length).toBe(3);
+    const item = track(trace, 'T').items[0]!;
+    expect(item.orphan).toBe(true);
+    expect(countOf(trace, 'orphan_exit')).toBe(1);
+  });
+
+  test('[rst] 不接受任何参数', () => {
+    const trace = parseChiperf(['chiperf 1.1', '[rst] dom=default', '[clk] p', '@end', ''].join('\n'));
+    expect(trace.records.length).toBe(1);
+    expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
+  });
+});
