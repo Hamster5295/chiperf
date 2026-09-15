@@ -268,6 +268,52 @@ let rowOrder: string[] = [];
 let hiddenRows = new Set<string>();
 /** 最近一次构建出的全部行（含被隐藏的），供"已隐藏的行"菜单取名字 */
 let allRows: LaneRow[] = [];
+/** 批量选中的行键（Shift 选一整片、Ctrl 点选增减），以及 Shift 区间用的锚点 */
+let selectedRows = new Set<string>();
+let anchorKey: string | null = null;
+/** 行键 → 行头单元格：给选中的行加类名用（重画后要重新套一遍） */
+const rowCells = new Map<string, HTMLElement>();
+
+/** 当前渲染顺序（被隐藏的行不参与区间选择） */
+function renderedRowKeys(): string[] {
+  const lanes = registry?.lanes.map((lane) => lane.key) ?? [];
+  return lanes.length > 0 ? lanes : allRows.filter((row) => !hiddenRows.has(row.key)).map((row) => row.key);
+}
+
+function applyRowSelection(): void {
+  for (const [key, cell] of rowCells) cell.classList.toggle('is-row-selected', selectedRows.has(key));
+}
+
+/** 左键（可带修饰键）改选中：普通=只选它，Ctrl/⌘=加选或去掉它，Shift=从锚点连选一整片 */
+function selectRow(row: LaneRow, mode: 'only' | 'toggle' | 'range'): void {
+  if (mode === 'only') {
+    selectedRows = new Set([row.key]);
+    anchorKey = row.key;
+  } else if (mode === 'toggle') {
+    if (selectedRows.has(row.key)) selectedRows.delete(row.key);
+    else selectedRows.add(row.key);
+    anchorKey = row.key;
+  } else {
+    const keys = renderedRowKeys();
+    const here = keys.indexOf(row.key);
+    const from = anchorKey !== null && keys.includes(anchorKey) ? keys.indexOf(anchorKey) : here;
+    if (here >= 0 && from >= 0) {
+      selectedRows = new Set(keys.slice(Math.min(from, here), Math.max(from, here) + 1));
+      anchorKey = row.key;
+    }
+  }
+  applyRowSelection();
+}
+
+/**
+ * 右键作用于哪些行：右键的行在选中集里 → 整批；否则只有它自己。
+ * 菜单项据此只作用在"适用的行"上 —— 时钟/事件这类没有显示格式与显示模式的行
+ * 不会被批量操作改到（见 menuSectionsFor 的过滤）。
+ */
+function menuTargets(row: LaneRow): LaneRow[] {
+  if (selectedRows.size <= 1 || !selectedRows.has(row.key)) return [row];
+  return allRows.filter((candidate) => selectedRows.has(candidate.key));
+}
 let scrollEl: HTMLElement | null = null;
 let ctxRef: ViewContext | null = null;
 let unsub: (() => void) | null = null;
@@ -604,6 +650,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   });
   gutter.append(axisGutterCell(plot));
 
+  rowCells.clear();
   let y = AXIS_H;
   for (const row of rows) {
     const h = rowHeight(row);
@@ -614,10 +661,14 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     row.draw(g, reg, y, h);
     reg.currentRow = null;
     reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
-    gutter.append(gutterCell(row, h, ctx));
+    const cell = gutterCell(row, h, ctx);
+    rowCells.set(row.key, cell);
+    gutter.append(cell);
     installRowMenu(g, row);
     y += h + ROW_GAP;
   }
+  // 单元格是新建的，把批量选中态重新套上
+  applyRowSelection();
 
   // 选中 / 悬停标记（覆盖层）
   const overlay = svgEl('g', { 'pointer-events': 'none' });
@@ -802,7 +853,30 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
       }),
     ],
   );
-  if (row.select) node.addEventListener('click', () => ctx.selection.set(row.select ?? null));
+  node.addEventListener('mousedown', (event) => {
+    const me = event as MouseEvent;
+    if (me.button !== 0) return; // 右键交给菜单
+    if (me.shiftKey) {
+      selectRow(row, 'range');
+      me.preventDefault();
+      return;
+    }
+    if (me.ctrlKey || me.metaKey) {
+      selectRow(row, 'toggle');
+      me.preventDefault();
+      return;
+    }
+    // 普通左键：已经是多选的一部分就保持整批（这样才能拖着一整块走），否则只选它
+    if (selectedRows.size > 1 && selectedRows.has(row.key)) return;
+    selectRow(row, 'only');
+  });
+  if (row.select) {
+    node.addEventListener('click', (event) => {
+      const me = event as MouseEvent;
+      if (me.shiftKey || me.ctrlKey || me.metaKey) return; // 批量选择时不动跨视图选中
+      ctx.selection.set(row.select ?? null);
+    });
+  }
   if (row.hover) {
     const sel = row.hover;
     node.addEventListener('mouseenter', () => ctx.selection.hover(sel));
@@ -814,14 +888,16 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
 }
 
 /** 行头拖拽排序：拖到目标行的上半 → 插到它前面，下半 → 插到它后面 */
-let draggingKey: string | null = null;
+/** 正在拖的行键（整批拖动时是多个） */
+let draggingKey: string[] | null = null;
 
 function installRowDrag(node: HTMLElement, row: LaneRow): void {
   const clearMarks = (): void => {
     document.querySelectorAll('.tl-drop-before, .tl-drop-after').forEach((n) => n.classList.remove('tl-drop-before', 'tl-drop-after'));
   };
   node.addEventListener('dragstart', (event) => {
-    draggingKey = row.key;
+    // 拖的是选中行 → 整批一起搬；否则只搬它自己
+    draggingKey = selectedRows.size > 1 && selectedRows.has(row.key) ? [...selectedRows] : [row.key];
     node.classList.add('tl-dragging');
     event.dataTransfer?.setData('text/plain', row.key);
     if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
@@ -832,7 +908,7 @@ function installRowDrag(node: HTMLElement, row: LaneRow): void {
     clearMarks();
   });
   node.addEventListener('dragover', (event) => {
-    if (draggingKey === null || draggingKey === row.key) return;
+    if (draggingKey === null || draggingKey.includes(row.key)) return;
     event.preventDefault();
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
     const box = node.getBoundingClientRect();
@@ -852,7 +928,7 @@ function installRowDrag(node: HTMLElement, row: LaneRow): void {
     clearMarks();
     node.classList.remove('tl-dragging');
     draggingKey = null;
-    if (dragged !== null) reorderRow(dragged, row.key, after);
+    if (dragged !== null) reorderRows(dragged, row.key, after);
   });
 }
 
@@ -996,17 +1072,20 @@ function rerenderTimeline(): void {
 }
 
 /** 拖拽结束：把被拖的行插到目标行的前/后，并记住顺序 */
-function reorderRow(draggedKey: string, targetKey: string, after: boolean): void {
-  const ctx = ctxRef;
-  if (!ctx || draggedKey === targetKey) return;
+/**
+ * 把 `movingKeys` 整块搬到 `targetKey` 前/后，块内保持原相对顺序。
+ * 拖动选中的行时整批一起走（批量选中的意义就在这里）。
+ */
+function reorderRows(movingKeys: string[], targetKey: string, after: boolean): void {
+  if (!ctxRef) return;
   const current = rowOrder.length > 0 ? [...rowOrder] : registry?.lanes.map((lane) => lane.key) ?? [];
-  const keys = current.includes(draggedKey) ? current : [...current, draggedKey];
-  const from = keys.indexOf(draggedKey);
-  keys.splice(from, 1);
-  const targetIndex = keys.indexOf(targetKey);
+  const moving = movingKeys.filter((key) => key !== targetKey && current.includes(key));
+  if (moving.length === 0) return;
+  const rest = current.filter((key) => !moving.includes(key));
+  const targetIndex = rest.indexOf(targetKey);
   if (targetIndex < 0) return;
-  keys.splice(after ? targetIndex + 1 : targetIndex, 0, draggedKey);
-  rowOrder = keys;
+  rest.splice(after ? targetIndex + 1 : targetIndex, 0, ...moving);
+  rowOrder = rest;
   rerenderTimeline();
 }
 
@@ -1764,55 +1843,70 @@ function openRowMenu(clientX: number, clientY: number, sections: MenuSection[]):
   openMenuNode = root;
 }
 
+/**
+ * 右键菜单。作用于 `menuTargets(row)`（通常是整批选中）：
+ *  - 「显示格式」只给有格式的行（数值/计数器/流水线；时钟、事件行没有）
+ *  - 「显示模式」只给有显示模式的行（数值/计数器）—— **时钟/事件/流水线这类
+ *    不能改显示方式的行不会被批量操作改到**
+ *  - 勾选状态按"作用范围内全部一致"才算选中，混合时不勾
+ */
 function menuSectionsFor(row: LaneRow): MenuSection[] {
   const sections: MenuSection[] = [];
-  const menu = row.menu;
-  if (menu?.formatKey !== undefined) {
-    const key = menu.formatKey;
-    const width = menu.formatWidth ?? 32;
-    const allowRv = menu.allowRv !== false;
+  const targets = menuTargets(row);
+  const batch = targets.length > 1;
+  /** 选中多行时标出"这次会改到几行"，并在有行不适用时说明跳过了几行 */
+  const scope = (applicable: number): string => {
+    if (!batch) return '';
+    const skipped = targets.length - applicable;
+    return `（${applicable} 行${skipped > 0 ? `，跳过 ${skipped} 行不适用` : ''}）`;
+  };
+
+  const formats = targets.filter((target) => target.menu?.formatKey !== undefined);
+  if (formats.length > 0) {
+    const allowRv = formats.every((target) => target.menu?.allowRv !== false);
+    const width = Math.min(...formats.map((target) => target.menu?.formatWidth ?? 32));
+    const keys = formats.map((target) => target.menu!.formatKey!);
     sections.push({
-      title: '显示格式',
+      title: `显示格式${scope(formats.length)}`,
       items: VALUE_FORMATS.filter((item) => {
-        // rv32/rv64 是"把字当指令译"，位宽不够就没有意义；计数器这类整数值不提供。
-        // RV64 的反汇编覆盖 RV64GC，所以 64 位值也该给出 rv64。
         if (item.id === 'rv32') return allowRv && width <= 32;
         if (item.id === 'rv64') return allowRv && width <= 64;
         return true;
       }).map((item) => ({
         label: item.label,
-        checked: valueFormatOf(key) === item.id,
+        checked: formats.every((target) => valueFormatOf(target.menu!.formatKey!) === item.id),
         pick: () => {
-          valueFormats.set(key, item.id);
+          for (const key of keys) valueFormats.set(key, item.id);
           rerenderTimeline();
         },
       })),
     });
   }
-  if (menu?.modeKey !== undefined) {
-    const key = menu.modeKey;
-    const fallback = menu.defaultMode ?? 'wave';
+
+  const modes = targets.filter((target) => target.menu?.modeKey !== undefined);
+  if (modes.length > 0) {
+    const keys = modes.map((target) => target.menu!.modeKey!);
     sections.push({
-      title: '显示模式',
+      title: `显示模式${scope(modes.length)}`,
       items: VALUE_MODES.map((mode) => ({
         label: `${mode.glyph}  ${mode.label}`,
-        checked: valueModeOf(key, fallback) === mode.id,
+        checked: modes.every((target) => valueModeOf(target.menu!.modeKey!, target.menu!.defaultMode ?? 'wave') === mode.id),
         pick: () => {
-          valueModes.set(key, mode.id);
+          for (const key of keys) valueModes.set(key, mode.id);
           rerenderTimeline();
         },
       })),
     });
   }
-  // 隐藏是每行都有的能力（时钟/事件行也在内）
+
   sections.push({
     title: '行',
     items: [
       {
-        label: '隐藏此行',
+        label: batch ? `隐藏这 ${targets.length} 行` : '隐藏此行',
         checked: false,
         pick: () => {
-          hiddenRows.add(row.key);
+          for (const target of targets) hiddenRows.add(target.key);
           rerenderTimeline();
         },
       },
@@ -1826,6 +1920,8 @@ function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
   node.addEventListener('contextmenu', (event) => {
     const me = event as MouseEvent;
     me.preventDefault();
+    // 右键未选中的行 → 选择收窄到它；右键选中的行 → 菜单作用于整批
+    if (!selectedRows.has(row.key)) selectRow(row, 'only');
     openRowMenu(me.clientX, me.clientY, menuSectionsFor(row));
   });
 }
@@ -1839,7 +1935,15 @@ document.addEventListener('click', () => closeRowMenu());
 // 菜单是 fixed 定位，画布滚动后位置就对不上那一行了；捕获阶段才能收到内层滚动容器的 scroll
 window.addEventListener('scroll', () => closeRowMenu(), true);
 document.addEventListener('keydown', (event) => {
-  if ((event as KeyboardEvent).key === 'Escape') closeRowMenu();
+  if ((event as KeyboardEvent).key === 'Escape') {
+    closeRowMenu();
+    // Esc 也顺手取消批量选中
+    if (selectedRows.size > 0) {
+      selectedRows = new Set();
+      anchorKey = null;
+      applyRowSelection();
+    }
+  }
 });
 
 // ------------------------------ 事件 / 消息
@@ -2211,6 +2315,8 @@ export const timelineView: View = {
     hoverSel = null;
     lastHoverKey = '';
     chartAvail = 0;
+    selectedRows = new Set();
+    anchorKey = null;
     paint(container, ctx);
     unsub = ctx.selection.subscribe((sel, kind) => {
       if (kind === 'hover') {
