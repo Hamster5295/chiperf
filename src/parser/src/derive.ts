@@ -102,6 +102,7 @@ export class Deriver {
         name: rec.name,
         domain: rec.pos.domain,
         key,
+        source: 'cnt',
         total: 0,
         samples: [],
         deltaByCycle: new Map(),
@@ -134,7 +135,7 @@ export class Deriver {
       this.values.set(key, track);
     }
     const prev = track.samples[track.samples.length - 1];
-    const timed: Timed<ScalarValue> = { value: rec.value, pos: rec.pos, async: rec.async };
+    const timed: Timed<ScalarValue> = { value: rec.value, pos: rec.pos, async: rec.async, line: rec.line };
     track.samples.push(timed);
     // `changes` 复用同一个对象（可用引用比较），而不是另建一份
     if (prev && valueKey(prev.value) !== valueKey(rec.value)) track.changes.push(timed);
@@ -155,7 +156,7 @@ export class Deriver {
       this.ctx.diag('self_transition', rec.line, `状态机 "${rec.name}" 在周期 ${rec.pos.cycle} 自环于状态 ${to}`);
     }
     track.transitions.push({ from, to, pos: rec.pos, selfLoop });
-    track.samples.push({ value: rec.state, pos: rec.pos, async: rec.async });
+    track.samples.push({ value: rec.state, pos: rec.pos, async: rec.async, line: rec.line });
     if (!track.stateSet.includes(to)) track.stateSet.push(to);
     if (prev) {
       const span = rec.pos.cycle - prev.pos.cycle;
@@ -170,7 +171,7 @@ export class Deriver {
       track = { name: rec.name, domain: rec.pos.domain, key, samples: [] };
       this.events.set(key, track);
     }
-    track.samples.push({ value: rec.payload, pos: rec.pos, async: rec.async });
+    track.samples.push({ value: rec.payload, pos: rec.pos, async: rec.async, line: rec.line });
   }
 
   private applyPip(rec: Extract<EventRecord, { kind: 'pip' }>): void {

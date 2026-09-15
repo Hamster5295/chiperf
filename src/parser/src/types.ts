@@ -179,6 +179,8 @@ export interface Timed<T> {
   value: T;
   pos: Position;
   async: boolean;
+  /** 源文件行号（`[rst]` 丢弃记录时行号不重编，仍是原始行号） */
+  line: number;
 }
 
 /** 计数器（spec §9.2）。追踪键 = (域, 名字) */
@@ -188,6 +190,8 @@ export interface CounterTrack {
   key: string;
   /** 终值 */
   total: number;
+  /** 轨道来源：`cnt` = 真的 `[cnt]` 记录，`evt` = 由 `[evt]` 按每条 +1 折算（见 `eventCounters`） */
+  source: 'cnt' | 'evt';
   /** 每条 cnt 记录（按文件顺序） */
   samples: {
     pos: Position;

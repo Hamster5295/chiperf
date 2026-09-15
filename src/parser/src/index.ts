@@ -35,6 +35,7 @@ export {
   describeSamples,
   type Distribution,
   latencyStats,
+  eventCounters,
   ratioBetween,
   sameValue,
 } from './selectors.ts';

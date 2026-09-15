@@ -5,6 +5,7 @@
  */
 import type {
   CounterTrack,
+  Trace,
   DomainInfo,
   FsmTrack,
   Phase,
@@ -13,6 +14,7 @@ import type {
   TrackInfo,
   ValueTrack,
 } from './types.ts';
+import { trackKey } from './types.ts';
 import { formatValue, valueKey } from './value.ts';
 
 const PHASE_RANK: Record<Phase, number> = { '-': -1, p: 0, n: 1 };
@@ -213,6 +215,47 @@ export function ratioBetween(num: CounterTrack, den: CounterTrack, c1: number, c
   const d = counterDeltaBetween(den, c1, c2);
   if (n === null || d === null || d === 0) return null;
   return n / d;
+}
+
+/**
+ * 把事件轨折算成"每条 +1 的计数器"（spec §9.1 的 `[evt]`）。
+ *
+ * 事件记录只有"发生过"这一个信息，没有增量字段，所以计数是确定的：
+ * 一条记录 = 一次 +1，累计值 = 到该条为止的事件条数，
+ * 每周期增量 = 该周期里的事件条数（同周期多条会累加）。
+ *
+ * 键带 `evt:` 前缀：同一个域里 `[cnt] foo` 与 `[evt] foo` 可以并存
+ * （解析器只对 (域, 名字) 报 `name_reused` 提示），而视图用键做选中与高亮，
+ * 不区分就会一起亮。折算结果与原计数器**同构**，因此可以直接当 `CounterTrack` 用。
+ */
+export function eventCounters(trace: Trace): CounterTrack[] {
+  const out: CounterTrack[] = [];
+  for (const track of trace.events.values()) {
+    const samples: CounterTrack['samples'] = [];
+    const deltaByCycle = new Map<number, number>();
+    const totalByCycle = new Map<number, number>();
+    const changeCycles: number[] = [];
+    let total = 0;
+    for (const sample of track.samples) {
+      total += 1;
+      deltaByCycle.set(sample.pos.cycle, (deltaByCycle.get(sample.pos.cycle) ?? 0) + 1);
+      totalByCycle.set(sample.pos.cycle, total);
+      changeCycles.push(sample.pos.cycle);
+      samples.push({ pos: sample.pos, delta: 1, abs: null, total, async: sample.async, line: sample.line });
+    }
+    out.push({
+      name: track.name,
+      domain: track.domain,
+      key: trackKey(track.domain, `evt:${track.name}`),
+      source: 'evt',
+      total,
+      samples,
+      deltaByCycle,
+      totalByCycle,
+      changeCycles,
+    });
+  }
+  return out;
 }
 
 /** 同一取值是否构成"变化"（spec §9.3 的比较口径） */

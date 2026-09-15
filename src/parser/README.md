@@ -62,7 +62,7 @@ const trace3 = parser.finish();
 | `src/lexer.ts` | 注释剥除、字段切分、`at=` 值规则（§4.1 / §5.1） |
 | `src/parse.ts` | 记录分派、校验、位置推导、诊断（§5–§7 / §10） |
 | `src/derive.ts` | 在飞条目、占用度、气泡、延迟、状态机、计数器（§9） |
-| `src/selectors.ts` | 只读查询（`stateAt` / `occupancyAt` / `latencyStats` …） |
+| `src/selectors.ts` | 只读查询（`stateAt` / `occupancyAt` / `latencyStats` / `eventCounters` …） |
 | `src/inflate.ts` | DEFLATE/gzip 解码（§3.1 / §10.6） |
 | `src/gzip.ts` | `.chiperf.gz` 容器层 |
 
