@@ -35,11 +35,19 @@ import { cycleTime, fmtInt, type Selection, type View, type ViewContext } from '
 const zoomByChart = new Map<string, number>();
 /** 缩放归属的轨迹：换文件整批清掉，切到别的视图再回来保持 */
 let zoomTrace: Trace | null = null;
-/** 缩放上下限：1 是"正好铺满卡片"，再往下缩没有意义；上限靠画布保险兜住 */
-const MIN_HZOOM = 1;
-const MAX_HZOOM = 64;
-/** 未缩放时的画布总宽上限（几十万像素的 SVG 浏览器渲染会明显吃力） */
-const MAX_CHART_WIDTH = 3000;
+/** 绘图区左右边距（两个小卡的横轴都用它，`chartWidth` 的尺寸下限也要靠它算） */
+const AXIS_PAD = { left: 54, right: 16 };
+
+/**
+ * 缩放本身**不设上下限**（可以一直放大/缩小），只保留画布尺寸的保险：
+ * 几十万像素的 SVG 浏览器渲染会明显吃力。下限夹的是**绘图区**而不是画布 ——
+ * 画布再小也得留得下左右边距，否则 `plot.width` 会算成负数，坐标轴与柱子会画出
+ * 负宽度的 `<rect>`（浏览器直接报错）。
+ */
+const MIN_PLOT_WIDTH = 24;
+const MAX_CHART_WIDTH = 200000;
+/** 未缩放时的图宽上限：周期很多时先按这个宽度画（再靠缩放看细节），免得首屏就铺出十万像素 */
+const FIT_CHART_WIDTH = 3000;
 
 /** 一条采样在图上画出来的样子 */
 interface Point {
@@ -99,17 +107,19 @@ function drawXAxis(svg: SVGSVGElement, g: XGeom): XAxis {
  *
  * 缩放乘在**整幅图**上而不是只乘周期跨度：周期很短的计数器（示例里不少只有十几拍）
  * 本来就靠列宽撑开，只乘跨度的话前几级缩放完全看不出变化，滚轮像坏了一样。
- * 画布上限也跟着倍数放大，否则放大到一定程度就被上限钉住。
+ * 倍数本身不限（缩到小于 1 就是比卡片列宽还窄，整条曲线一眼看全），
+ * 只把结果夹在画布尺寸的保险区间里。
  */
 function chartWidth(span: number, available: number, zoom: number): number {
-  const fit = Math.max(available, Math.min(MAX_CHART_WIDTH, span * 12 + 100));
-  return Math.min(MAX_CHART_WIDTH * zoom, fit * zoom);
+  const fit = Math.max(available, Math.min(FIT_CHART_WIDTH, span * 12 + 100));
+  const floor = AXIS_PAD.left + AXIS_PAD.right + MIN_PLOT_WIDTH;
+  return Math.min(MAX_CHART_WIDTH, Math.max(floor, fit * zoom));
 }
 
 /** 卡片、图例、下拉里的显示名：evt 折算来的加前缀，免得跟同名 `[cnt]` 看混 */
 const labelOf = (track: CounterTrack): string => (track.source === 'evt' ? `[evt] ${track.name}` : track.name);
 
-/** 图键 → 横向缩放倍数。图键必须逐图唯一（同一个计数器既有累计曲线又有增量柱图） */
+/** 图键 → 横向缩放倍数（不限大小，只受画布尺寸保险约束）。图键必须逐图唯一 */
 const zoomOf = (chartKey: string): number => zoomByChart.get(chartKey) ?? 1;
 
 /** 卡片列宽：先放同样数量的占位卡片让 auto-fit 定下真实列数，再量列宽（图表至少占满一列） */
@@ -216,7 +226,7 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
   const first = points[0]!.cycle;
   const last = points[points.length - 1]!.cycle;
   const height = 150;
-  const pad = { left: 54, right: 16, top: 12, bottom: 20 };
+  const pad = { ...AXIS_PAD, top: 12, bottom: 20 };
   const width = chartWidth(last - first + 1, available, zoomOf(chartKey));
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
@@ -384,7 +394,7 @@ function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, ava
   }
 
   const height = 118;
-  const pad = { left: 54, right: 16, top: 10, bottom: 20 };
+  const pad = { ...AXIS_PAD, top: 10, bottom: 20 };
   const width = chartWidth(span, available, zoomOf(chartKey));
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
@@ -623,7 +633,7 @@ function highlight(selection: Selection): void {
  *
  * 锚点取指针处的内容比例（放大时内容不会从指针下面跑掉）。重建后其余图的
  * 倍数没变、宽度也没变，按左边缘（`viewX = 0`）还原即可保住它们各自的滚动位置。
- * 倍数到上下限时也不拦截，交回浏览器原生行为（横拖这张图）。
+ * 倍数本身不限，只有画布尺寸有保险（见 `chartWidth`）。
  */
 function installWheelZoom(host: HTMLElement, ctx: ViewContext): void {
   host.addEventListener(
@@ -640,8 +650,8 @@ function installWheelZoom(host: HTMLElement, ctx: ViewContext): void {
       if (!target) return;
       const chartKey = target.dataset.key!;
       const current = zoomOf(chartKey);
-      const next = Math.min(MAX_HZOOM, Math.max(MIN_HZOOM, current * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2)));
-      if (Math.abs(next - current) < 1e-6) return;
+      const next = current * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2);
+      if (!Number.isFinite(next) || next <= 0 || Math.abs(next - current) < 1e-6) return;
       wheel.preventDefault();
       // 重画会重建所有容器：先记下每张图的滚动位置，再按图键还原
       const before = new Map<string, number>();
