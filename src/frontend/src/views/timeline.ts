@@ -1222,7 +1222,9 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
             const right = clamp(segment.right, reg.plot.x0, reg.plot.x1);
             if (right - left < 1) continue;
             const unknown = segment.sample.value.hasXZ === true;
-            const centerY = segment.value === null ? (top + bottom) / 2 : yOf(segment.value);
+            // 六边形块只管"这一段是这个值"，不承担数值高低的表达：一律竖直居中，
+            // 否则同一行里块会随数值上下跳，反而不利于对比相邻的取值
+            const centerY = (top + bottom) / 2;
             g.append(
               svgEl('path', {
                 d: hexPath(left, right, centerY - blockH / 2, centerY + blockH / 2, 5),
