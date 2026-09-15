@@ -54,6 +54,7 @@ import {
   type View,
   type ViewContext,
 } from '../view.ts';
+import { VALUE_FORMATS, formatScalarBy, type ValueFormat } from '../rv.ts';
 
 // ------------------------------------------------------------------ 常量
 
@@ -192,6 +193,8 @@ interface LaneRow {
   note: string;
   color: string;
   height: number;
+  /** 行头里的附加控件（例如数值行的显示格式选择） */
+  controls?: HTMLElement;
   /** 标签列点击 / 悬停时广播的选中态 */
   select?: Selection;
   hover?: Selection;
@@ -393,7 +396,9 @@ function cycleSurface(
   // 高亮挂在这一行的**分组**上：鼠标压在条目/标记上时也要能高亮当前周期
   // （提示气泡仍然各管各的：条目有条目自己的，泳道空白处才有泳道的）
   const host = node.parentElement !== null && node.parentElement.tagName !== 'svg' ? node.parentElement : node;
-  host.addEventListener('mousemove', onMove as EventListener);
+  // 用捕获阶段：本行内的元素（条目、标记）可能自带 mousemove 提示，
+  // 捕获先于目标阶段执行，保证提示读到的是本拍刚算出的周期，而不是上一拍的残留
+  host.addEventListener('mousemove', onMove as EventListener, true);
   host.addEventListener('mouseleave', () => hideHoverCycle());
   node.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', domain, cycle: probe.cycle }));
   return hoverTarget(node, () => render(probe));
@@ -681,9 +686,12 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
         style: 'flex:0 1 auto;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
         text: row.label,
       }),
+      row.controls
+        ? el('span', { style: 'margin-left:auto;flex:0 0 auto;display:flex;align-items:center' }, [row.controls])
+        : null,
       el('span', {
         class: 'muted nowrap',
-        style: 'margin-left:auto;font-size:10px;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis',
+        style: `${row.controls ? '' : 'margin-left:auto;'}font-size:10px;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis`,
         text: row.note,
       }),
     ],
@@ -1099,6 +1107,7 @@ function numericOf(value: ScalarValue): number | null {
 function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
   const color = colorFor(track.key);
   const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
+  const format = valueFormatOf(track.key);
   return {
     kind: 'lane',
     group: 'value',
@@ -1109,6 +1118,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
     color,
     height: H.value,
     hover: { kind: 'value', key: track.key },
+    controls: valueFormatSelect(track, ctx) ?? undefined,
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const pad = 7;
@@ -1124,11 +1134,42 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
       if (numeric.length > 0) {
-        const points = numeric.map((entry) => [xOf(entry.sample.pos, entry.sample.async), yOf(entry.value)] as [number, number]);
+        const yOfValue = (entry: { sample: (typeof numeric)[number]['sample']; value: number }): number => yOf(entry.value);
+        // 无记录处按"保持"处理：左侧用虚线补出（首个采样之前是推断），右侧实线保持到画布结尾
+        const first = numeric[0]!;
+        const last = numeric[numeric.length - 1]!;
+        const firstX = xOf(first.sample.pos, first.sample.async);
+        const lastX = xOf(last.sample.pos, last.sample.async);
+        if (firstX > reg.plot.x0 + 0.5) {
+          g.append(
+            svgEl('path', {
+              d: `M${reg.plot.x0},${yOfValue(first)}L${firstX},${yOfValue(first)}`,
+              fill: 'none',
+              stroke: color,
+              'stroke-width': 1.7,
+              // 实线但更淡：线是连续的（首采样之前按"保持"补出），淡一些表示是推断段
+              'stroke-opacity': 0.45,
+            }),
+          );
+        }
+        if (lastX < reg.plot.x1 - 0.5) {
+          g.append(
+            svgEl('path', {
+              d: `M${lastX},${yOfValue(last)}L${reg.plot.x1},${yOfValue(last)}`,
+              fill: 'none',
+              stroke: color,
+              'stroke-width': 1.7,
+            }),
+          );
+        }
+        const points = numeric.map((entry, index) => {
+          const x = xOf(entry.sample.pos, entry.sample.async);
+          return [index === 0 && firstX > reg.plot.x0 ? reg.plot.x0 : x, yOfValue(entry)] as [number, number];
+        });
         g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         for (const entry of numeric) {
           const x = xOf(entry.sample.pos, entry.sample.async);
-          const y2 = yOf(entry.value);
+          const y2 = yOfValue(entry);
           const unknown = entry.sample.value.hasXZ === true;
           g.append(
             svgEl('circle', {
@@ -1142,11 +1183,24 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
             }),
           );
         }
-        // 变化点：加一道竖线刻度，方便和"次数"对上
-        for (const change of track.changes) {
-          if (numericOf(change.value) === null) continue;
-          const x = xOf(change.pos, change.async);
-          g.append(svgEl('line', { x1: x, x2: x, y1: top - 2, y2: bottom + 2, stroke: color, 'stroke-width': 0.8, 'stroke-opacity': 0.35 }));
+        // 变化处画「X」（传统波形图的交叉写法）：从旧值到新值的两条对角交叉线
+        const halfWidth = clamp(reg.plot.pxPerCycle * 0.35, 2, 7);
+        for (let index = 1; index < numeric.length; index++) {
+          const prev = numeric[index - 1]!;
+          const cur = numeric[index]!;
+          if (prev.value === cur.value) continue;
+          const x = xOf(cur.sample.pos, cur.sample.async);
+          const yPrev = yOfValue(prev);
+          const yCur = yOfValue(cur);
+          g.append(
+            svgEl('path', {
+              d: `M${x - halfWidth},${yPrev}L${x + halfWidth},${yCur}M${x - halfWidth},${yCur}L${x + halfWidth},${yPrev}`,
+              fill: 'none',
+              stroke: color,
+              'stroke-width': 1.3,
+              'stroke-opacity': 0.9,
+            }),
+          );
         }
       } else {
         // 非数值（字符串/符号）：只标变化点，值写在提示里
@@ -1163,7 +1217,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
         return [
           `数值 ${track.name}（域 ${track.domain}）`,
           cycleLabel(probe.cycle),
-          `该周期末取值 ${current === null ? '（尚未采样）' : formatScalar(current)}`,
+          `该周期末取值 ${current === null ? '（尚未采样）' : formatScalarBy(current, format)}`,
           numericNow === null ? '' : `区间 ${fmtCompact(min)} – ${fmtCompact(max)}`,
           `${track.samples.length} 次采样 · ${track.changes.length} 次变化`,
           current !== null && current.hasXZ === true ? '含未知位/高阻位（x/z）' : '',
@@ -1175,9 +1229,44 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
   };
 }
 
-/** 值的显示文本（字符串加引号，其余原样） */
-function formatScalar(value: ScalarValue): string {
-  return value.kind === 'str' ? `"${value.text}"` : value.text;
+/** 每行数值的显示格式（dec/hex/oct/bin/rv32/rv64），默认 dec，按行记忆 */
+const valueFormats = new Map<string, ValueFormat>();
+
+function valueFormatOf(key: string): ValueFormat {
+  return valueFormats.get(key) ?? 'dec';
+}
+
+/**
+ * 数值行的行头控件：进制 / RISC-V 译码。
+ * 只有"整条轨都是数字"的行才给选择器（字符串/符号轨无从格式化）；
+ * rv32/rv64 只在数据宽度 ≤ 32 位时给出。
+ */
+function valueFormatSelect(track: ValueTrack, ctx: ViewContext): HTMLElement | null {
+  // 允许个别采样是 x/z（它们按原样显示），只排除字符串/符号轨
+  if (track.samples.every((sample) => sample.value.kind === 'str' || sample.value.kind === 'sym')) return null;
+  const width = track.samples.reduce((max, sample) => {
+    const value = sample.value;
+    const declared = value.width ?? 0;
+    const needed = value.big === undefined ? 0 : Math.max(1, value.big < 0n ? (-value.big).toString(2).length + 1 : value.big.toString(2).length);
+    return Math.max(max, declared, needed);
+  }, 0);
+  const options = VALUE_FORMATS.filter((item) => item.id !== 'rv32' && item.id !== 'rv64' || width <= 32);
+  const select = el('select', {
+    class: 'tl-format',
+    title: '该行的显示格式（不影响解析结果）',
+    style: 'font:inherit;font-size:10px;padding:0 2px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);max-width:58px',
+  });
+  for (const item of options) {
+    const option = el('option', { value: item.id, text: item.label });
+    if (item.id === valueFormatOf(track.key)) option.setAttribute('selected', 'selected');
+    select.append(option);
+  }
+  select.addEventListener('change', () => {
+    valueFormats.set(track.key, (select.value as ValueFormat) ?? 'dec');
+    rerenderTimeline();
+  });
+  select.addEventListener('click', (event) => event.stopPropagation());
+  return select;
 }
 
 // ------------------------------ 事件 / 消息
