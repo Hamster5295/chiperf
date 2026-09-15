@@ -1036,10 +1036,14 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
       });
       const last = segments[segments.length - 1];
       let drawn = 0;
+      // 最后一段的状态会一直保持到轨迹结束（`fsm` 与 `val` 同为保持型），所以画到该域末尾；
+      // 但它只到"最后一次上报"为止是确定的，之后纯属推断，所以照 §9.5 用开放样式区分。
+      const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
+      const openEnd = domainEnd + 1;
       for (const seg of segments) {
         if (drawn >= MAX_ITEMS) break;
-        // 区段是半开区间 [start, 下一采样)；最后一段收在自己的周期里
-        const segEnd = seg === last ? seg.end + 1 : seg.end;
+        // 区段是半开区间 [start, 下一采样)；最后一段延伸到轨迹末尾
+        const segEnd = seg === last ? Math.max(seg.end + 1, openEnd) : seg.end;
         const from = Math.max(seg.start, reg.plot.from);
         const to = Math.min(segEnd, reg.plot.to + 1);
         if (to <= from) continue;
@@ -1064,10 +1068,15 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
             [
               `状态机 ${fsm.name}（域 ${fsm.domain}）`,
               `状态 ${seg.state}`,
-              `周期 ${seg.start} → ${segEnd}（跨 ${segEnd - seg.start} 周期）`,
+              open
+                ? `周期 ${seg.start} → ${domainEnd}（一直保持到轨迹末尾）`
+                : `周期 ${seg.start} → ${segEnd}（跨 ${segEnd - seg.start} 周期）`,
               `该状态驻留合计 ${countLabel(dwell)} 周期`,
               `转换 ${fsm.transitions.length} 次 · 状态集 {${fsm.stateSet.join(', ')}}`,
-              open ? '最后一段：驻留周期数不可确定（spec §9.5），画成开放的浅色虚线段' : '',
+              open
+                ? `最后一段：最后一次上报在第 ${seg.start} 周期，之后没有记录 —— 画到轨迹末尾是因为状态保持，` +
+                  '但"之后还保持了多久"不可确定（spec §9.5），所以画成浅色虚线的开放段'
+                : '',
             ]
               .filter((line) => line !== '')
               .join('\n'),
