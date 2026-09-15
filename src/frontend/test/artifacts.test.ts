@@ -6,7 +6,7 @@
  *  - 服务器提供页面、/healthz、404、405，且提供的内容与 dist/index.html 完全一致
  */
 import { beforeAll, afterAll, describe, expect, test } from 'bun:test';
-import { copyFile, mkdtemp, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -110,6 +110,33 @@ describe('dist/app.js（HTTP 服务器）', () => {
     const line = await Bun.file(join(DIST, 'index.html')).text();
     const response = await fetch(`${BASE}/`);
     expect(await response.text()).toBe(line);
+  });
+
+  test('重新 build 后无需重启：服务器按请求重读页面文件', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'chiperf-live-'));
+    try {
+      const pagePath = join(dir, 'index.html');
+      const appPath = join(dir, 'app.js');
+      await copyFile(join(DIST, 'app.js'), appPath);
+      await writeFile(pagePath, '<!doctype html><title>v1</title>');
+      const port = PORT + 2;
+      const child = Bun.spawn({ cmd: ['bun', appPath, '-p', String(port), '-q'], cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+      try {
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for await (const chunk of child.stdout as ReadableStream<Uint8Array>) {
+          buffer += decoder.decode(chunk, { stream: true });
+          if (buffer.includes('chiperf 可视化服务')) break;
+        }
+        expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toContain('v1');
+        await writeFile(pagePath, '<!doctype html><title>v2</title>');
+        expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toContain('v2');
+      } finally {
+        child.kill();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   test('app.js 被单独拷到没有 index.html 的目录时，仍然提供内嵌页面', async () => {

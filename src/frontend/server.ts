@@ -29,7 +29,10 @@ export interface ServerConfig {
   host: string;
   /** 页面来源描述（用于启动日志） */
   htmlSource: string;
+  /** 内存里的页面（内嵌副本，或启动时读到的文件内容） */
   html: string;
+  /** 有值时按请求重新读盘：重新 build 后刷新页面即可看到新版本，不必重启服务 */
+  htmlPath?: string;
   quiet: boolean;
 }
 
@@ -90,23 +93,36 @@ const HELP = `chiperf 可视化服务器
  *   2. **与 app.js 同目录的 index.html**（构建产物，改完源码重新 build 即刻生效，无需重启）
  *   3. 构建时内嵌的副本（app.js 被单独拷走时仍可用）
  */
-export async function resolveHtml(explicitPath?: string): Promise<{ html: string; source: string }> {
+export async function resolveHtml(explicitPath?: string): Promise<{ html: string; source: string; path?: string }> {
   if (explicitPath !== undefined) {
     const file = Bun.file(explicitPath);
     if (!(await file.exists())) throw new Error(`找不到 --html 指定的文件：${explicitPath}`);
-    return { html: await file.text(), source: explicitPath };
+    return { html: await file.text(), source: explicitPath, path: explicitPath };
   }
   const sibling = new URL('./index.html', import.meta.url);
   const siblingFile = Bun.file(sibling);
   if (await siblingFile.exists()) {
     const html = await siblingFile.text();
-    return { html, source: `${sibling.pathname}（${formatBytes(html.length)}）` };
+    return { html, source: `${sibling.pathname}（${formatBytes(html.length)}）`, path: sibling.pathname };
   }
   if (typeof __CHIPERF_HTML_B64__ === 'string' && __CHIPERF_HTML_B64__.length > 0) {
     const html = embeddedHtml()!;
     return { html, source: `内嵌页面（${formatBytes(html.length)}；同目录没有 index.html 时使用）` };
   }
   throw new Error('既没有同目录的 index.html，也没有内嵌页面；请先在 src/frontend 运行 `bun run build`');
+}
+
+/** 每个请求都重读页面文件（若配置了路径）；读不到就退回内存里的那份 */
+async function currentPage(config: ServerConfig): Promise<Uint8Array> {
+  if (config.htmlPath !== undefined) {
+    try {
+      const file = Bun.file(config.htmlPath);
+      if (await file.exists()) return new Uint8Array(await file.arrayBuffer());
+    } catch {
+      /* 读盘失败就用内存里的副本 */
+    }
+  }
+  return new TextEncoder().encode(config.html);
 }
 
 function formatBytes(n: number): string {
@@ -127,18 +143,18 @@ export function lanUrls(port: number): string[] {
 }
 
 export function startServer(config: ServerConfig): Server {
-  const page = new TextEncoder().encode(config.html);
   const server = Bun.serve({
     port: config.port,
     hostname: config.host,
     development: false,
-    fetch(request) {
+    async fetch(request) {
       const url = new URL(request.url);
       const method = request.method.toUpperCase();
       if (method !== 'GET' && method !== 'HEAD') {
         return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
       }
       if (url.pathname === '/' || url.pathname === '/index.html') {
+        const page = await currentPage(config);
         return new Response(method === 'HEAD' ? null : page, {
           headers: {
             'content-type': 'text/html; charset=utf-8',
@@ -194,8 +210,15 @@ async function main(): Promise<void> {
   const portFromEnv = process.env.PORT !== undefined ? Number(process.env.PORT) : undefined;
   const port = args.port ?? (Number.isInteger(portFromEnv) ? portFromEnv! : DEFAULT_PORT);
   const host = args.host ?? process.env.HOST ?? DEFAULT_HOST;
-  const { html, source } = await resolveHtml(args.htmlPath);
-  const server = startServer({ port, host, html, htmlSource: source, quiet: args.quiet ?? false });
+  const resolved = await resolveHtml(args.htmlPath);
+  const server = startServer({
+    port,
+    host,
+    html: resolved.html,
+    htmlSource: resolved.source,
+    ...(resolved.path !== undefined ? { htmlPath: resolved.path } : {}),
+    quiet: args.quiet ?? false,
+  });
   const shutdown = () => {
     server.stop(true);
     process.exit(0);
