@@ -129,6 +129,8 @@ interface DomainEdges {
   lo: number;
   hi: number;
   hasClk: boolean;
+  /** n 沿是按相位模型补出来的（文件里只有 p 记录），不是文件里写着的 */
+  synthN: boolean;
 }
 
 interface Scan {
@@ -336,6 +338,7 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
         lo: Number.POSITIVE_INFINITY,
         hi: Number.NEGATIVE_INFINITY,
         hasClk: false,
+        synthN: false,
       };
       edges.set(name, e);
     }
@@ -368,6 +371,14 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
   for (const e of edges.values()) {
     e.p.sort((a, b) => a - b);
     e.n.sort((a, b) => a - b);
+    // 只插上升沿是规范允许的省事写法（§6.2 第 3 条 / W10），此时文件里没有 n 记录；
+    // 但「周期 = 先 p 段（高）再 n 段（低）」的相位模型仍然成立（§6.1 第 5 条），
+    // 下降沿必然落在周期中点 —— 不补出来波形会一直停在第一次上升沿后的高电平。
+    // 只影响渲染与 tip 里的电平：不动 nSet，§9.1 的「下降沿数」仍是文件里的 n 记录数。
+    if (e.hasClk && e.p.length > 0 && e.n.length === 0) {
+      e.n = e.p.slice();
+      e.synthN = true;
+    }
   }
   asyncRecords.sort((a, b) => a.seq - b.seq);
   return { edges, asyncRecords, from, to };
@@ -903,7 +914,7 @@ function reorderRow(draggedKey: string, targetKey: string, after: boolean): void
 
 function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
   const edges: DomainEdges =
-    scan.edges.get(d.name) ?? { p: [], n: [], pSet: new Set(), nSet: new Set(), lo: d.firstCycle, hi: d.lastCycle, hasClk: false };
+    scan.edges.get(d.name) ?? { p: [], n: [], pSet: new Set(), nSet: new Set(), lo: d.firstCycle, hi: d.lastCycle, hasClk: false, synthN: false };
   const period = d.periodNs !== undefined ? `${d.periodNs} ns/周期` : d.freqHz !== undefined ? `${fmtCompact(d.freqHz)}Hz` : '未声明 period/freq';
   return {
     kind: 'lane',
@@ -930,6 +941,7 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
           `相位 ${probe.half === 0 ? 'p（上升沿之后）' : 'n（下降沿之后）'} · ${level ? '高电平' : '低电平'}`,
           `周期参数：${period}`,
           `本周期沿：${marks.length > 0 ? marks.join(' + ') : '（无）'}`,
+          ...(edges.synthN ? ['下降沿：文件里只写了 [clk] p，按相位模型补在周期中点'] : []),
           `该域记录周期 ${d.firstCycle} – ${d.lastCycle} · 共 ${countLabel(d.cycles)} 周期`,
         ].join('\n');
       });
@@ -937,7 +949,7 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
   };
 }
 
-/** 方波折线：p 沿占前半格、n 沿占后半格；只有 p 记录时整段都是高电平 */
+/** 方波折线：p 沿占前半格、n 沿占后半格（只有 p 记录的域，n 沿由扫描阶段按周期中点补出） */
 function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number): string {
   const step = Math.max(1, Math.ceil((plot.to + 1 - plot.from) / 4000));
   const pts: [number, number][] = [];
