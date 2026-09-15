@@ -1753,9 +1753,11 @@ function menuSectionsFor(row: LaneRow): MenuSection[] {
     sections.push({
       title: '显示格式',
       items: VALUE_FORMATS.filter((item) => {
-        const isRv = item.id === 'rv32' || item.id === 'rv64';
-        // rv32/rv64 只对"≤32 位的指令流"有意义；计数器这类整数值不提供
-        return isRv ? allowRv && width <= 32 : true;
+        // rv32/rv64 是"把字当指令译"，位宽不够就没有意义；计数器这类整数值不提供。
+        // RV64 的反汇编覆盖 RV64GC，所以 64 位值也该给出 rv64。
+        if (item.id === 'rv32') return allowRv && width <= 32;
+        if (item.id === 'rv64') return allowRv && width <= 64;
+        return true;
       }).map((item) => ({
         label: item.label,
         checked: valueFormatOf(key) === item.id,
