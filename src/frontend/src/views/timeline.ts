@@ -14,23 +14,19 @@
  *    文字标签有全局预算，占用度在低缩放下退化成阶梯折线。
  */
 import type {
-  CounterTrack,
   DomainInfo,
   EventRecord,
-  FsmTrack,
   Phase,
   PipelineItem,
   Position,
   ScalarValue,
   TrackInfo,
   Trace,
+  ValueTrack,
 } from '../../../parser/src/index.ts';
 import {
-  counterDeltaBetween,
-  counterTotalAt,
   formatPosition,
-  stateSegments,
-  timeNs,
+  valueAt,
 } from '../../../parser/src/index.ts';
 import {
   axisTicks,
@@ -40,7 +36,6 @@ import {
   countLabel,
   el,
   emptyState,
-  heatColor,
   hoverTarget,
   legend,
   linearScale,
@@ -51,7 +46,6 @@ import {
   type Scale,
 } from '../charts.ts';
 import {
-  cycleTime,
   fmtCompact,
   fmtInt,
   fmtNs,
@@ -70,7 +64,9 @@ const AXIS_H = 30;
 /** 绘图区左右内边距（px） */
 const SIDE = 8;
 /** 泳道高度（px） */
-const H = { header: 22, clk: 26, fsm: 28, pip: 22, occ: 28, cnt: 30, evt: 22 } as const;
+const H = { clk: 34, pip: 30, value: 36, evt: 26 } as const;
+/** 行间距（px）：行之间留白，靠间距而不是分隔线区分行 */
+const ROW_GAP = 9;
 /** 每周期像素范围 */
 const PX_MIN = 0.35;
 const PX_MAX = 64;
@@ -168,7 +164,8 @@ interface Registry extends Surface {
   selBox: SVGRectElement;
   hoverBox: SVGRectElement;
   selLabel: SVGTextElement;
-  /** 悬停高亮：只画在鼠标所在那一行的、该行时钟域的当前周期上 */
+  /** 悬停高光：整列一层很淡的底色 + 鼠标所在那一行更明显一点 */
+  hoverCol: SVGRectElement;
   hoverCell: SVGRectElement;
   hoverTag: SVGTextElement;
   /** 渲染循环在调用 row.draw 前写入，供 cycleSurface 捕获（不改各泳道的绘制签名） */
@@ -176,11 +173,12 @@ interface Registry extends Surface {
 }
 
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
-type LaneGroup = 'clock' | 'pipeline' | 'event';
+type LaneGroup = 'clock' | 'pipeline' | 'value' | 'event';
 
 const GROUP_TINT: Record<LaneGroup, string> = {
   clock: 'color-mix(in srgb, var(--accent) 16%, transparent)',
   pipeline: 'var(--surface-2)',
+  value: 'color-mix(in srgb, #7c3aed 13%, transparent)',
   event: 'color-mix(in srgb, #d97706 14%, transparent)',
 };
 
@@ -197,7 +195,7 @@ interface LaneRow {
   /** 标签列点击 / 悬停时广播的选中态 */
   select?: Selection;
   hover?: Selection;
-  draw(g: SVGGElement, reg: Registry, y: number, h: number, stripe: boolean): void;
+  draw(g: SVGGElement, reg: Registry, y: number, h: number): void;
 }
 
 type Row = LaneRow;
@@ -417,30 +415,36 @@ function showHoverCycle(domain: string, cycle: number, rowAt: { key: string; y: 
   const x0 = plot.scale(cycle);
   const x1 = plot.scale(cycle + 1);
   const width = Math.max(2, x1 - x0);
+  // 整列高光（贯穿绘图区）
+  reg.hoverCol.setAttribute('x', String(x0));
+  reg.hoverCol.setAttribute('y', String(plot.top));
+  reg.hoverCol.setAttribute('width', String(width));
+  reg.hoverCol.setAttribute('height', String(plot.bottom - plot.top));
+  reg.hoverCol.setAttribute('fill', target.color);
+  reg.hoverCol.setAttribute('display', '');
+  // 当前行再加深一档
   reg.hoverCell.setAttribute('x', String(x0));
-  reg.hoverCell.setAttribute('y', String(target.y + 1.5));
+  reg.hoverCell.setAttribute('y', String(target.y));
   reg.hoverCell.setAttribute('width', String(width));
-  reg.hoverCell.setAttribute('height', String(Math.max(2, target.h - 3)));
-  reg.hoverCell.setAttribute('stroke', target.color);
+  reg.hoverCell.setAttribute('height', String(Math.max(2, target.h)));
+  reg.hoverCell.setAttribute('fill', target.color);
   reg.hoverCell.setAttribute('display', '');
   reg.hoverTag.setAttribute('x', String(x1 + 6));
   reg.hoverTag.setAttribute('y', String(target.y + target.h / 2 + 3.5));
   reg.hoverTag.setAttribute('fill', target.color);
-  reg.hoverTag.textContent = `${domain} · ${cycleTime(ctx.trace.domains.get(domain), cycle, ctx.options.useTimeAxis)}`;
+  reg.hoverTag.textContent = `${domain} · ${cycleLabel(cycle)}`;
   reg.hoverTag.setAttribute('display', '');
 }
 
 function hideHoverCycle(): void {
+  registry?.hoverCol.setAttribute('display', 'none');
   registry?.hoverCell.setAttribute('display', 'none');
   registry?.hoverTag.setAttribute('display', 'none');
 }
 
 /** 泳道底：透明命中矩形 + 底部分隔线 */
-function laneCanvas(g: SVGGElement, reg: Registry, y: number, h: number, stripe: boolean): SVGRectElement {
+function laneCanvas(g: SVGGElement, reg: Registry, y: number, h: number): SVGRectElement {
   const plot = reg.plot;
-  if (stripe) {
-    g.append(svgEl('rect', { x: plot.x0, y, width: plot.x1 - plot.x0, height: h, fill: 'var(--surface-2)', 'fill-opacity': 0.5 }));
-  }
   g.append(svgEl('line', { x1: plot.x0, x2: plot.x1, y1: y + h - 0.5, y2: y + h - 0.5, stroke: 'var(--border)' }));
   const hit = svgEl('rect', {
     x: plot.x0,
@@ -469,7 +473,6 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   // 时间轴换算的主域：优先 default，其次任意声明了 period 的可见域
   const timeDomain =
     domains.find((d) => d.name === 'default' && d.periodNs !== undefined) ?? domains.find((d) => d.periodNs !== undefined);
-  const useTime = ctx.options.useTimeAxis && timeDomain?.periodNs !== undefined;
   const primary = timeDomain ?? domains[0]!;
 
   const rows = buildRows(trace, ctx, domains, scan, visible);
@@ -477,7 +480,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   const span = Math.max(1, scan.to - scan.from + 1);
   const px = pixelScale(ctx, host, span);
   const plotW = Math.max(1, span * px);
-  const height = AXIS_H + rows.reduce((sum, row) => sum + rowHeight(row), 0);
+  // 行之间留白：总高 = 轴 + Σ行高 + 行间距（末尾不加）
+  const height = AXIS_H + rows.reduce((sum, row) => sum + rowHeight(row) + ROW_GAP, 0) - ROW_GAP;
   const plot: Plot = {
     scale: linearScale(scan.from, scan.to + 1, SIDE, SIDE + plotW),
     from: scan.from,
@@ -493,7 +497,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   const svg = svgRoot(plot.width, plot.height, { style: 'flex:0 0 auto' });
   svg.append(buildDefs());
-  axisLayer(svg, plot, primary, useTime, ctx);
+  axisLayer(svg, plot, primary, ctx);
 
   const reg: Registry = {
     svg,
@@ -504,6 +508,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     selBox: svgEl('rect', {}),
     hoverBox: svgEl('rect', {}),
     selLabel: svgEl('text', {}),
+    hoverCol: svgEl('rect', {}),
     hoverCell: svgEl('rect', {}),
     hoverTag: svgEl('text', {}),
     currentRow: null,
@@ -512,22 +517,20 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   const gutter = el('div', {
     style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--border)`,
   });
-  gutter.append(axisGutterCell(plot, useTime ? primary : undefined));
+  gutter.append(axisGutterCell(plot));
 
   let y = AXIS_H;
-  let stripe = false;
   for (const row of rows) {
     const h = rowHeight(row);
     const g = svgEl('g', {});
     svg.append(g);
     // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
     reg.currentRow = { key: row.key, y, h, color: row.color };
-    row.draw(g, reg, y, h, stripe);
+    row.draw(g, reg, y, h);
     reg.currentRow = null;
     reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
     gutter.append(gutterCell(row, h, ctx));
-    stripe = !stripe;
-    y += h;
+    y += h + ROW_GAP;
   }
 
   // 网格线画在泳道之上，避免被泳道底色冲淡
@@ -538,21 +541,21 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   // 选中 / 悬停标记（覆盖层）
   const overlay = svgEl('g', { 'pointer-events': 'none' });
   reg.selLine = svgEl('line', { y1: plot.top, y2: plot.bottom, stroke: 'var(--accent)', 'stroke-width': 1, 'stroke-dasharray': '4 3', display: 'none' });
-  // 悬停：只框出"鼠标所在行的那一个周期"，不再画横跨全图的竖线
-  reg.hoverCell = svgEl('rect', { fill: 'none', 'stroke-width': 2, rx: 2, 'fill-opacity': 0.1, display: 'none' });
+  // 悬停：周期所在的一整列加一层浅色高光（不画边框，也不画竖向虚线），
+  // 其中鼠标所在行再加深一点，兼顾"列"的定位与"行"的归属
+  reg.hoverCol = svgEl('rect', { 'fill-opacity': 0.07, display: 'none', 'pointer-events': 'none' });
+  reg.hoverCell = svgEl('rect', { rx: 3, 'fill-opacity': 0.18, display: 'none', 'pointer-events': 'none' });
   reg.hoverTag = svgEl('text', { class: 'axis-label', 'text-anchor': 'start', display: 'none' });
   reg.selBox = svgEl('rect', { fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, rx: 3, display: 'none' });
   reg.hoverBox = svgEl('rect', { fill: 'none', stroke: COLOR.async, 'stroke-width': 1.5, 'stroke-dasharray': '3 2', rx: 3, display: 'none' });
   reg.selLabel = svgEl('text', { class: 'axis-label', 'text-anchor': 'middle', y: AXIS_H - 9, display: 'none' });
-  overlay.append(reg.hoverCell, reg.hoverBox, reg.selBox, reg.selLine, reg.selLabel, reg.hoverTag);
+  overlay.append(reg.hoverCol, reg.hoverCell, reg.hoverBox, reg.selBox, reg.selLine, reg.selLabel, reg.hoverTag);
   svg.append(overlay);
 
   // 卡片
   const cardNode = card(
     '时间轴',
-    useTime && timeDomain
-      ? `共用横轴：周期（时间换算按 ${timeDomain.name} 域，1 周期 = ${fmtNs(timeDomain.periodNs!)}）`
-      : '共用横轴：周期（没有可见域声明 period/freq，无法改标时间）',
+    '共用横轴：周期（各时钟域独立计数）。行头可拖拽排序；Ctrl/⌘ + 滚轮缩放',
   );
   cardNode.body.append(buildStats(domains, scan, trace));
   cardNode.body.append(buildControls(ctx, plot, span));
@@ -571,6 +574,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   cardNode.body.append(scroll);
   host.append(cardNode.root);
 
+  installWheelZoom(scroll);
   scrollEl = scroll;
   registry = reg;
   chartAvail = scroll.clientWidth;
@@ -640,7 +644,12 @@ function buildControls(ctx: ViewContext, plot: Plot, span: number): HTMLElement 
   return row;
 }
 
-function axisGutterCell(plot: Plot, timeDomain: DomainInfo | undefined): HTMLElement {
+/** 时间轴只讲周期，不换算真实时间 */
+function cycleLabel(cycle: number): string {
+  return cycle <= 0 ? '时钟之前（周期 0）' : `周期 ${cycle}`;
+}
+
+function axisGutterCell(plot: Plot): HTMLElement {
   return el(
     'div',
     {
@@ -650,7 +659,7 @@ function axisGutterCell(plot: Plot, timeDomain: DomainInfo | undefined): HTMLEle
         'px;display:flex;flex-direction:column;justify-content:center;gap:1px;padding:0 8px;border-bottom:1px solid var(--border-strong)',
     },
     [
-      el('span', { style: 'font-size:11px;font-weight:600', text: timeDomain ? `周期 / 时间（${timeDomain.name}）` : '周期' }),
+      el('span', { style: 'font-size:11px;font-weight:600', text: '周期' }),
       el('span', { class: 'muted', style: 'font-size:10px', text: `${countLabel(plot.from)} – ${countLabel(plot.to)} · ${plot.pxPerCycle.toFixed(2)} px/周期` }),
     ],
   );
@@ -663,7 +672,7 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
       class: 'tl-gutter-cell',
       draggable: 'true',
       title: '拖动可调整行顺序',
-      style: `height:${h}px;display:flex;align-items:center;gap:6px;padding:0 8px;border-bottom:1px solid var(--border);overflow:hidden;min-width:0;cursor:grab;background:${GROUP_TINT[row.group]};${row.select ? 'cursor:pointer' : ''}`,
+      style: `height:${h}px;margin-bottom:${ROW_GAP}px;display:flex;align-items:center;gap:6px;padding:0 10px;border-radius:6px;overflow:hidden;min-width:0;cursor:grab;background:${GROUP_TINT[row.group]};${row.select ? 'cursor:pointer' : ''}`,
     },
     [
       el('span', { class: 'tl-drag-handle', text: '⠿' }),
@@ -735,15 +744,14 @@ function installRowDrag(node: HTMLElement, row: LaneRow): void {
 
 // ------------------------------------------------------------------ 轴 / 网格 / defs
 
-function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, useTime: boolean, ctx: ViewContext): void {
+function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, ctx: ViewContext): void {
   const g = svgEl('g', {});
   g.append(svgEl('rect', { x: plot.x0, y: 0, width: plot.x1 - plot.x0, height: AXIS_H, fill: 'var(--surface-2)', 'fill-opacity': 0.55 }));
-  const period = primary.periodNs;
+  // 时间轴只标周期数：不显示真实时间（各域周期号本来就不同刻度，换成 ns 更容易误读）
   for (const t of axisTicks(plot.from, plot.to, tickCount(plot))) {
     const x = plot.scale(t);
     g.append(svgEl('line', { x1: x, x2: x, y1: AXIS_H - 5, y2: AXIS_H, stroke: 'var(--border-strong)' }));
-    const label = useTime && period !== undefined ? (t < 1 ? '时钟前' : fmtNs(timeNs(primary, t) ?? 0)) : String(t);
-    g.append(svgEl('text', { x, y: 15, class: 'axis-label', 'text-anchor': 'middle', text: label }));
+    g.append(svgEl('text', { x, y: 15, class: 'axis-label', 'text-anchor': 'middle', text: String(t) }));
   }
   g.append(svgEl('line', { x1: plot.x0, x2: plot.x1, y1: AXIS_H - 0.5, y2: AXIS_H - 0.5, stroke: 'var(--border-strong)' }));
   g.append(
@@ -752,7 +760,7 @@ function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, useTime:
       y: 15,
       class: 'axis-label axis-title',
       'text-anchor': 'start',
-      text: useTime ? '时间（按主域 period 换算）' : '周期',
+      text: '周期',
     }),
   );
   svg.append(g);
@@ -769,10 +777,10 @@ function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, useTime:
   svg.append(hit);
   cycleSurface(hit, { svg, plot }, primary.name, ctx, (probe) =>
     [
-      cycleTime(primary, probe.cycle, true),
-      useTime ? `时间轴：按域 ${primary.name} 的 1 周期 = ${fmtNs(period ?? 0)} 换算` : '没有可见域声明 period，刻度只能标周期号',
+      cycleLabel(probe.cycle),
       `横轴范围 ${countLabel(plot.from)} – ${countLabel(plot.to)} · 当前 ${plot.pxPerCycle.toFixed(2)} px/周期`,
       '点击：广播该周期（其它视图会跟着定位）',
+      'Ctrl/⌘ + 滚轮：以指针处为中心缩放',
     ].join('\n'),
   );
 }
@@ -822,6 +830,11 @@ function buildRows(
 
   for (const track of trace.tracks.values()) {
     if (visible(track.domain)) rows.push(pipLane(track, ctx));
+  }
+
+  // 数值：保持型阶梯（采样后一直保持到下一条），变化点单独标出来
+  for (const track of trace.values.values()) {
+    if (visible(track.domain)) rows.push(valueLane(track, ctx));
   }
 
   // 事件：evt 轨 + msg + （合并进来的）其它类型的异步记录 —— 不再单独占一节
@@ -884,8 +897,8 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
     color: colorFor(d.name),
     height: H.clk,
     hover: { kind: 'cycle', domain: d.name, cycle: Math.max(1, d.firstCycle) },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
       const high = y + 4;
       const low = y + h - 4;
       g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low), fill: 'none', stroke: colorFor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
@@ -896,7 +909,7 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
         const marks = [edges.pSet.has(c) ? 'p（上升）' : null, edges.nSet.has(c) ? 'n（下降）' : null].filter((v) => v !== null);
         return [
           `时钟域 ${d.name}（${d.declared ? '@domain 声明' : '隐式建立'}）`,
-          cycleTime(d, c, true),
+          cycleLabel(c),
           `相位 ${probe.half === 0 ? 'p（上升沿之后）' : 'n（下降沿之后）'} · ${level ? '高电平' : '低电平'}`,
           `周期参数：${period}`,
           `本周期沿：${marks.length > 0 ? marks.join(' + ') : '（无）'}`,
@@ -958,12 +971,12 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     color: colorFor(track.name),
     height: H.pip,
     hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
       cycleSurface(hit, reg, track.domain, ctx, (probe) =>
         [
           `轨道 ${track.name}（域 ${track.domain}）`,
-          cycleTime(ctx.trace.domains.get(track.domain), probe.cycle, true),
+          cycleLabel(probe.cycle),
           `本周期占用 ${track.occupancy.get(probe.cycle) ?? 0} · 到达 ${track.arrivals.get(probe.cycle) ?? 0} · 离开 ${track.departures.get(probe.cycle) ?? 0}`,
           `${track.items.length} 条目 · ${track.completed} 完成 · ${track.aborted} 冲刷 · ${track.open} 未闭合`,
         ].join('\n'),
@@ -1075,6 +1088,99 @@ function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
 // ------------------------------ 计数器
 
 
+// ------------------------------ 数值
+
+/** 数值轨里能画成折线的取样：int/bits（无 x/z）与 real */
+function numericOf(value: ScalarValue): number | null {
+  if (value.kind === 'real') return value.num ?? null;
+  if ((value.kind === 'int' || value.kind === 'bits') && value.big !== undefined) return Number(value.big);
+  return null;
+}
+
+function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
+  const color = colorFor(track.key);
+  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
+  return {
+    kind: 'lane',
+    group: 'value',
+    key: `val:${track.key}`,
+    domain: track.domain,
+    label: track.name,
+    note: `${track.samples.length} 采样 · ${track.changes.length} 次变化`,
+    color,
+    height: H.value,
+    hover: { kind: 'value', key: track.key },
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
+      const pad = 7;
+      const top = y + pad;
+      const bottom = y + h - pad;
+      const numeric = shown
+        .map((sample) => ({ sample, value: numericOf(sample.value) }))
+        .filter((entry): entry is { sample: (typeof shown)[number]; value: number } => entry.value !== null);
+      const values = numeric.map((entry) => entry.value);
+      const min = values.length > 0 ? Math.min(...values) : 0;
+      const max = values.length > 0 ? Math.max(...values) : 1;
+      const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
+      const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
+
+      if (numeric.length > 0) {
+        const points = numeric.map((entry) => [xOf(entry.sample.pos, entry.sample.async), yOf(entry.value)] as [number, number]);
+        g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
+        for (const entry of numeric) {
+          const x = xOf(entry.sample.pos, entry.sample.async);
+          const y2 = yOf(entry.value);
+          const unknown = entry.sample.value.hasXZ === true;
+          g.append(
+            svgEl('circle', {
+              cx: x,
+              cy: y2,
+              r: unknown ? 2.6 : 1.8,
+              fill: unknown ? 'var(--surface)' : color,
+              stroke: color,
+              'stroke-width': 1.1,
+              ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
+            }),
+          );
+        }
+        // 变化点：加一道竖线刻度，方便和"次数"对上
+        for (const change of track.changes) {
+          if (numericOf(change.value) === null) continue;
+          const x = xOf(change.pos, change.async);
+          g.append(svgEl('line', { x1: x, x2: x, y1: top - 2, y2: bottom + 2, stroke: color, 'stroke-width': 0.8, 'stroke-opacity': 0.35 }));
+        }
+      } else {
+        // 非数值（字符串/符号）：只标变化点，值写在提示里
+        for (const change of shown) {
+          const x = xOf(change.pos, change.async);
+          g.append(svgEl('line', { x1: x, x2: x, y1: top, y2: bottom, stroke: color, 'stroke-width': 1.2, 'stroke-opacity': 0.6 }));
+        }
+        g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: '非数值轨：只标变化点' }));
+      }
+
+      cycleSurface(hit, reg, track.domain, ctx, (probe) => {
+        const current = valueAt(track, probe.cycle);
+        const numericNow = current === null ? null : numericOf(current);
+        return [
+          `数值 ${track.name}（域 ${track.domain}）`,
+          cycleLabel(probe.cycle),
+          `该周期末取值 ${current === null ? '（尚未采样）' : formatScalar(current)}`,
+          numericNow === null ? '' : `区间 ${fmtCompact(min)} – ${fmtCompact(max)}`,
+          `${track.samples.length} 次采样 · ${track.changes.length} 次变化`,
+          current !== null && current.hasXZ === true ? '含未知位/高阻位（x/z）' : '',
+        ]
+          .filter((line) => line !== '')
+          .join('\n');
+      });
+    },
+  };
+}
+
+/** 值的显示文本（字符串加引号，其余原样） */
+function formatScalar(value: ScalarValue): string {
+  return value.kind === 'str' ? `"${value.text}"` : value.text;
+}
+
 // ------------------------------ 事件 / 消息
 
 function eventLane(
@@ -1095,13 +1201,13 @@ function eventLane(
     color: colorFor(key),
     height: H.evt,
     hover: { kind: 'cycle', domain, cycle: samples.length > 0 ? samples[0]!.pos.cycle : 1 },
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
       cycleSurface(hit, reg, domain, ctx, (probe) =>
         [
           `事件 ${name}（域 ${domain}）`,
-          cycleTime(ctx.trace.domains.get(domain), probe.cycle, true),
+          cycleLabel(probe.cycle),
           `本周期触发 ${samples.filter((s) => s.pos.cycle === probe.cycle).length} 次 · 共 ${samples.length} 次`,
         ].join('\n'),
       );
@@ -1146,14 +1252,14 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
     note: `${messages.length} 条`,
     color: COLOR.msg,
     height: H.evt,
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
       cycleSurface(hit, reg, messages[0]!.pos.domain, ctx, (probe) => {
         const here = messages.filter((m) => m.pos.cycle === probe.cycle);
         return [
           `消息（${messages.length} 条）`,
-          cycleTime(ctx.trace.domains.get(messages[0]!.pos.domain), probe.cycle, true),
+          cycleLabel(probe.cycle),
           here.length > 0 ? here.map((m) => `· ${m.text}`).join('\n') : '本周期没有消息',
         ].join('\n');
       });
@@ -1197,14 +1303,14 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
     note: `${records.length} 条`,
     color: COLOR.async,
     height: H.evt,
-    draw(g, reg, y, h, stripe) {
-      const hit = laneCanvas(g, reg, y, h, stripe);
+    draw(g, reg, y, h) {
+      const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
       cycleSurface(hit, reg, records[0]!.pos.domain, ctx, (probe) => {
         const here = records.filter((r) => r.pos.cycle === probe.cycle);
         return [
           `异步记录（${records.length} 条）`,
-          cycleTime(ctx.trace.domains.get(records[0]!.pos.domain), probe.cycle, true),
+          cycleLabel(probe.cycle),
           here.length > 0 ? here.map((r) => `· ${KIND_LABEL[r.kind] ?? r.kind} ${recordName(r)}`).join('\n') : '本周期没有异步记录',
           '画在周期区间中点（两个时钟沿之间），空心标记 + 虚线连回区间',
         ].join('\n');
@@ -1299,7 +1405,7 @@ function placeCycleMark(line: SVGLineElement, label: SVGTextElement | null, sel:
   if (label) {
     label.setAttribute('x', String(clamp(x, plot.x0 + 46, plot.x1 - 46)));
     label.setAttribute('display', '');
-    label.textContent = cycleTime(ctx.trace.domains.get(sel.domain), sel.cycle, ctx.options.useTimeAxis);
+    label.textContent = `${sel.domain} · ${cycleLabel(sel.cycle)}`;
   }
 }
 
@@ -1372,6 +1478,33 @@ function rebuild(keepScroll: boolean, center: number | null): void {
   if (keepScroll) scrollEl!.scrollLeft = left;
   restoreCenter(center);
   applyState();
+}
+
+/**
+ * Ctrl/⌘ + 滚轮：以指针所在周期为锚点缩放；普通滚轮保持浏览器原生滚动，
+ * 免得横向拖动轨迹时被缩放打断。
+ */
+function installWheelZoom(scroll: HTMLElement): void {
+  scroll.addEventListener(
+    'wheel',
+    (event) => {
+      const wheel = event as WheelEvent;
+      if (!wheel.ctrlKey && !wheel.metaKey) return;
+      wheel.preventDefault();
+      const reg = registry;
+      const plot = reg?.plot;
+      if (!reg || !plot) return;
+      const box = reg.svg.getBoundingClientRect();
+      const userX = box.width > 0 ? (wheel.clientX - box.left) * (plot.width / box.width) : plot.x0;
+      const anchor = clamp(Math.round(plot.scale.invert(clamp(userX, plot.x0, plot.x1))), plot.from, plot.to);
+      const next = clamp(plot.pxPerCycle * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2), PX_MIN, PX_MAX);
+      if (Math.abs(next - plot.pxPerCycle) < 1e-6) return;
+      fitWidth = false;
+      ctxRef!.options.zoom = Number(next.toFixed(4));
+      rebuild(false, anchor);
+    },
+    { passive: false },
+  );
 }
 
 function rebuildAnchored(center: number | null): void {

@@ -232,22 +232,9 @@ function buildToolbar(): HTMLElement {
   }
   bar.append(domainChips, el('div', { class: 'toolbar-spacer' }));
 
-  const anyPeriod = [...trace.domains.values()].some((d) => d.periodNs !== undefined);
-  if (anyPeriod) {
-    const toggle = el('label', { class: 'toggle' }, [
-      el('input', { type: 'checkbox', ...(state.options.useTimeAxis ? { checked: 'checked' } : {}) }),
-      el('span', { text: '时间轴' }),
-    ]);
-    toggle.querySelector('input')!.addEventListener('change', (event) => {
-      state.options.useTimeAxis = (event.target as HTMLInputElement).checked;
-      refreshViews('options');
-    });
-    bar.append(toggle);
-  }
-
   // 多域时周期号各自独立计数：这里必须说清楚，否则读者会以为 default#6 与 mem#6 是同一时刻
   const shown = [...trace.domains.keys()].filter((d) => state.options.domains.length === 0 || state.options.domains.includes(d));
-  if (shown.length > 1 && !state.options.useTimeAxis) {
+  if (shown.length > 1) {
     bar.append(el('span', { class: 'muted nowrap', text: '各域周期号独立计数（≠ 同一时刻）' }));
   }
 
