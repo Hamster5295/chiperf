@@ -159,24 +159,27 @@ export class ChiperfParser {
   private processLine(rawLine: string): void {
     this.lineNo++;
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    // 注释对**所有**行生效（spec §4.1）：版本行与 @ 指令也先剥注释再看内容。
+    // `msg` 除外 —— 它的载荷要连注释一起收下（spec §7.7），所以那条路径自己处理。
     const body = line.trim();
+    const bare = stripComment(body).trim();
     if (this.lineNo === 1) {
-      const m = /^chiperf[ \t]+(\d+)\.(\d+)$/.exec(body);
+      const m = /^chiperf[ \t]+(\d+)\.(\d+)$/.exec(bare);
       if (m) {
-        this.version = { major: Number(m[1]), minor: Number(m[2]), explicit: true, raw: body };
+        this.version = { major: Number(m[1]), minor: Number(m[2]), explicit: true, raw: bare };
         if (this.version.major !== 2 && !this.ignoreVersion) {
           throw new UnsupportedVersionError(this.version.major, this.version.minor);
         }
         return;
       }
     }
-    if (body.length === 0 || body.startsWith('#')) return;
+    if (bare.length === 0) return;
     // spec §8.3：@end 之后的记录仍要被解析，但要产生诊断（注释不算）
     if (this.endSeen) {
       this.diag('records_after_end', this.lineNo, '@end 之后仍然出现了记录');
     }
-    if (body.startsWith('@')) {
-      this.processDirective(body);
+    if (bare.startsWith('@')) {
+      this.processDirective(bare);
       return;
     }
     if (body.startsWith('[')) {

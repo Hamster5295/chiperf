@@ -164,6 +164,23 @@ describe('§3.2 编码与行终止', () => {
     expect(trace.diagnostics.length).toBe(0);
   });
 
+  // 注释对**所有**行生效（spec §4.1）：版本行与 @ 指令也不例外
+  // （曾经只对事件记录生效，结果 `@domain core, period=1.0ns  # 主时钟` 整行被跳过、域声明静默丢失）
+  test('版本行与 @ 指令上的行尾注释不被当成内容', () => {
+    const trace = parseChiperf('chiperf 2.0   # 版本行\n@meta design="x" # 元数据\n@domain core, period=1.0ns # 主时钟\n[clk] p, dom=core\n@end # 完\n');
+    expect(trace.version).toMatchObject({ major: 2, minor: 0, explicit: true, raw: 'chiperf 2.0' });
+    expect(trace.meta).toEqual({ design: 'x' });
+    expect(trace.domains.get('core')!.periodNs).toBe(1);
+    expect(trace.skipped).toEqual([]);
+    expect(trace.diagnosticCounts.get('eof_without_end_marker') ?? 0).toBe(0);
+  });
+
+  test('但字符串里的 # 不是注释（版本行/指令/记录一致）', () => {
+    const trace = parseChiperf('@meta note="a # b"\n[val] "x", "c # d"\n@end\n');
+    expect(trace.meta).toEqual({ note: 'a # b' });
+    expect(trace.values.get('default\u0000x')!.samples[0]!.value.text).toBe('c # d');
+  });
+
   test('UTF-8 名字与中文注释', () => {
     const trace = parseChiperf('[clk] p\n[cnt] "分支预测失败"   # 中文注释\n@end\n');
     expect(trace.counters.get('default\u0000分支预测失败')!.total).toBe(1);
