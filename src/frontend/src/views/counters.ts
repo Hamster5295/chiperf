@@ -9,7 +9,6 @@
 import type { CounterTrack, DomainInfo } from '../../../parser/src/index.ts';
 import { counterDeltaBetween, counterTotalAt, ratioBetween } from '../../../parser/src/index.ts';
 import {
-  axisTicks,
   barRect,
   card,
   clear,
@@ -27,7 +26,7 @@ import {
   svgEl,
   svgRoot,
 } from '../charts.ts';
-import { cycleTime, fmtInt, fmtNs, type Selection, type View, type ViewContext } from '../view.ts';
+import { cycleTime, fmtInt, type Selection, type View, type ViewContext } from '../view.ts';
 
 /** 一条采样在图上画出来的样子 */
 interface Point {
@@ -62,47 +61,22 @@ interface XAxis {
   px(cycle: number): number;
   /** 一个周期占多少像素 */
   unit(cycle: number): number;
-  time: boolean;
   /** 悬停用的位置标签（周期 + 时间） */
   label(cycle: number): string;
 }
 
-/** 周期轴 / 时间轴（域声明了 period 时可用 `cycleTime` 换算） */
+/**
+ * 横轴一律是**周期数**，不是时刻：每个计数器卡片跟的是它自己时钟域的周期，
+ * 多域并排时标 ns 会被误读成同一条时间轴。时刻仍在悬停标签里给（`cycleTime`）。
+ */
 function drawXAxis(svg: SVGSVGElement, g: XGeom): XAxis {
-  const period = g.domain?.periodNs;
-  if (g.useTime && period !== undefined) {
-    // spec §8.2：第 1 个上升沿位于 0 ns；周期 ≤ 0（时钟之前）没有时间基准，
-    // 这里把它压在 0 并把该刻度标成"时钟前"，避免出现负时间
-    const ns = (cycle: number) => Math.max(0, cycle - 1) * period;
-    const scale = linearScale(ns(g.from), ns(g.to + 1), g.x, g.x + g.width);
-    for (const tick of axisTicks(ns(g.from), ns(g.to + 1), Math.max(2, Math.floor(g.width / 96)))) {
-      const px = scale(tick);
-      svg.append(
-        svgEl('line', { x1: px, x2: px, y1: g.y, y2: g.y + g.height, class: 'grid-line' }),
-        svgEl('text', { x: px, y: g.y + g.height + 14, class: 'axis-label', 'text-anchor': 'middle', text: fmtNs(tick) }),
-      );
-    }
-    svg.append(
-      svgEl('text', {
-        x: g.x + g.width,
-        y: g.y + g.height + 14,
-        class: 'axis-label axis-title',
-        'text-anchor': 'end',
-        text: '时间轴（ns，由 @domain period 换算）',
-      }),
-    );
-    return {
-      px: (cycle) => scale(ns(cycle)),
-      unit: (cycle) => scale(ns(cycle + 1)) - scale(ns(cycle)),
-      time: true,
-      label: (cycle) => cycleTime(g.domain, cycle, true),
-    };
-  }
   const scale = cycleAxis(svg, { x: g.x, y: g.y, width: g.width, height: g.height, from: g.from, to: g.to });
+  svg.append(
+    svgEl('text', { x: g.x + g.width, y: g.y + g.height + 14, class: 'axis-label axis-title', 'text-anchor': 'end', text: '周期' }),
+  );
   return {
     px: (cycle) => scale(cycle),
     unit: (cycle) => scale(cycle + 1) - scale(cycle),
-    time: false,
     label: (cycle) => cycleTime(g.domain, cycle, g.useTime),
   };
 }

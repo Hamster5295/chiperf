@@ -10,7 +10,6 @@
 import type { DomainInfo, ScalarValue, Timed, Trace, ValueTrack } from '../../../parser/src/index.ts';
 import { comparePosition } from '../../../parser/src/index.ts';
 import {
-  axisTicks,
   card,
   clear,
   colorFor,
@@ -27,7 +26,7 @@ import {
   svgEl,
   svgRoot,
 } from '../charts.ts';
-import { cycleTime, fmtInt, fmtNs, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
+import { cycleTime, fmtInt, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
 
 /** 保持型信号的一个采样点 */
 interface Item {
@@ -95,7 +94,6 @@ interface XGeom {
   from: number;
   to: number;
   domain: DomainInfo | undefined;
-  useTime: boolean;
 }
 
 interface XAxis {
@@ -103,32 +101,15 @@ interface XAxis {
   unit(cycle: number): number;
 }
 
-/** 周期轴 / 时间轴：`useTimeAxis` 且域声明了 period 时按 ns 画（spec §8.2） */
+/**
+ * 横轴一律是**周期数**，不是时刻：每条数值轨跟的是它自己时钟域的周期，
+ * 多域并排时标 ns 会被误读成同一条时间轴。时刻仍在悬停标签里给（`sampleLines`）。
+ */
 function drawXAxis(svg: SVGSVGElement, g: XGeom): XAxis {
-  const period = g.domain?.periodNs;
-  if (g.useTime && period !== undefined) {
-    // spec §8.2：第 1 个上升沿位于 0 ns；周期 ≤ 0（时钟之前）没有时间基准
-    const ns = (cycle: number) => Math.max(0, cycle - 1) * period;
-    const scale = linearScale(ns(g.from), ns(g.to + 1), g.x, g.x + g.width);
-    for (const tick of axisTicks(ns(g.from), ns(g.to + 1), Math.max(2, Math.floor(g.width / 96)))) {
-      const px = scale(tick);
-      svg.append(
-        svgEl('line', { x1: px, x2: px, y1: g.y, y2: g.y + g.height, class: 'grid-line' }),
-        svgEl('text', { x: px, y: g.y + g.height + 14, class: 'axis-label', 'text-anchor': 'middle', text: fmtNs(tick) }),
-      );
-    }
-    svg.append(
-      svgEl('text', {
-        x: g.x + g.width,
-        y: g.y + g.height + 14,
-        class: 'axis-label axis-title',
-        'text-anchor': 'end',
-        text: '时间轴（ns，由 @domain period 换算）',
-      }),
-    );
-    return { px: (cycle) => scale(ns(cycle)), unit: (cycle) => scale(ns(cycle + 1)) - scale(ns(cycle)) };
-  }
   const scale = cycleAxis(svg, { x: g.x, y: g.y, width: g.width, height: g.height, from: g.from, to: g.to });
+  svg.append(
+    svgEl('text', { x: g.x + g.width, y: g.y + g.height + 14, class: 'axis-label axis-title', 'text-anchor': 'end', text: '周期' }),
+  );
   return { px: (cycle) => scale(cycle), unit: (cycle) => scale(cycle + 1) - scale(cycle) };
 }
 
@@ -276,7 +257,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
   const width = chartWidth(last - first + 1, available);
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
-  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: ctx.trace.domains.get(track.domain), useTime });
+  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: ctx.trace.domains.get(track.domain) });
 
   let min = Infinity;
   let max = -Infinity;
@@ -452,7 +433,7 @@ function eventBar(track: ValueTrack, items: Item[], color: string, useTime: bool
   const width = chartWidth(last - first + 1, available);
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
-  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: ctx.trace.domains.get(track.domain), useTime });
+  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: ctx.trace.domains.get(track.domain) });
   const base = plot.y + plot.height / 2;
   const at = (item: Item) => x.px(item.cycle) + (item.async ? 0.5 * x.unit(item.cycle) : 0);
 
