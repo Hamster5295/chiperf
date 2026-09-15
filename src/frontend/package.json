@@ -1,0 +1,16 @@
+{
+  "name": "@chiperf/frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "chiperf 可视化：独立 HTML 页面 + HTTP 服务器",
+  "scripts": {
+    "build": "bun build.ts",
+    "start": "bun ../../dist/app.js",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

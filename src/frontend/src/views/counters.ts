@@ -1,0 +1,682 @@
+/**
+ * 计数器视图 —— 累计曲线、每周期增量、终值占比与区间差工具（spec §9.2）
+ *
+ * 数据来源：`Trace.counters`（追踪键 = (域, 名字)）。三条必须守住的口径：
+ *  - `abs=` 回读记录只置总量、不贡献增量（`samples[].delta === null`，spec §9.2）
+ *  - 累计值取"该周期末"的取值（`counterTotalAt` 的判据是 position ≤ (cycle, n)）
+ *  - `async=1` 的记录不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.7）
+ */
+import type { CounterTrack, DomainInfo } from '../../../parser/src/index.ts';
+import { counterDeltaBetween, counterTotalAt, ratioBetween } from '../../../parser/src/index.ts';
+import {
+  axisTicks,
+  barRect,
+  card,
+  clear,
+  colorFor,
+  countLabel,
+  cycleAxis,
+  dataTable,
+  el,
+  emptyState,
+  hoverTarget,
+  legend,
+  linearScale,
+  numericAxis,
+  statTile,
+  svgEl,
+  svgRoot,
+} from '../charts.ts';
+import { cycleTime, fmtInt, fmtNs, type Selection, type View, type ViewContext } from '../view.ts';
+
+/** 一条采样在图上画出来的样子 */
+interface Point {
+  cycle: number;
+  total: number;
+  async: boolean;
+  /** `abs=` 绝对值回读 */
+  abs: boolean;
+  line: number;
+}
+
+/** 单张图最多画这么多点（超出按步长抽稀，`abs=`/异步点始终保留） */
+const MAX_POINTS = 2500;
+/** 每周期增量柱状图超过这个柱数就按周期分桶求和 */
+const MAX_BARS = 1200;
+
+// ------------------------------------------------------------------ 横轴
+
+interface XGeom {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  from: number;
+  to: number;
+  domain: DomainInfo | undefined;
+  useTime: boolean;
+}
+
+interface XAxis {
+  /** 周期 → 像素（同步采样落在时钟沿刻度上） */
+  px(cycle: number): number;
+  /** 一个周期占多少像素 */
+  unit(cycle: number): number;
+  time: boolean;
+  /** 悬停用的位置标签（周期 + 时间） */
+  label(cycle: number): string;
+}
+
+/** 周期轴 / 时间轴（域声明了 period 时可用 `cycleTime` 换算） */
+function drawXAxis(svg: SVGSVGElement, g: XGeom): XAxis {
+  const period = g.domain?.periodNs;
+  if (g.useTime && period !== undefined) {
+    // spec §8.2：第 1 个上升沿位于 0 ns；周期 ≤ 0（时钟之前）没有时间基准，
+    // 这里把它压在 0 并把该刻度标成"时钟前"，避免出现负时间
+    const ns = (cycle: number) => Math.max(0, cycle - 1) * period;
+    const scale = linearScale(ns(g.from), ns(g.to + 1), g.x, g.x + g.width);
+    for (const tick of axisTicks(ns(g.from), ns(g.to + 1), Math.max(2, Math.floor(g.width / 96)))) {
+      const px = scale(tick);
+      svg.append(
+        svgEl('line', { x1: px, x2: px, y1: g.y, y2: g.y + g.height, class: 'grid-line' }),
+        svgEl('text', { x: px, y: g.y + g.height + 14, class: 'axis-label', 'text-anchor': 'middle', text: fmtNs(tick) }),
+      );
+    }
+    svg.append(
+      svgEl('text', {
+        x: g.x + g.width,
+        y: g.y + g.height + 14,
+        class: 'axis-label axis-title',
+        'text-anchor': 'end',
+        text: '时间轴（ns，由 @domain period 换算）',
+      }),
+    );
+    return {
+      px: (cycle) => scale(ns(cycle)),
+      unit: (cycle) => scale(ns(cycle + 1)) - scale(ns(cycle)),
+      time: true,
+      label: (cycle) => cycleTime(g.domain, cycle, true),
+    };
+  }
+  const scale = cycleAxis(svg, { x: g.x, y: g.y, width: g.width, height: g.height, from: g.from, to: g.to });
+  return {
+    px: (cycle) => scale(cycle),
+    unit: (cycle) => scale(cycle + 1) - scale(cycle),
+    time: false,
+    label: (cycle) => cycleTime(g.domain, cycle, g.useTime),
+  };
+}
+
+/** 图宽：至少占满卡片列宽，周期跨度大时再放宽（由 .chart-scroll 横向滚动） */
+function chartWidth(span: number, available: number): number {
+  return Math.max(available, Math.min(3000, span * 12 + 100));
+}
+
+/** 卡片列宽：先放同样数量的占位卡片让 auto-fit 定下真实列数，再量列宽（图表至少占满一列） */
+function columnWidth(grid: HTMLElement, count: number): number {
+  const probes = Array.from({ length: Math.max(1, count) }, () => el('div', { class: 'card', style: 'visibility:hidden;height:0;border:0' }));
+  for (const probe of probes) grid.append(probe);
+  const width = probes[0]!.clientWidth - 32;
+  for (const probe of probes) probe.remove();
+  return Math.max(300, width);
+}
+
+/** 采样点按位置排序（`at=` 允许乱序，spec §6.3） */
+function orderedPoints(track: CounterTrack): Point[] {
+  const points: Point[] = track.samples.map((s) => ({
+    cycle: s.pos.cycle,
+    total: s.total,
+    async: s.async,
+    abs: s.delta === null,
+    line: s.line,
+  }));
+  points.sort((a, b) => a.cycle - b.cycle || a.line - b.line);
+  return points;
+}
+
+/** 抽稀：保留首尾与所有特殊点 */
+function decimate(points: Point[]): Point[] {
+  if (points.length <= MAX_POINTS) return points;
+  const stride = Math.ceil(points.length / MAX_POINTS);
+  const out: Point[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]!;
+    if (i % stride === 0 || p.abs || p.async || i === points.length - 1) out.push(p);
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ 图元
+
+/** 悬停 + 广播 hover 高亮（`hoverTarget` 只做提示，选中态走 selectionBus） */
+function bindHover<T extends Element>(node: T, ctx: ViewContext, sel: Selection, render: () => string): T {
+  hoverTarget(node, render);
+  node.addEventListener('mouseenter', () => ctx.selection.hover(sel));
+  node.addEventListener('mouseleave', () => ctx.selection.hover(null));
+  return node;
+}
+
+function clickable<T extends HTMLElement | SVGElement>(node: T, onClick: () => void): T {
+  node.style.cursor = 'pointer';
+  node.addEventListener('click', onClick);
+  return node;
+}
+
+// ------------------------------------------------------------------ 小卡
+
+function statsRow(tracks: CounterTrack[], shown: CounterTrack[]): HTMLElement {
+  let samples = 0;
+  let absCount = 0;
+  let asyncCount = 0;
+  let deltaSum = 0;
+  for (const track of tracks) {
+    for (const sample of track.samples) {
+      samples++;
+      if (sample.delta === null) absCount++;
+      else deltaSum += sample.delta;
+      if (sample.async) asyncCount++;
+    }
+  }
+  return el('div', { class: 'stat-row' }, [
+    statTile('计数器', countLabel(tracks.length), shown.length === tracks.length ? '每个 (域, 名字) 一条' : `当前筛选显示 ${shown.length} 个`),
+    statTile('cnt 记录', countLabel(samples), '每条 cnt 记录一次采样'),
+    statTile('abs= 回读', countLabel(absCount), '只置总量，不贡献增量（spec §9.2）'),
+    statTile('Δ 合计', countLabel(deltaSum), '所有 delta 之和（不含 abs= 回读）'),
+    statTile('异步记录', countLabel(asyncCount), '不在时钟沿上（spec §6.7）'),
+  ]);
+}
+
+// ------------------------------------------------------------------ 累计曲线
+
+function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTime: boolean, ctx: ViewContext, available: number): HTMLElement {
+  const points = orderedPoints(track);
+  const color = colorFor(track.key);
+  const absCount = points.filter((p) => p.abs).length;
+  const node = card(track.name, `${track.domain} · ${fmtInt(track.samples.length)} 条采样 · 终值 ${countLabel(track.total)}`, [
+    (() => {
+      const btn = el('button', { class: 'btn btn-ghost', text: '详情' });
+      btn.addEventListener('click', () => inspectCounter(track, ctx));
+      return btn;
+    })(),
+  ]);
+
+  if (points.length === 0) {
+    node.body.append(emptyState('该计数器没有采样'));
+    return node.root;
+  }
+
+  const first = points[0]!.cycle;
+  const last = points[points.length - 1]!.cycle;
+  const height = 150;
+  const pad = { left: 54, right: 16, top: 12, bottom: 20 };
+  const width = chartWidth(last - first + 1, available);
+  const svg = svgRoot(width, height);
+  const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
+
+  let min = Infinity;
+  let max = -Infinity;
+  for (const p of points) {
+    min = Math.min(min, p.total);
+    max = Math.max(max, p.total);
+  }
+  if (min === max) {
+    const slack = Math.max(1, Math.abs(max) * 0.1);
+    min -= slack;
+    max += slack;
+  }
+  numericAxis(svg, { ...plot, min, max, label: '累计值' });
+  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: dom, useTime });
+  const ys = linearScale(min, max, plot.y + plot.height, plot.y);
+  /** 同步采样贴沿刻度；异步采样落到周期区间内部（spec §6.7） */
+  const at = (p: Point) => (p.async ? x.px(p.cycle) + 0.5 * x.unit(p.cycle) : x.px(p.cycle));
+
+  const hit = svgEl('rect', {
+    x: plot.x,
+    y: plot.y,
+    width: plot.width,
+    height: plot.height,
+    fill: 'transparent',
+    'pointer-events': 'all',
+  });
+  clickable(hit, () => ctx.selection.set({ kind: 'counter', key: track.key }));
+  svg.append(hit);
+
+  const drawn = decimate(points);
+  svg.append(
+    svgEl('path', {
+      d: drawn.map((p) => `${at(p)},${ys(p.total)}`).map((s, i) => `${i === 0 ? 'M' : 'L'}${s}`).join(''),
+      fill: 'none',
+      stroke: color,
+      'stroke-width': 1.6,
+      'stroke-linejoin': 'round',
+    }),
+  );
+
+  const marked: SVGElement[] = [];
+  for (const p of points) {
+    if (!p.abs && !p.async && p !== points[0] && p !== points[points.length - 1]) continue;
+    const marker = svgEl('circle', {
+      cx: at(p),
+      cy: ys(p.total),
+      r: 3.6,
+      fill: 'var(--surface)',
+      stroke: p.abs ? 'var(--warn)' : color,
+      'stroke-width': 1.8,
+      ...(p.async ? { 'stroke-dasharray': '2 1.6' } : {}),
+    });
+    const text = () =>
+      [
+        x.label(p.cycle),
+        `累计 ${fmtInt(p.total)}`,
+        p.abs ? `绝对值回读 abs（spec §9.2，不贡献增量）` : '增量采样',
+        p.async ? '异步记录：不在时钟沿上，画在周期区间内部（spec §6.7）' : '时钟沿采样',
+        `源文件第 ${p.line} 行`,
+      ].join('\n');
+    bindHover(marker, ctx, { kind: 'counter', key: track.key }, text);
+    clickable(marker, () => {
+      ctx.selection.set({ kind: 'counter', key: track.key });
+      ctx.inspect(`计数器采样 · ${track.name}`, [
+        ['位置', x.label(p.cycle)],
+        ['周期', String(p.cycle)],
+        ['该点累计值', fmtInt(p.total)],
+        ['记录类型', p.abs ? 'abs= 绝对值回读' : p.async ? '异步增量' : '普通增量'],
+        ['源文件行', String(p.line)],
+      ]);
+    });
+    marked.push(marker);
+  }
+  svg.append(...marked);
+  node.body.append(el('div', { class: 'chart-scroll' }, [svg]));
+
+  const dotted = el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
+    el('span', { text: `${fmtInt(points.length)} 条采样（图上抽稀到 ${fmtInt(drawn.length)} 点）` }),
+    absCount > 0 ? el('span', { text: `○ 空心黄点 = abs= 回读（${fmtInt(absCount)} 次）` }) : null,
+    el('span', { text: '虚线空心点 = 异步记录（不在时钟沿上）' }),
+    el('span', { text: '点击图形或标记可广播选中' }),
+  ]);
+  node.body.append(dotted);
+  return node.root;
+}
+
+function inspectCounter(track: CounterTrack, ctx: ViewContext): void {
+  const absCount = track.samples.filter((s) => s.delta === null).length;
+  const asyncCount = track.samples.filter((s) => s.async).length;
+  const first = track.samples[0];
+  const last = track.samples[track.samples.length - 1];
+  const body = dataTable(
+    ['周期', 'Δ', '累计', '来源', '行'],
+    track.samples.slice(-60).map((s) => [
+      String(s.pos.cycle),
+      s.delta === null ? `abs=${fmtInt(s.abs ?? 0)}` : fmtInt(s.delta),
+      fmtInt(s.total),
+      s.async ? '异步' : '沿上',
+      String(s.line),
+    ]),
+  );
+  ctx.inspect(
+    `计数器 · ${track.name}`,
+    [
+      ['域', track.domain],
+      ['追踪键', track.key.replace('\u0000', ' / ')],
+      ['终值', fmtInt(track.total)],
+      ['采样条数', fmtInt(track.samples.length)],
+      ['abs= 回读', fmtInt(absCount)],
+      ['异步采样', fmtInt(asyncCount)],
+      ['总量变化周期', fmtInt(track.changeCycles.length)],
+      ['周期范围', first && last ? `${first.pos.cycle} – ${last.pos.cycle}` : '—'],
+      ['总量', `Σdelta = ${fmtInt([...track.deltaByCycle.values()].reduce((a, b) => a + b, 0))}`],
+    ],
+    body,
+  );
+}
+
+// ------------------------------------------------------------------ 每周期增量
+
+function deltaCard(tracks: CounterTrack[], ctx: ViewContext, useTime: boolean, available: number): HTMLElement {
+  const node = card('每周期增量', '柱高 = Σdelta（`abs=` 回读不贡献增量，spec §9.2）');
+  const shown = tracks.filter((t) => t.deltaByCycle.size > 0);
+  if (shown.length === 0) {
+    node.body.append(emptyState('没有增量记录（所有采样都是 abs= 回读）'));
+    return node.root;
+  }
+  const groups = el('div', { class: 'col' });
+  for (const track of shown) groups.append(deltaChart(track, ctx, useTime, available));
+  node.body.append(groups);
+  return node.root;
+}
+
+function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, available: number): HTMLElement {
+  const color = colorFor(track.key);
+  const dom = ctx.trace.domains.get(track.domain);
+  const cycles = [...track.deltaByCycle.keys()].sort((a, b) => a - b);
+  const first = cycles[0]!;
+  const last = cycles[cycles.length - 1]!;
+  const span = last - first + 1;
+  // 周期太多时按桶求和（桶内仍是**精确**的 Σdelta，只是画成一根柱）
+  const bucket = cycles.length > MAX_BARS ? Math.ceil(span / MAX_BARS) : 1;
+  const bars = new Map<number, { sum: number; from: number; to: number; count: number }>();
+  for (const cycle of cycles) {
+    const key = bucket === 1 ? cycle : first + Math.floor((cycle - first) / bucket) * bucket;
+    const slot = bars.get(key) ?? { sum: 0, from: cycle, to: cycle, count: 0 };
+    slot.sum += track.deltaByCycle.get(cycle)!;
+    slot.from = Math.min(slot.from, cycle);
+    slot.to = Math.max(slot.to, cycle);
+    slot.count++;
+    bars.set(key, slot);
+  }
+
+  const height = 118;
+  const pad = { left: 54, right: 16, top: 10, bottom: 20 };
+  const width = chartWidth(span, available);
+  const svg = svgRoot(width, height);
+  const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
+
+  let min = 0;
+  let max = 0;
+  for (const slot of bars.values()) {
+    min = Math.min(min, slot.sum);
+    max = Math.max(max, slot.sum);
+  }
+  if (min === 0 && max === 0) max = 1;
+  numericAxis(svg, { ...plot, min, max, label: 'Δ/周期' });
+  const x = drawXAxis(svg, { ...plot, from: first, to: last, domain: dom, useTime });
+  const ys = linearScale(min, max, plot.y + plot.height, plot.y);
+  const zero = ys(0);
+
+  const hit = svgEl('rect', { x: plot.x, y: plot.y, width: plot.width, height: plot.height, fill: 'transparent', 'pointer-events': 'all' });
+  clickable(hit, () => ctx.selection.set({ kind: 'counter', key: track.key }));
+  svg.append(hit);
+
+  for (const [key, slot] of [...bars].sort((a, b) => a[0] - b[0])) {
+    const x0 = x.px(slot.from);
+    const w = Math.max(1, x.unit(slot.from) - 1);
+    const y = slot.sum >= 0 ? ys(slot.sum) : zero;
+    const rect = svgEl('rect', {
+      ...barRect(x0, y, w, Math.max(1, Math.abs(zero - ys(slot.sum)))),
+      fill: color,
+      opacity: 0.8,
+      rx: 1.5,
+    });
+    const totalAt = counterTotalAt(track, slot.to);
+    bindHover(rect, ctx, { kind: 'counter', key: track.key }, () =>
+      [
+        slot.from === slot.to ? x.label(slot.from) : `${x.label(slot.from)} – 周期 ${slot.to}`,
+        `Δ = ${fmtInt(slot.sum)}（${fmtInt(slot.count)} 个周期）`,
+        `周期末累计 = ${totalAt === null ? '—' : fmtInt(totalAt)}`,
+        'abs= 回读不贡献增量（spec §9.2）',
+      ].join('\n'),
+    );
+    svg.append(rect);
+  }
+
+  const deltaSum = [...track.deltaByCycle.values()].reduce((a, b) => a + b, 0);
+  return el('div', {}, [
+    el('div', { class: 'row' }, [
+      el('span', { class: 'mono', text: track.name }),
+      el('span', { class: 'badge', text: track.domain }),
+      el('span', { class: 'badge', text: `Δ合计 ${countLabel(deltaSum)}` }),
+      el('span', { class: 'badge', text: `${fmtInt(cycles.length)} 个周期有增量` }),
+    ]),
+    el('div', { class: 'chart-scroll' }, [svg]),
+  ]);
+}
+
+// ------------------------------------------------------------------ 终值占比
+
+function pie(items: { key: string; label: string; value: number; color: string }[], size: number, onPick: (key: string) => void): SVGSVGElement {
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  const svg = svgRoot(size, size);
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = size / 2 - 8;
+  if (items.length === 1 || total <= 0) {
+    const only = items[0];
+    const circle = svgEl('circle', { cx, cy, r, fill: only ? only.color : 'var(--border)' });
+    if (only) {
+      hoverTarget(circle, () => `${only.label}\n${fmtInt(only.value)}（100.0%）`);
+      clickable(circle, () => onPick(only.key));
+    }
+    svg.append(circle);
+    return svg;
+  }
+  let angle = -Math.PI / 2;
+  for (const item of items) {
+    const sweep = (item.value / total) * Math.PI * 2;
+    const x0 = cx + r * Math.cos(angle);
+    const y0 = cy + r * Math.sin(angle);
+    const x1 = cx + r * Math.cos(angle + sweep);
+    const y1 = cy + r * Math.sin(angle + sweep);
+    const path = svgEl('path', {
+      d: `M${cx},${cy}L${x0.toFixed(2)},${y0.toFixed(2)}A${r},${r} 0 ${sweep > Math.PI ? 1 : 0} 1 ${x1.toFixed(2)},${y1.toFixed(2)}Z`,
+      fill: item.color,
+      stroke: 'var(--surface)',
+      'stroke-width': 1,
+    });
+    hoverTarget(path, () => `${item.label}\n终值 ${fmtInt(item.value)}\n占比 ${((item.value / total) * 100).toFixed(1)}%\n点击查看详情`);
+    clickable(path, () => onPick(item.key));
+    svg.append(path);
+    angle += sweep;
+  }
+  return svg;
+}
+
+function shareCard(tracks: CounterTrack[], ctx: ViewContext): HTMLElement {
+  const node = card('终值占比', '按域分组，饼块 = 计数器终值（只统计终值为正的计数器）');
+  const groups = new Map<string, CounterTrack[]>();
+  for (const track of tracks) {
+    const list = groups.get(track.domain);
+    if (list) list.push(track);
+    else groups.set(track.domain, [track]);
+  }
+  if (groups.size === 0) {
+    node.body.append(emptyState('没有可统计的计数器'));
+    return node.root;
+  }
+  const grid = el('div', { class: 'grid grid-3' });
+  for (const [domain, list] of groups) {
+    const items = list
+      .filter((t) => t.total > 0)
+      .sort((a, b) => b.total - a.total)
+      .map((t) => ({ key: t.key, label: t.name, value: t.total, color: colorFor(t.key) }));
+    const total = items.reduce((sum, item) => sum + item.value, 0);
+    const block = el('div', {}, [
+      el('div', { class: 'row' }, [
+        el('span', { class: 'badge', text: domain }),
+        el('span', { class: 'muted', text: `合计 ${countLabel(total)}` }),
+      ]),
+      items.length > 0 ? pie(items, 168, (key) => ctx.selection.set({ kind: 'counter', key })) : emptyState('该域没有正终值的计数器'),
+      items.length > 0
+        ? legend(items.map((item) => ({ label: item.label, color: item.color, value: `${((item.value / total) * 100).toFixed(1)}%` })))
+        : null,
+    ]);
+    grid.append(block);
+  }
+  node.body.append(grid);
+  return node.root;
+}
+
+// ------------------------------------------------------------------ 区间差（delta_between）
+
+function intervalCard(tracks: CounterTrack[], ctx: ViewContext, range: { from: number; to: number }): HTMLElement {
+  const node = card(
+    '区间差 / 比率',
+    'delta_between(c1, c2) 与 ratio_between：区间两端都取"该周期末"的累计值（spec §9.2）；默认区间 = 各计数器都有采样的范围',
+  );
+  const fromInput = el('input', {
+    type: 'number',
+    value: String(range.from),
+    style: 'width:90px;padding:4px 6px;border:1px solid var(--border-strong);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;font-size:12px',
+  });
+  const toInput = el('input', {
+    type: 'number',
+    value: String(range.to),
+    style: 'width:90px;padding:4px 6px;border:1px solid var(--border-strong);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;font-size:12px',
+  });
+  const selectStyle = 'padding:4px 6px;border:1px solid var(--border-strong);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;font-size:12px';
+  const numSel = el('select', { style: selectStyle });
+  const denSel = el('select', { style: selectStyle });
+  for (const track of tracks) {
+    numSel.append(el('option', { value: track.key, text: track.name }));
+    denSel.append(el('option', { value: track.key, text: track.name }));
+  }
+  numSel.value = tracks[0]?.key ?? '';
+  denSel.value = tracks[1]?.key ?? tracks[0]?.key ?? '';
+
+  const host = el('div', {});
+  const render = () => {
+    clear(host);
+    const rawFrom = fromInput.value.trim();
+    const rawTo = toInput.value.trim();
+    const parsedFrom = Number(rawFrom);
+    const parsedTo = Number(rawTo);
+    if (rawFrom === '' || rawTo === '' || !Number.isFinite(parsedFrom) || !Number.isFinite(parsedTo)) {
+      host.append(emptyState('请输入整数周期：区间为左开右闭 (c1, c2]'));
+      return;
+    }
+    const c1 = Math.trunc(parsedFrom);
+    const c2 = Math.trunc(parsedTo);
+    const deltas = tracks.map((track) => ({ track, delta: counterDeltaBetween(track, c1, c2) }));
+    const sum = deltas.reduce((acc, item) => acc + (item.delta ?? 0), 0);
+    const rows = deltas.map(({ track, delta }) => {
+      const t1 = counterTotalAt(track, c1);
+      const t2 = counterTotalAt(track, c2);
+      const share = delta !== null && sum !== 0 ? `${((delta / sum) * 100).toFixed(1)}%` : '—';
+      const name = el('button', { class: 'btn btn-ghost mono', text: track.name, style: 'padding:0;font-size:12px' });
+      name.addEventListener('click', () => {
+        ctx.selection.set({ kind: 'counter', key: track.key });
+        inspectCounter(track, ctx);
+      });
+      return [name, track.domain, t1 === null ? '—' : fmtInt(t1), t2 === null ? '—' : fmtInt(t2), delta === null ? '—' : fmtInt(delta), share, fmtInt(track.total)];
+    });
+    host.append(dataTable(['计数器', '域', `累计@${c1}`, `累计@${c2}`, `Δ(${c1}, ${c2}]`, '占 Δ 合计', '终值'], rows));
+
+    const num = tracks.find((t) => t.key === numSel.value);
+    const den = tracks.find((t) => t.key === denSel.value);
+    const ratio = num && den ? ratioBetween(num, den, c1, c2) : null;
+    host.append(
+      el('div', { class: 'row' }, [
+        el('span', { class: 'muted', text: '比率' }),
+        el('code', { class: 'mono', text: num && den ? `${num.name} / ${den.name}` : '—' }),
+        el('b', { text: ratio === null ? '—' : `${ratio.toFixed(4)}（${(ratio * 100).toFixed(2)}%）` }),
+        ratio === null ? el('span', { class: 'muted', text: '分母增量为 0 或区间内没有采样' }) : null,
+      ]),
+    );
+  };
+
+  for (const input of [fromInput, toInput]) input.addEventListener('change', render);
+  for (const select of [numSel, denSel]) select.addEventListener('change', render);
+  node.body.append(
+    el('div', { class: 'row' }, [
+      el('span', { class: 'toolbar-label', text: '从周期' }),
+      fromInput,
+      el('span', { class: 'toolbar-label', text: '到周期' }),
+      toInput,
+      el('span', { class: 'toolbar-label', text: '分子' }),
+      numSel,
+      el('span', { class: 'toolbar-label', text: '分母' }),
+      denSel,
+    ]),
+    host,
+  );
+  render();
+  return node.root;
+}
+
+// ------------------------------------------------------------------ 视图
+
+let containerRef: HTMLElement | null = null;
+let unsubscribe: (() => void) | null = null;
+/** 追踪键 → 需要随选中态高亮的节点 */
+const highlights = new Map<string, HTMLElement[]>();
+
+function highlight(selection: Selection): void {
+  const key = selection && selection.kind === 'counter' ? selection.key : null;
+  for (const [trackKey, nodes] of highlights) {
+    const on = key === trackKey;
+    for (const node of nodes) node.style.outline = on ? '2px solid var(--accent)' : '';
+  }
+}
+
+function render(ctx: ViewContext): void {
+  if (!containerRef) return;
+  clear(containerRef);
+  highlights.clear();
+  const all = [...ctx.trace.counters.values()];
+  const shown = all
+    .filter((t) => ctx.options.domains.length === 0 || ctx.options.domains.includes(t.domain))
+    .sort((a, b) => (a.domain === b.domain ? a.name.localeCompare(b.name) : a.domain.localeCompare(b.domain)));
+
+  if (shown.length === 0) {
+    const node = card('计数器');
+    node.body.append(emptyState(all.length === 0 ? '这份轨迹没有 cnt 记录' : '当前时钟域筛选下没有计数器'));
+    containerRef.append(node.root);
+    return;
+  }
+
+  // 默认区间：`from` 取"最晚的首个采样周期"（此后每个计数器都有累计值），`to` 取最晚的采样周期
+  let from = Number.NEGATIVE_INFINITY;
+  let to = Number.NEGATIVE_INFINITY;
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const track of shown) {
+    let first = Number.POSITIVE_INFINITY;
+    let last = Number.NEGATIVE_INFINITY;
+    for (const sample of track.samples) {
+      first = Math.min(first, sample.pos.cycle);
+      last = Math.max(last, sample.pos.cycle);
+      earliest = Math.min(earliest, sample.pos.cycle);
+    }
+    if (Number.isFinite(first)) from = Math.max(from, first);
+    if (Number.isFinite(last)) to = Math.max(to, last);
+  }
+  if (!Number.isFinite(from) || from > to) from = Number.isFinite(earliest) ? earliest : 0;
+  if (!Number.isFinite(to)) to = from;
+  const useTime = ctx.options.useTimeAxis;
+  const range = { from, to };
+
+  const summary = card('总览', '按当前时钟域筛选');
+  summary.body.append(statsRow(all, shown));
+  containerRef.append(summary.root);
+
+  const charts = el('div', { class: 'grid grid-2' });
+  containerRef.append(charts);
+  const available = columnWidth(charts, shown.length);
+  for (const track of shown) {
+    const dom = ctx.trace.domains.get(track.domain);
+    const node = cumulativeCard(track, dom, useTime, ctx, available);
+    const list = highlights.get(track.key) ?? [];
+    list.push(node);
+    highlights.set(track.key, list);
+    charts.append(node);
+  }
+
+  containerRef.append(deltaCard(shown, ctx, useTime, Math.max(300, containerRef.clientWidth - 32)));
+  containerRef.append(shareCard(shown, ctx));
+  containerRef.append(intervalCard(shown, ctx, range));
+  highlight(ctx.selection.get());
+}
+
+export const countersView: View = {
+  id: 'counters',
+  title: '计数器',
+  hint: '累计曲线、每周期增量、比率',
+  mount(container, ctx) {
+    // app.ts 每次重挂载都会新建容器：先退订上一次，避免监听器累积
+    unsubscribe?.();
+    unsubscribe = null;
+    containerRef = container;
+    unsubscribe = ctx.selection.subscribe((selection) => highlight(selection));
+    render(ctx);
+  },
+  refresh(ctx, reason) {
+    if (reason === 'options') render(ctx);
+    else highlight(ctx.selection.get());
+  },
+  unmount() {
+    unsubscribe?.();
+    unsubscribe = null;
+    containerRef = null;
+    highlights.clear();
+  },
+};
+
+export default countersView;

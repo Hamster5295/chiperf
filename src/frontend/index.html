@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chiperf 可视化</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Crect x='7' y='8' width='8' height='16' rx='2' fill='white'/%3E%3Crect x='17' y='8' width='8' height='7' rx='2' fill='white' opacity='.65'/%3E%3Crect x='17' y='17' width='8' height='7' rx='2' fill='white' opacity='.35'/%3E%3C/svg%3E"
+    />
+    <!--
+      chiperf 可视化 —— 单文件页面模板。
+
+      `bun run build` 会把下面两个占位注释替换成内联的 CSS 与打包后的 JS，
+      产出 dist/index.html（可直接双击打开，也可以放到任意静态托管）。
+      这里保留占位而不是外链，是为了让产物只有一个文件、不依赖相对路径。
+    -->
+    <style>/*__CHIPERF_STYLES__*/</style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>chiperf 可视化需要启用 JavaScript。</noscript>
+    <script>/*__CHIPERF_SCRIPT__*/</script>
+  </body>
+</html>
