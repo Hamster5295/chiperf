@@ -7,7 +7,7 @@
  *  - `abs=` 回读记录只置总量、不贡献增量（`samples[].delta === null`，spec §9.2）
  *  - 累计值取"该周期末"的取值（`counterTotalAt` 的判据是 position ≤ (cycle, n)）
  *  - `async=1` 的记录不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.7）
- *  - 横轴是周期数，缩放只改每周期像素，不改数据（Shift/Ctrl + 滚轮，见 installWheelZoom）
+ *  - 横轴是周期数，缩放只改每周期像素、不改数据，且只作用于指针所在的那张图（见 installWheelZoom）
  */
 import type { CounterTrack, DomainInfo, Trace } from '../../../parser/src/index.ts';
 import { counterDeltaBetween, counterTotalAt, eventCounters, ratioBetween } from '../../../parser/src/index.ts';
@@ -31,9 +31,9 @@ import {
 } from '../charts.ts';
 import { cycleTime, fmtInt, type Selection, type View, type ViewContext } from '../view.ts';
 
-/** 折线图的横向缩放倍数（Shift/Ctrl + 滚轮）。1 = 铺满卡片列宽 */
-let hZoom = 1;
-/** 缩放归属的轨迹：换文件归 1，切到别的视图再回来保持 */
+/** 每张折线图各自的横向缩放倍数（Shift/Ctrl + 滚轮只缩放指针所在的那张）。缺省 = 1 */
+const zoomByChart = new Map<string, number>();
+/** 缩放归属的轨迹：换文件整批清掉，切到别的视图再回来保持 */
 let zoomTrace: Trace | null = null;
 /** 缩放上下限：1 是"正好铺满卡片"，再往下缩没有意义；上限靠画布保险兜住 */
 const MIN_HZOOM = 1;
@@ -108,6 +108,9 @@ function chartWidth(span: number, available: number, zoom: number): number {
 
 /** 卡片、图例、下拉里的显示名：evt 折算来的加前缀，免得跟同名 `[cnt]` 看混 */
 const labelOf = (track: CounterTrack): string => (track.source === 'evt' ? `[evt] ${track.name}` : track.name);
+
+/** 图键 → 横向缩放倍数。图键必须逐图唯一（同一个计数器既有累计曲线又有增量柱图） */
+const zoomOf = (chartKey: string): number => zoomByChart.get(chartKey) ?? 1;
 
 /** 卡片列宽：先放同样数量的占位卡片让 auto-fit 定下真实列数，再量列宽（图表至少占满一列） */
 function columnWidth(grid: HTMLElement, count: number): number {
@@ -193,6 +196,7 @@ function statsRow(tracks: CounterTrack[], shown: CounterTrack[]): HTMLElement {
 // ------------------------------------------------------------------ 累计曲线
 
 function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTime: boolean, ctx: ViewContext, available: number): HTMLElement {
+  const chartKey = `cum:${track.key}`;
   const points = orderedPoints(track);
   const color = colorFor(track.key);
   const absCount = points.filter((p) => p.abs).length;
@@ -213,7 +217,7 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
   const last = points[points.length - 1]!.cycle;
   const height = 150;
   const pad = { left: 54, right: 16, top: 12, bottom: 20 };
-  const width = chartWidth(last - first + 1, available, hZoom);
+  const width = chartWidth(last - first + 1, available, zoomOf(chartKey));
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
 
@@ -297,7 +301,7 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
     marked.push(marker);
   }
   svg.append(...marked);
-  node.body.append(el('div', { class: 'chart-scroll', 'data-key': `cum:${track.key}` }, [svg]));
+  node.body.append(el('div', { class: 'chart-scroll', 'data-key': chartKey }, [svg]));
 
   const dotted = el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
     el('span', { text: `${fmtInt(points.length)} 条采样（图上抽稀到 ${fmtInt(drawn.length)} 点）` }),
@@ -359,6 +363,7 @@ function deltaCard(tracks: CounterTrack[], ctx: ViewContext, useTime: boolean, a
 }
 
 function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, available: number): HTMLElement {
+  const chartKey = `delta:${track.key}`;
   const color = colorFor(track.key);
   const dom = ctx.trace.domains.get(track.domain);
   const cycles = [...track.deltaByCycle.keys()].sort((a, b) => a - b);
@@ -380,7 +385,7 @@ function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, ava
 
   const height = 118;
   const pad = { left: 54, right: 16, top: 10, bottom: 20 };
-  const width = chartWidth(span, available, hZoom);
+  const width = chartWidth(span, available, zoomOf(chartKey));
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
 
@@ -430,7 +435,7 @@ function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, ava
       el('span', { class: 'badge', text: `Δ合计 ${countLabel(deltaSum)}` }),
       el('span', { class: 'badge', text: `${fmtInt(cycles.length)} 个周期有增量` }),
     ]),
-    el('div', { class: 'chart-scroll', 'data-key': `delta:${track.key}` }, [svg]),
+    el('div', { class: 'chart-scroll', 'data-key': chartKey }, [svg]),
   ]);
 }
 
@@ -611,13 +616,14 @@ function highlight(selection: Selection): void {
 }
 
 /**
- * Shift（或 Ctrl/⌘ —— 与时间轴同一个手势）+ 滚轮：横向缩放**所有**折线图。
- * 同一份轨迹的卡片共用一条周期横轴，只有一起缩放才能互相参照。
+ * Shift（或 Ctrl/⌘ —— 与时间轴同一个手势）+ 滚轮：缩放**指针所在的那一张图**。
  *
- * 锚点：指针所在的那张图按"指针处的内容比例"还原（放大时内容不会从指针下面跑掉）；
- * 其余图按**左边缘**还原 —— 计数器大多只有十几拍采样、集中在最左边，
- * 按容器中心锚会让它们把有内容的左边滚出视野，看起来像"图是空的"。
- * 普通滚轮不拦截，保留浏览器原生滚动。
+ * 每张图各存各的倍数：卡片长短不一，一起放大等于"我只想看清这条曲线，
+ * 结果整页都变了"。指针不在任何图上时不抢滚轮。
+ *
+ * 锚点取指针处的内容比例（放大时内容不会从指针下面跑掉）。重建后其余图的
+ * 倍数没变、宽度也没变，按左边缘（`viewX = 0`）还原即可保住它们各自的滚动位置。
+ * 倍数到上下限时也不拦截，交回浏览器原生行为（横拖这张图）。
  */
 function installWheelZoom(host: HTMLElement, ctx: ViewContext): void {
   host.addEventListener(
@@ -625,26 +631,31 @@ function installWheelZoom(host: HTMLElement, ctx: ViewContext): void {
     (event) => {
       const wheel = event as WheelEvent;
       if (!wheel.shiftKey && !wheel.ctrlKey && !wheel.metaKey) return;
-      // data-key 必须**逐图唯一**：同一个计数器既有累计曲线又有增量柱图，
-      // 只用 track.key 的话两者会互相覆盖锚点，缩放后滚动位置会算成负数被夹回 0。
-      const before = new Map<string, { viewX: number; frac: number }>();
-      for (const node of host.querySelectorAll<HTMLElement>('.chart-scroll[data-key]')) {
+      const target = [...host.querySelectorAll<HTMLElement>('.chart-scroll[data-key]')].find((node) => {
         const box = node.getBoundingClientRect();
-        const over =
-          wheel.clientX >= box.left && wheel.clientX <= box.right && wheel.clientY >= box.top && wheel.clientY <= box.bottom;
-        const viewX = over ? wheel.clientX - box.left : 0; // 其余图锚在左边缘
-        before.set(node.dataset.key!, { viewX, frac: (node.scrollLeft + viewX) / Math.max(1, node.scrollWidth) });
-      }
-      if (before.size === 0) return; // 没有图可缩放：不抢滚轮
+        return (
+          wheel.clientX >= box.left && wheel.clientX <= box.right && wheel.clientY >= box.top && wheel.clientY <= box.bottom
+        );
+      });
+      if (!target) return;
+      const chartKey = target.dataset.key!;
+      const current = zoomOf(chartKey);
+      const next = Math.min(MAX_HZOOM, Math.max(MIN_HZOOM, current * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2)));
+      if (Math.abs(next - current) < 1e-6) return;
       wheel.preventDefault();
-      const next = Math.min(MAX_HZOOM, Math.max(MIN_HZOOM, hZoom * (wheel.deltaY < 0 ? 1.2 : 1 / 1.2)));
-      if (Math.abs(next - hZoom) < 1e-6) return;
-      hZoom = next;
-      render(ctx);
-      // 重画后容器是新的：按 data-key 找回同一个，还原到同一个内容比例
+      // 重画会重建所有容器：先记下每张图的滚动位置，再按图键还原
+      const before = new Map<string, number>();
       for (const node of host.querySelectorAll<HTMLElement>('.chart-scroll[data-key]')) {
-        const anchor = before.get(node.dataset.key!);
-        if (anchor) node.scrollLeft = anchor.frac * node.scrollWidth - anchor.viewX;
+        before.set(node.dataset.key!, node.scrollLeft / Math.max(1, node.scrollWidth));
+      }
+      const viewX = wheel.clientX - target.getBoundingClientRect().left;
+      const pointerFrac = (target.scrollLeft + viewX) / Math.max(1, target.scrollWidth);
+      zoomByChart.set(chartKey, next);
+      render(ctx);
+      for (const node of host.querySelectorAll<HTMLElement>('.chart-scroll[data-key]')) {
+        const key = node.dataset.key!;
+        if (key === chartKey) node.scrollLeft = pointerFrac * node.scrollWidth - viewX;
+        else node.scrollLeft = (before.get(key) ?? 0) * node.scrollWidth;
       }
     },
     { passive: false },
@@ -657,7 +668,7 @@ function render(ctx: ViewContext): void {
   highlights.clear();
   if (zoomTrace !== ctx.trace) {
     zoomTrace = ctx.trace;
-    hZoom = 1;
+    zoomByChart.clear();
   }
   const all = [...ctx.trace.counters.values(), ...eventCounters(ctx.trace)];
   const shown = all
@@ -716,7 +727,7 @@ function render(ctx: ViewContext): void {
 export const countersView: View = {
   id: 'counters',
   title: '计数器',
-  hint: '累计曲线、每周期增量、比率；[evt] 按每条 +1 与计数器一起展示，Shift/Ctrl + 滚轮横向缩放',
+  hint: '累计曲线、每周期增量、比率；[evt] 按每条 +1 与计数器一起展示，Shift/Ctrl + 滚轮缩放指针所在的那张图',
   mount(container, ctx) {
     // app.ts 每次重挂载都会新建容器：先退订上一次，避免监听器累积
     unsubscribe?.();
