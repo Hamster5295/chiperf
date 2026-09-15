@@ -68,81 +68,121 @@ function selfLoops(fsm: FsmTrack): number {
   return count;
 }
 
-/** 状态列顺序：按各状态机出现顺序归并（稳定、可复现） */
-function stateColumns(fsms: FsmTrack[]): string[] {
-  const columns: string[] = [];
-  for (const fsm of fsms) {
-    for (const state of fsm.stateSet) if (!columns.includes(state)) columns.push(state);
+/** 该状态机驻留最多的状态（用于"峰值"与小标题） */
+function peakState(fsm: FsmTrack): { state: string; dwell: number } | null {
+  let best: { state: string; dwell: number } | null = null;
+  for (const [state, dwell] of fsm.dwellCycles) {
+    if (best === null || dwell > best.dwell) best = { state, dwell };
   }
-  return columns;
+  return best;
 }
 
-// ------------------------------------------------------------------ 热力图
+/** 最后一条记录的状态：它的驻留还没定型（spec §9.5） */
+function tailState(fsm: FsmTrack): string | null {
+  const last = fsm.samples[fsm.samples.length - 1];
+  return last === undefined ? null : formatState(last.value);
+}
 
-function heatmap(fsms: FsmTrack[], columns: string[], ctx: ViewContext, state: FsmState): HTMLElement {
-  let peak = 0;
-  for (const fsm of fsms) {
-    for (const dwell of fsm.dwellCycles.values()) if (dwell > peak) peak = dwell;
-  }
-  const width = `${Math.max(64, Math.round(420 / Math.max(1, columns.length)))}px`;
+function formatState(value: FsmTrack['samples'][number]['value']): string {
+  return value.kind === 'str' ? `"${value.text}"` : value.text;
+}
 
-  const header = el('tr', {}, [
-    el('th', { text: '状态机' }),
-    ...columns.map((column) =>
-      el('th', { style: `text-align:center;min-width:${width}` }, [
-        el('span', { style: `color:${colorFor(column)}`, text: column }),
-      ]),
-    ),
-    el('th', { style: 'text-align:right', text: '总驻留' }),
-  ]);
+// ------------------------------------------------------------------ 每台状态机各自的占用热力
 
-  const bodyRows = fsms.map((fsm) => {
-    const total = totalDwell(fsm);
-    const row = el('tr', {}, [
-      el('td', {}, [
-        el('code', { class: 'mono', text: fsm.name }),
-        el('div', { class: 'muted', style: 'font-size:10.5px', text: `${fsm.domain} · ${fmtInt(fsm.samples.length)} 条记录` }),
-      ]),
-      ...columns.map((column) => {
-        const dwell = dwellOf(fsm, column);
-        if (dwell === null) {
-          const blank = el('td', { style: 'text-align:center' }, [el('div', { style: 'height:19px' })]);
-          hoverTarget(blank, () => `${fsm.name}\n没有状态 ${column}`);
-          return blank;
-        }
-        const background = heatColor(peak > 0 ? dwell / peak : 0);
-        const cell = el('div', {
-          style: `background:${background};color:${textColorOn(background)};border-radius:4px;padding:4px 6px;text-align:center;font-variant-numeric:tabular-nums;font-size:11px;cursor:pointer`,
-          text: fmtInt(dwell),
-        });
-        const share = total > 0 ? (dwell / total) * 100 : 0;
-        hoverTarget(
-          cell,
-          () => `${fsm.name}\n状态 ${column}\n驻留 ${fmtInt(dwell)} 周期\n占该状态机 ${share.toFixed(1)}%（总驻留 ${fmtInt(total)} 周期）`,
-          () => selectFsm(ctx, fsm, `热力图 · ${column}`, [
-            ['状态机', fsm.name],
-            ['时钟域', fsm.domain],
-            ['状态', column],
-            ['驻留周期', fmtInt(dwell)],
-            ['占比', `${share.toFixed(2)}%`],
-            ['该状态机总驻留', `${fmtInt(total)} 周期`],
-            ['状态数', String(fsm.stateSet.length)],
-          ]),
-        );
-        return el('td', {}, [cell]);
-      }),
-      el('td', { class: 'num', text: fmtInt(total) }),
-    ]);
-    state.highlights.push({
-      node: row,
-      match: (selection) => selection?.kind === 'fsm' && selection.key === fsm.key,
-    });
-    return row;
+/**
+ * 一台状态机一张卡片：行内只放**它自己的**状态，格子 = 该状态的驻留周期数。
+ * 颜色按该状态机自身的峰值归一（独立可读），卡片小标题里给出峰值以便跨状态机比较。
+ */
+function fsmHeatCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement {
+  const total = totalDwell(fsm);
+  const peak = peakState(fsm);
+  const tail = tailState(fsm);
+  const cards = card(
+    `状态占用 · ${fsm.name}`,
+    `域 ${fsm.domain} · ${fsm.stateSet.length} 个状态 · 总驻留 ${fmtInt(total)} 周期` +
+      (peak ? ` · 峰值 ${peak.state} ${fmtInt(peak.dwell)} 周期` : '') +
+      (tail !== null ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : ''),
+  );
+
+  const cells = el('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:6px',
   });
+  const peakDwell = peak?.dwell ?? 0;
+  for (const name of fsm.stateSet) {
+    const dwell = dwellOf(fsm, name) ?? 0;
+    const background = heatColor(peakDwell > 0 ? dwell / peakDwell : 0);
+    const foreground = textColorOn(background);
+    const share = total > 0 ? (dwell / total) * 100 : 0;
+    const isTail = tail !== null && name === tail;
+    const cell = el(
+      'div',
+      {
+        style: [
+          `background:${background}`,
+          `color:${foreground}`,
+          'border-radius:6px',
+          'padding:6px 8px',
+          'display:flex',
+          'flex-direction:column',
+          'gap:1px',
+          'min-width:0',
+          'cursor:pointer',
+          isTail ? 'outline:1px dashed currentColor;outline-offset:-3px' : '',
+        ]
+          .filter(Boolean)
+          .join(';'),
+      },
+      [
+        el('span', {
+          style: 'font-size:10.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+          title: name,
+          text: name,
+        }),
+        el('span', { style: 'font-size:12.5px;font-variant-numeric:tabular-nums', text: `${fmtInt(dwell)} 周期` }),
+        el('span', { style: 'font-size:10px;opacity:.85', text: `${share.toFixed(1)}%${isTail ? ' · 未定型' : ''}` }),
+      ],
+    );
+    hoverTarget(
+      cell,
+      () =>
+        [
+          `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+          `状态 ${name}`,
+          `驻留 ${fmtInt(dwell)} 周期`,
+          `占该状态机 ${share.toFixed(2)}%（总驻留 ${fmtInt(total)} 周期）`,
+          isTail ? '末状态：后面还没有新记录，驻留周期数仍会增长（spec §9.5）' : '',
+        ]
+          .filter((line) => line !== '')
+          .join('\n'),
+      () =>
+        selectFsm(ctx, fsm, `状态占用 · ${name}`, [
+          ['状态机', fsm.name],
+          ['时钟域', fsm.domain],
+          ['状态', name],
+          ['驻留周期', fmtInt(dwell)],
+          ['占比', `${share.toFixed(2)}%`],
+          ['该状态机总驻留', `${fmtInt(total)} 周期`],
+          ['该状态机状态数', String(fsm.stateSet.length)],
+          ['状态记录', `${fmtInt(fsm.samples.length)} 条`],
+        ]),
+    );
+    cells.append(cell);
+  }
 
-  return el('div', { class: 'table-wrap' }, [
-    el('table', { class: 'table' }, [el('thead', {}, [header]), el('tbody', {}, bodyRows)]),
-  ]);
+  cards.body.append(
+    cells,
+    legend([
+      { label: '驻留少', color: heatColor(0) },
+      { label: '驻留多', color: heatColor(1) },
+      { label: `按本状态机峰值 ${peakDwell > 0 ? fmtInt(peakDwell) : 0} 周期归一`, color: heatColor(0.7) },
+    ]),
+  );
+
+  state.highlights.push({
+    node: cards.root,
+    match: (selection) => selection?.kind === 'fsm' && selection.key === fsm.key,
+  });
+  return cards.root;
 }
 
 // ------------------------------------------------------------------ 时序色带
@@ -290,7 +330,13 @@ function transitionRows(fsms: FsmTrack[]): TransitionRow[] {
       rows.push(row);
     }
   }
-  rows.sort((a, b) => b.count - a.count || a.fsm.name.localeCompare(b.fsm.name) || (a.from ?? '').localeCompare(b.from ?? ''));
+  rows.sort(
+    (a, b) =>
+      a.fsm.name.localeCompare(b.fsm.name) ||
+      b.count - a.count ||
+      (a.from ?? '').localeCompare(b.from ?? '') ||
+      a.to.localeCompare(b.to),
+  );
   return rows;
 }
 
@@ -314,7 +360,6 @@ function renderFsm(state: FsmState): void {
     return;
   }
 
-  const columns = stateColumns(fsms);
   const allStates = new Set<string>();
   let transitions = 0;
   let loops = 0;
@@ -339,16 +384,10 @@ function renderFsm(state: FsmState): void {
   );
   container.append(overview.root);
 
-  // ---------------------------------------------------------------- 热力图
-  const heatCard = card('状态占用热力图', '格子颜色 = 驻留周期（按全局最大值归一）；空白表示该状态机没有这个状态');
-  heatCard.body.append(el('div', { class: 'chart-scroll' }, [heatmap(fsms, columns, ctx, state)]));
-  heatCard.body.append(
-    legend([
-      { label: '驻留少', color: heatColor(0) },
-      { label: '驻留多', color: heatColor(1) },
-    ]),
-  );
-  container.append(heatCard.root);
+  // ---------------------------------------------------------------- 每台状态机各自的占用
+  // 不把不同状态机塞进同一张表：每台状态机的状态集合、驻留口径与峰值都不同，
+  // 合并后大多数格子会是空的，也看不出"某个模块各状态占了多少周期"。
+  for (const fsm of fsms) container.append(fsmHeatCard(fsm, ctx, state));
 
   // ---------------------------------------------------------------- 色带
   const bandCard = card('状态时序色带', '状态区间是半开的 [start, end)，长度 = end − start；颜色与热力图一致');
@@ -360,7 +399,7 @@ function renderFsm(state: FsmState): void {
 
   // ---------------------------------------------------------------- 跳转表
   const rows = transitionRows(fsms);
-  const jumpCard = card('跳转表', 'from → to 聚合计数，含自环（同一状态连续上报，spec §9.5）');
+  const jumpCard = card('跳转表（跨状态机）', 'from → to 聚合计数，含自环（同一状态连续上报，spec §9.5）；按状态机分组便于对照');
   if (rows.length === 0) {
     jumpCard.body.append(emptyState('没有跳转记录'));
   } else {
