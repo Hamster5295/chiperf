@@ -6,6 +6,8 @@
  *  - 服务器提供页面、/healthz、404、405，且提供的内容与 dist/index.html 完全一致
  */
 import { beforeAll, afterAll, describe, expect, test } from 'bun:test';
+import { copyFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const FRONTEND = join(import.meta.dir, '..');
@@ -102,5 +104,35 @@ describe('dist/app.js（HTTP 服务器）', () => {
     const html = await (await fetch(`${BASE}/`)).text();
     expect(html).not.toMatch(/<script[^>]+src=/);
     expect(html).not.toMatch(/<link[^>]+href="(?!data:)/);
+  });
+
+  test('与 app.js 同目录有 index.html 时优先用它（改完源码重新 build 即刻生效）', async () => {
+    const line = await Bun.file(join(DIST, 'index.html')).text();
+    const response = await fetch(`${BASE}/`);
+    expect(await response.text()).toBe(line);
+  });
+
+  test('app.js 被单独拷到没有 index.html 的目录时，仍然提供内嵌页面', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'chiperf-portable-'));
+    try {
+      const standalone = join(dir, 'app.js');
+      await copyFile(join(DIST, 'app.js'), standalone);
+      const port = PORT + 1;
+      const child = Bun.spawn({ cmd: ['bun', standalone, '-p', String(port), '-q'], cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+      try {
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for await (const chunk of child.stdout as ReadableStream<Uint8Array>) {
+          buffer += decoder.decode(chunk, { stream: true });
+          if (buffer.includes('chiperf 可视化服务')) break;
+        }
+        const served = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+        expect(served).toBe(await Bun.file(join(DIST, 'index.html')).text());
+      } finally {
+        child.kill();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -84,24 +84,29 @@ const HELP = `chiperf 可视化服务器
   其它路径          404
 `;
 
-/** 内嵌页面优先；直接跑源码时回退读构建产物 */
+/**
+ * 页面来源优先级：
+ *   1. `--html <路径>` 显式指定
+ *   2. **与 app.js 同目录的 index.html**（构建产物，改完源码重新 build 即刻生效，无需重启）
+ *   3. 构建时内嵌的副本（app.js 被单独拷走时仍可用）
+ */
 export async function resolveHtml(explicitPath?: string): Promise<{ html: string; source: string }> {
   if (explicitPath !== undefined) {
     const file = Bun.file(explicitPath);
     if (!(await file.exists())) throw new Error(`找不到 --html 指定的文件：${explicitPath}`);
     return { html: await file.text(), source: explicitPath };
   }
+  const sibling = new URL('./index.html', import.meta.url);
+  const siblingFile = Bun.file(sibling);
+  if (await siblingFile.exists()) {
+    const html = await siblingFile.text();
+    return { html, source: `${sibling.pathname}（${formatBytes(html.length)}）` };
+  }
   if (typeof __CHIPERF_HTML_B64__ === 'string' && __CHIPERF_HTML_B64__.length > 0) {
     const html = embeddedHtml()!;
-    return { html, source: `内嵌页面（${formatBytes(html.length)}）` };
+    return { html, source: `内嵌页面（${formatBytes(html.length)}；同目录没有 index.html 时使用）` };
   }
-  const fallback = new URL('../../dist/index.html', import.meta.url);
-  const file = Bun.file(fallback);
-  if (!(await file.exists())) {
-    throw new Error('没有内嵌页面，也找不到 dist/index.html；请先在 src/frontend 运行 `bun run build`');
-  }
-  const html = await file.text();
-  return { html, source: `${fallback.pathname}（${formatBytes(html.length)}）` };
+  throw new Error('既没有同目录的 index.html，也没有内嵌页面；请先在 src/frontend 运行 `bun run build`');
 }
 
 function formatBytes(n: number): string {
