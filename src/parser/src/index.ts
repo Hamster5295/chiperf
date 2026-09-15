@@ -36,6 +36,7 @@ export {
   describeSamples,
   equalRuns,
   type Distribution,
+  itemsWithin,
   latencyStats,
   eventCounters,
   ratioBetween,

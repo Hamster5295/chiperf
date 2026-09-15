@@ -4,6 +4,10 @@
  * 口径（spec §9.5）：状态是保持型的；`dwellCycles` = 相邻两条记录的周期差之和，
  * 色带区间是**半开**的 `[start, end)`，长度 = end − start。状态配色统一走 `colorFor(state)`，
  * 保证热力图与色带里同名同色。
+ *
+ * 标记区间：波形上最多两个同域标记围出一个**闭区间** `[from, to]`，本视图只统计"与这个区间
+ * 相交"的数据（见 `buildScopes`）。没有标记、或状态机不在标记所在域时走**全量**口径 ——
+ * 那时用的就是轨道上现成的 `dwellCycles` / `transitions` 本体，所以数字与加标记之前一致。
  */
 import type { FsmTrack, Position } from '../../../parser/src/index.ts';
 import { formatPosition, stateSegments } from '../../../parser/src/index.ts';
@@ -23,6 +27,8 @@ import {
   svgRoot,
   textColorOn,
 } from '../charts.ts';
+import { abortable, nextFrame, runChunked } from '../chunk.ts';
+import type { MarkerRange } from '../markers.ts';
 import { fmtInt, type Selection, type View, type ViewContext } from '../view.ts';
 
 /** 选中态高亮：默认切 `is-selected` 类，SVG 元素可自定义 */
@@ -37,6 +43,14 @@ interface FsmState {
   ctx: ViewContext;
   highlights: Highlight[];
   unsubscribe: (() => void) | null;
+  /** 标记订阅：标记被提交（打/拖/删）时重算区间统计 */
+  unsubscribeMarkers: (() => void) | null;
+  /** 当前这一轮重算的取消令牌：新一轮开始或卸载时取消上一轮，避免旧结果盖掉新结果 */
+  token: { signal: AbortSignal; abort: () => void } | null;
+  /** 统计内容挂在这里：算完之前保留上一轮的内容，不露出半算完的数据 */
+  body: HTMLElement;
+  /** 顶部那一行：统计范围说明 + "计算中…" */
+  chips: HTMLElement;
   /** 当前被选中的状态机 key；为 null 时不淡化任何色带 */
   selectedKey: string | null;
 }
@@ -52,10 +66,10 @@ function visibleFsms(ctx: ViewContext): FsmTrack[] {
   return domains.length === 0 ? fsms : fsms.filter((fsm) => domains.includes(fsm.domain));
 }
 
-function dwellOf(fsm: FsmTrack, state: string): number | null {
-  return fsm.dwellCycles.get(state) ?? null;
-}
-
+/**
+ * 全量口径的三个小工具：区间筛选时不用它们（那时候逐段裁剪现算），
+ * 只用来在"没有标记 / 域不匹配"时**原样**取回轨道上的数字。
+ */
 function totalDwell(fsm: FsmTrack): number {
   let total = 0;
   for (const value of fsm.dwellCycles.values()) total += value;
@@ -77,6 +91,205 @@ function peakState(fsm: FsmTrack): { state: string; dwell: number } | null {
   return best;
 }
 
+// ------------------------------------------------------------------ 统计范围（波形上的标记区间）
+
+/** `stateSegments` 的元素：半开区间 `[start, end)` */
+type BandSegment = { state: string; start: number; end: number; open: boolean };
+
+/**
+ * 一台状态机在**当前统计范围**下的数据 —— 视图只读这一份，不再直接摸
+ * `fsm.dwellCycles` / `fsm.transitions`，"按区间统计"这件事因此只发生在一个地方。
+ *
+ * 全量口径（没有标记，或该状态机不在标记所在域）时，`dwell` / `transitions` 就是轨道上
+ * 现成的 `dwellCycles` / `transitions` **本体**：没打标记时数字不变，靠的不是"算得准"，
+ * 而是根本没换算法。
+ */
+interface FsmScope {
+  fsm: FsmTrack;
+  /**
+   * 本台状态机实际生效的标记区间（闭）；`null` ⇒ 全量口径（没有标记，或它不在标记所在域）。
+   * 一张卡片是"区间统计"还是"全量统计"就看这个字段，不再另立一个布尔量。
+   */
+  range: MarkerRange | null;
+  /** 状态 → 区间内驻留周期数 */
+  dwell: Map<string, number>;
+  /** 区间内驻留周期数之和 */
+  dwellTotal: number;
+  /** 区间内驻留最多的状态 */
+  peak: { state: string; dwell: number } | null;
+  /** 区间内**发生**的跳转（跳转是瞬时事件，看它的周期落没落在区间里） */
+  transitions: FsmTrack['transitions'];
+  selfLoops: number;
+  /** 区间内的状态记录条数 */
+  samples: number;
+  /** 画色带用的区段：已裁剪到区间（跨边界取相交部分，区间外的丢掉） */
+  segments: BandSegment[];
+}
+
+/** 分片作业：一段连续编号的长活；`runChunked` 按编号切片，片间让出主线程 */
+interface ChunkJob {
+  count: number;
+  run: (from: number, to: number) => void;
+}
+
+/**
+ * 算出每台状态机在当前标记区间下的数据。
+ *
+ * 为什么分片：区间统计要逐段裁剪、逐条过滤，一台状态机几万条记录一次算完会把主线程占住
+ * 好几帧（页面卡住、也没有任何反馈）。这里把三类可枚举的长活（状态段裁剪 / 跳转过滤 /
+ * 记录计数）各切一片，片间让出一帧，`onProgress` 报整轮进度。
+ *
+ * 返回 null 表示中途被取消（视图卸载、或更新的一轮已经开始了）——调用方必须丢弃这一轮的产物。
+ */
+async function buildScopes(
+  fsms: FsmTrack[],
+  range: MarkerRange | null,
+  signal: AbortSignal,
+  onProgress: (done: number, total: number) => void,
+): Promise<FsmScope[] | null> {
+  const scopes: FsmScope[] = fsms.map((fsm) => {
+    // 标记只对**它所在的那个域**有意义：跨域周期数不可比（spec §6.5）
+    const filtered = range !== null && fsm.domain === range.domain;
+    if (!filtered) {
+      return {
+        fsm,
+        range: null,
+        dwell: fsm.dwellCycles,
+        dwellTotal: totalDwell(fsm),
+        peak: peakState(fsm),
+        transitions: fsm.transitions,
+        selfLoops: selfLoops(fsm),
+        samples: fsm.samples.length,
+        segments: stateSegments(fsm),
+      };
+    }
+    return {
+      fsm,
+      range,
+      dwell: new Map<string, number>(),
+      dwellTotal: 0,
+      peak: null,
+      transitions: [],
+      selfLoops: 0,
+      samples: 0,
+      segments: [],
+    };
+  });
+
+  const jobs: ChunkJob[] = [];
+  for (const scope of scopes) {
+    // `range !== null` 就是"这台状态机被筛选了"：全量口径没有要算的长活
+    const marked = scope.range;
+    if (marked === null) continue;
+    const from = marked.from;
+    const to = marked.to;
+    // 先按 §9.5 切段（合并连续同状态），下面再逐段裁剪 —— 切段本身是一趟线性扫描
+    const raw = stateSegments(scope.fsm);
+
+    // ① 状态段裁剪：跨边界的段只算落在区间里的那部分
+    jobs.push({
+      count: raw.length,
+      run: (start, stop) => {
+        for (let i = start; i < stop; i++) {
+          const segment = raw[i]!;
+          // 半开段 `[start,end)` 裁到闭区间 `[from,to]`：上界写成 `to + 1`，长度就是"这段里
+          // 有几个周期落在区间内"。区间为空（from === to）时长度是 0 或 1，不会是负数。
+          const clippedFrom = Math.max(segment.start, from);
+          const clippedTo = Math.min(segment.end, to + 1);
+          // 交集为空 ⇒ 整段丢掉；零长段（开区间的尾段，驻留未定型）只在它的那个周期落在
+          // 区间里时留下 —— 今天它本来就画成一根细条，没必要因为筛选就消失
+          if (clippedTo < clippedFrom) continue;
+          if (clippedTo === clippedFrom && (segment.start < from || segment.start > to)) continue;
+          const length = clippedTo - clippedFrom;
+          scope.segments.push({ state: segment.state, start: clippedFrom, end: clippedTo, open: segment.open });
+          scope.dwell.set(segment.state, (scope.dwell.get(segment.state) ?? 0) + length);
+          scope.dwellTotal += length;
+        }
+      },
+    });
+
+    // ② 跳转过滤：跳转发生在 `pos.cycle` 这一拍（它两端的段必然都碰到区间），
+    //    只有发生在区间里的跳转才算 —— 区间外发生的跳转不能算进"这段区间有多少次跳转"
+    jobs.push({
+      count: scope.fsm.transitions.length,
+      run: (start, stop) => {
+        for (let i = start; i < stop; i++) {
+          const transition = scope.fsm.transitions[i]!;
+          const cycle = transition.pos.cycle;
+          if (cycle < from || cycle > to) continue;
+          scope.transitions.push(transition);
+          if (transition.selfLoop) scope.selfLoops += 1;
+        }
+      },
+    });
+
+    // ③ 状态记录条数：概览里的"条"也跟着区间走
+    jobs.push({
+      count: scope.fsm.samples.length,
+      run: (start, stop) => {
+        for (let i = start; i < stop; i++) {
+          const cycle = scope.fsm.samples[i]!.pos.cycle;
+          if (cycle >= from && cycle <= to) scope.samples += 1;
+        }
+      },
+    });
+  }
+
+  let total = 0;
+  for (const job of jobs) total += job.count;
+  let done = 0;
+  for (const job of jobs) {
+    const base = done;
+    const completed = await runChunked(job.count, job.run, {
+      signal,
+      onProgress: (part) => onProgress(base + part, total),
+    });
+    if (!completed) return null;
+    done = base + job.count;
+  }
+
+  // 峰值：区间内的最大值（全量口径直接用 `peakState`，不在这里重算）
+  for (const scope of scopes) {
+    if (scope.range === null) continue;
+    for (const [state, dwell] of scope.dwell) {
+      if (scope.peak === null || dwell > scope.peak.dwell) scope.peak = { state, dwell };
+    }
+  }
+  return scopes;
+}
+
+/** 统计范围说明：「有区间」与「未打标记」两种文案；域不匹配的状态机额外提一句 */
+function scopeChips(range: MarkerRange | null, fsms: FsmTrack[]): HTMLElement[] {
+  if (range === null) {
+    return [
+      el('span', {
+        class: 'chip',
+        text: '未打标记：统计全量',
+        title: '在时间轴上打两个同域标记，这里的统计就只算两个标记之间的那一段',
+      }),
+    ];
+  }
+  const chips = [
+    el('span', {
+      class: 'chip',
+      text: `标记区间：${range.domain} 周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}（只统计这一段）`,
+      title:
+        '只有与闭区间相交的状态段才算数：跨边界的段只算落在区间里的那部分；跳转只看发生在区间里的',
+    }),
+  ];
+  const outside = fsms.filter((fsm) => fsm.domain !== range.domain).length;
+  if (outside > 0) {
+    chips.push(
+      el('span', {
+        class: 'chip chip-warn',
+        text: `${outside} 台状态机不在标记所在域，未按标记筛选`,
+        title: `这些状态机的周期数来自别的时钟域，与标记区间不可比，因此仍按全量统计`,
+      }),
+    );
+  }
+  return chips;
+}
+
 /** 最后一条记录的状态：它的驻留还没定型（spec §9.5） */
 function tailState(fsm: FsmTrack): string | null {
   const last = fsm.samples[fsm.samples.length - 1];
@@ -92,16 +305,32 @@ function formatState(value: FsmTrack['samples'][number]['value']): string {
 /**
  * 一台状态机一张卡片：行内只放**它自己的**状态，格子 = 该状态的驻留周期数。
  * 颜色按该状态机自身的峰值归一（独立可读），卡片小标题里给出峰值以便跨状态机比较。
+ *
+ * 数字一律取自 `scope`：区间筛选时它是"区间内的驻留"，未筛选时它原样就是 `dwellCycles`。
  */
-function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement {
-  const total = totalDwell(fsm);
-  const peak = peakState(fsm);
+function fsmCard(scope: FsmScope, marked: MarkerRange | null, ctx: ViewContext, state: FsmState): HTMLElement {
+  const { fsm } = scope;
+  const total = scope.dwellTotal;
+  const peak = scope.peak;
+  // 末状态的驻留还没定型（spec §9.5）：这张卡片按全量统计时（没打标记 / 域不匹配）就照旧提它
   const tail = tailState(fsm);
+  const tailCycle = fsm.samples[fsm.samples.length - 1]?.pos.cycle ?? null;
+  const tailVisible =
+    tail !== null &&
+    (scope.range === null || (tailCycle !== null && tailCycle >= scope.range.from && tailCycle <= scope.range.to));
+  // 区间筛选只对标记所在域生效；这张卡片按全量统计时必须写明，免得把全量数字当成区间数字
+  const domainNote =
+    scope.range !== null || marked === null ? '' : ` · 不在标记所在域（${marked.domain}），未按标记筛选`;
+  // 同一个口径在卡片里出现好几次（小标题 / tooltip / 详情抽屉），措辞保持一致
+  const filtered = scope.range !== null;
+  const dwellLabel = filtered ? '区间内驻留' : '总驻留';
+  const recordLabel = filtered ? '区间内状态记录' : '状态记录';
   const cards = card(
     `状态机 · ${fsm.name}`,
-    `域 ${fsm.domain} · ${fsm.stateSet.length} 个状态 · 总驻留 ${fmtInt(total)} 周期` +
+    `域 ${fsm.domain} · ${fsm.stateSet.length} 个状态 · ${dwellLabel} ${fmtInt(total)} 周期` +
       (peak ? ` · 峰值 ${peak.state} ${fmtInt(peak.dwell)} 周期` : '') +
-      (tail !== null ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : ''),
+      (tailVisible ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : '') +
+      domainNote,
   );
 
   const cells = el('div', {
@@ -109,11 +338,11 @@ function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement 
   });
   const peakDwell = peak?.dwell ?? 0;
   for (const name of fsm.stateSet) {
-    const dwell = dwellOf(fsm, name) ?? 0;
+    const dwell = scope.dwell.get(name) ?? 0;
     const background = heatColor(peakDwell > 0 ? dwell / peakDwell : 0);
     const foreground = textColorOn(background);
     const share = total > 0 ? (dwell / total) * 100 : 0;
-    const isTail = tail !== null && name === tail;
+    const isTail = tailVisible && name === tail;
     const cell = el(
       'div',
       {
@@ -148,8 +377,8 @@ function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement 
         [
           `状态机 ${fsm.name}（域 ${fsm.domain}）`,
           `状态 ${name}`,
-          `驻留 ${fmtInt(dwell)} 周期`,
-          `占该状态机 ${share.toFixed(2)}%（总驻留 ${fmtInt(total)} 周期）`,
+          `${dwellLabel} ${fmtInt(dwell)} 周期`,
+          `占该状态机 ${share.toFixed(2)}%（${dwellLabel} ${fmtInt(total)} 周期）`,
           isTail ? '末状态：后面还没有新记录，驻留周期数仍会增长（spec §9.5）' : '',
         ]
           .filter((line) => line !== '')
@@ -161,9 +390,9 @@ function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement 
           ['状态', name],
           ['驻留周期', fmtInt(dwell)],
           ['占比', `${share.toFixed(2)}%`],
-          ['该状态机总驻留', `${fmtInt(total)} 周期`],
+          [`该状态机${dwellLabel}`, `${fmtInt(total)} 周期`],
           ['该状态机状态数', String(fsm.stateSet.length)],
-          ['状态记录', `${fmtInt(fsm.samples.length)} 条`],
+          [recordLabel, `${fmtInt(scope.samples)} 条`],
         ]),
     );
     cells.append(cell);
@@ -176,11 +405,14 @@ function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement 
     legend([
       { label: '驻留少', color: heatColor(0) },
       { label: '驻留多', color: heatColor(1) },
-      { label: `按本状态机峰值 ${peakDwell > 0 ? fmtInt(peakDwell) : 0} 周期归一`, color: heatColor(0.7) },
+      {
+        label: `按${filtered ? '区间内' : '本状态机'}峰值 ${peakDwell > 0 ? fmtInt(peakDwell) : 0} 周期归一`,
+        color: heatColor(0.7),
+      },
     ]),
   );
   // ② 该状态机自己的状态时序色带
-  cards.body.append(el('h4', { class: 'fsm-section', text: '状态时序色带' }), stateBands([fsm], ctx, state));
+  cards.body.append(el('h4', { class: 'fsm-section', text: '状态时序色带' }), stateBands([scope], ctx, state));
   // ③ 该状态机的状态转移图（由相邻两条 fsm 记录推断）
   cards.body.append(
     el('h4', { class: 'fsm-section', text: '状态转移图' }),
@@ -189,7 +421,7 @@ function fsmCard(fsm: FsmTrack, ctx: ViewContext, state: FsmState): HTMLElement 
       style: 'margin:-2px 0 4px;font-size:11.5px',
       text: '箭头方向 = 转移方向，箭头颜色 = 转移频度；虚线圆圈是"起始"入口（第一条记录没有前驱状态）',
     }),
-    transitionGraph(fsm, ctx),
+    transitionGraph(scope, ctx),
   );
 
   state.highlights.push({
@@ -216,10 +448,13 @@ interface EdgeAgg {
   last: Position;
 }
 
-/** 由相邻两条 fsm 记录推断转移，并按 (from, to) 聚合 */
-function aggregateEdges(fsm: FsmTrack): EdgeAgg[] {
+/**
+ * 由相邻两条 fsm 记录推断转移，并按 (from, to) 聚合。
+ * `transitions` 由调用方给：全量口径是轨道上的全部跳转，区间口径是"发生在区间里的"那些。
+ */
+function aggregateEdges(fsm: FsmTrack, transitions: FsmTrack['transitions']): EdgeAgg[] {
   const map = new Map<string, EdgeAgg>();
-  for (const transition of fsm.transitions) {
+  for (const transition of transitions) {
     const from = transition.from ?? START_NODE;
     const key = `${from}\u0000${transition.to}`;
     const found = map.get(key);
@@ -282,11 +517,19 @@ function edgeGeometry(a: { x: number; y: number }, b: { x: number; y: number }, 
   return { start, end, mid, label, d: `M${start.x},${start.y}Q${mid.x},${mid.y} ${end.x},${end.y}` };
 }
 
-function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
-  const edges = aggregateEdges(fsm);
+function transitionGraph(scope: FsmScope, ctx: ViewContext): HTMLElement {
+  const { fsm } = scope;
+  const edges = aggregateEdges(fsm, scope.transitions);
   const names = [...(edges.some((e) => e.from === START_NODE) ? [START_NODE] : []), ...fsm.stateSet];
   const pos = nodePositions(names);
-  const total = Math.max(1, edges.reduce((sum, e) => sum + e.count, 0));
+  const edgeTotal = edges.reduce((sum, e) => sum + e.count, 0);
+  // 份额的分母至少为 1：空图（一次跳转都没有）时不能除零
+  const total = Math.max(1, edgeTotal);
+  // 图例上的"次数"：按全量统计的卡片沿用改动前的写法；区间口径给精确值 —— 区间里一次跳转
+  // 都没有时不能显示成"1 次"
+  const filtered = scope.range !== null;
+  const totalLabel = filtered ? edgeTotal : total;
+  const dwellLabel = filtered ? '区间内驻留' : '驻留';
   const maxCount = Math.max(1, ...edges.map((e) => e.count));
   const svg = svgRoot(GRAPH_W, GRAPH_H, { style: 'width:100%;max-width:560px;height:auto' });
 
@@ -365,7 +608,7 @@ function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
       () =>
         [
           `${edge.from} → ${edge.to}${edge.selfLoop ? '（自环）' : ''}`,
-          `发生 ${fmtInt(edge.count)} 次 · 占该状态机跳转的 ${share.toFixed(1)}%`,
+          `发生 ${fmtInt(edge.count)} 次 · 占该状态机${filtered ? '区间内' : ''}跳转的 ${share.toFixed(1)}%`,
           edge.selfLoop ? '自环 = 同一状态连续两次上报（spec §9.5）' : '',
           `首次 ${formatPosition(edge.first)}`,
           `最后 ${formatPosition(edge.last)}`,
@@ -390,7 +633,7 @@ function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
     const at = pos.get(name);
     if (at === undefined) continue;
     const isStart = name === START_NODE;
-    const dwell = isStart ? null : (dwellOf(fsm, name) ?? 0);
+    const dwell = isStart ? null : (scope.dwell.get(name) ?? 0);
     const color = isStart ? 'var(--text-muted)' : colorFor(name);
     const node = svgEl('g', { style: 'cursor:pointer' });
     node.append(
@@ -433,7 +676,7 @@ function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
           ? ['起始：该状态机的第一条记录（还没有前驱状态）', fsm.name]
           : [
               `状态 ${name}`,
-              `驻留 ${fmtInt(dwell ?? 0)} 周期`,
+              `${dwellLabel} ${fmtInt(dwell ?? 0)} 周期`,
               `来自 ${edges.filter((e) => e.to === name).reduce((sum, e) => sum + e.count, 0)} 次跳转`,
               `离开 ${edges.filter((e) => e.from === name).reduce((sum, e) => sum + e.count, 0)} 次`,
               '点击查看该状态的详情',
@@ -445,7 +688,7 @@ function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
               ['状态机', fsm.name],
               ['时钟域', fsm.domain],
               ['驻留周期', fmtInt(dwell ?? 0)],
-              ['占比', `${(((dwell ?? 0) / Math.max(1, totalDwell(fsm))) * 100).toFixed(2)}%`],
+              ['占比', `${(((dwell ?? 0) / Math.max(1, scope.dwellTotal)) * 100).toFixed(2)}%`],
             ]),
     );
     nodeLayer.append(node);
@@ -458,7 +701,7 @@ function transitionGraph(fsm: FsmTrack, ctx: ViewContext): HTMLElement {
       { label: '低', color: frequencyColor(0.25) },
       { label: '中', color: frequencyColor(0.6) },
       { label: '高', color: frequencyColor(1) },
-      { label: `${fmtInt(total)} 次跳转`, color: 'transparent' },
+      { label: `${fmtInt(totalLabel)} 次跳转${filtered ? '（区间内）' : ''}`, color: 'transparent' },
     ]),
   );
   return wrap;
@@ -470,10 +713,23 @@ const BAND_LABEL_WIDTH = 132;
 const BAND_HEIGHT = 15;
 const BAND_ROW_HEIGHT = 22;
 
-function stateBands(fsms: FsmTrack[], ctx: ViewContext, state: FsmState): HTMLElement {
+/**
+ * 状态时序色带：一台状态机一行，底色 = 状态。
+ *
+ * 横轴：区间筛选时用标记区间（只画这一段，区间外的东西根本不出现，免得被当成统计进来的数据），
+ * 未筛选时沿用"首末记录覆盖的范围"。段的来源是 `scope.segments`：未筛选时它与轨道上的
+ * `stateSegments` 是同一份，筛选时已经按区间裁剪过。
+ */
+function stateBands(scopes: FsmScope[], ctx: ViewContext, state: FsmState): HTMLElement {
   let from = Number.POSITIVE_INFINITY;
   let to = 0;
-  for (const fsm of fsms) {
+  for (const scope of scopes) {
+    if (scope.range !== null) {
+      from = Math.min(from, scope.range.from);
+      to = Math.max(to, scope.range.to);
+      continue;
+    }
+    const fsm = scope.fsm;
     const first = fsm.samples[0]?.pos.cycle;
     const last = fsm.samples[fsm.samples.length - 1]?.pos.cycle;
     if (first !== undefined && first < from) from = first;
@@ -484,12 +740,13 @@ function stateBands(fsms: FsmTrack[], ctx: ViewContext, state: FsmState): HTMLEl
   const plotWidth = Math.max(320, Math.min(1000, span * 6));
   const width = BAND_LABEL_WIDTH + plotWidth + 8;
   const axisHeight = 20;
-  const height = fsms.length * BAND_ROW_HEIGHT + axisHeight;
+  const height = scopes.length * BAND_ROW_HEIGHT + axisHeight;
   const svg = svgRoot(width, height);
   const x = linearScale(from, to + 1, BAND_LABEL_WIDTH, BAND_LABEL_WIDTH + plotWidth);
   const truncated: string[] = [];
 
-  for (const [index, fsm] of fsms.entries()) {
+  for (const [index, scope] of scopes.entries()) {
+    const fsm = scope.fsm;
     const y = index * BAND_ROW_HEIGHT;
     const group = svgEl('g');
     group.append(
@@ -501,7 +758,7 @@ function stateBands(fsms: FsmTrack[], ctx: ViewContext, state: FsmState): HTMLEl
         text: fsm.name,
       }),
     );
-    const segments = stateSegments(fsm);
+    const segments = scope.segments;
     const drawable = segments.length > MAX_SEGMENTS ? segments.slice(0, MAX_SEGMENTS) : segments;
     if (drawable.length < segments.length) truncated.push(fsm.name);
     for (const segment of drawable) {
@@ -550,7 +807,7 @@ function stateBands(fsms: FsmTrack[], ctx: ViewContext, state: FsmState): HTMLEl
     });
   }
 
-  const axisY = fsms.length * BAND_ROW_HEIGHT;
+  const axisY = scopes.length * BAND_ROW_HEIGHT;
   svg.append(
     svgEl('line', { x1: BAND_LABEL_WIDTH, x2: BAND_LABEL_WIDTH + plotWidth, y1: axisY, y2: axisY, class: 'grid-line' }),
     svgEl('text', {
@@ -586,49 +843,107 @@ function selectFsm(ctx: ViewContext, fsm: FsmTrack, title: string, rows: [string
 
 // ------------------------------------------------------------------ 挂载
 
-function renderFsm(state: FsmState): void {
-  const { container, ctx } = state;
-  container.replaceChildren();
-  state.highlights = [];
-
-  const fsms = visibleFsms(ctx);
-  if (fsms.length === 0) {
+/** 概览 + 每台状态机一张卡片；数据（`scopes`）已经算完，DOM 一次建好、一次替换 */
+function buildContent(scopes: FsmScope[], range: MarkerRange | null, ctx: ViewContext, state: FsmState): Node[] {
+  if (scopes.length === 0) {
     const empty = card('状态机', '没有可显示的状态机');
     empty.body.append(emptyState(ctx.trace.fsms.size === 0 ? '这份轨迹没有 fsm 记录' : '当前时钟域筛选下没有状态机'));
-    container.append(empty.root);
-    return;
+    return [empty.root];
   }
 
   const allStates = new Set<string>();
+  let stateSlots = 0;
   let transitions = 0;
   let loops = 0;
   let dwell = 0;
-  for (const fsm of fsms) {
-    for (const name of fsm.stateSet) allStates.add(name);
-    transitions += fsm.transitions.length;
-    loops += selfLoops(fsm);
-    dwell += totalDwell(fsm);
+  let records = 0;
+  for (const scope of scopes) {
+    const inRange = scope.range !== null;
+    // 区间口径下"状态数"只数区间里真的出现过的状态（全量口径仍用轨道上的状态集合）
+    for (const name of inRange ? scope.dwell.keys() : scope.fsm.stateSet) allStates.add(name);
+    stateSlots += inRange ? scope.dwell.size : scope.fsm.stateSet.length;
+    transitions += scope.transitions.length;
+    loops += scope.selfLoops;
+    dwell += scope.dwellTotal;
+    records += scope.samples;
   }
 
   // ---------------------------------------------------------------- 概览
-  const overview = card('状态机概览', '状态是保持型的：驻留周期 = 相邻两条记录的周期差之和（spec §9.5）');
+  // 数字全部取自 `scopes`：区间口径是"这一段里的"，没有标记时就是改动前的全量数字
+  const rangeNote =
+    range === null ? '' : ` · 已按标记区间裁剪：${range.domain} 周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}`;
+  const overview = card('状态机概览', `状态是保持型的：驻留周期 = 相邻两条记录的周期差之和（spec §9.5）${rangeNote}`);
   overview.body.append(
     el('div', { class: 'stat-row' }, [
-      statTile('状态机', countLabel(fsms.length), [...new Set(fsms.map((fsm) => fsm.domain))].join(' · ')),
-      statTile('状态数', countLabel(allStates.size), `合计 ${fmtInt(fsms.reduce((sum, fsm) => sum + fsm.stateSet.length, 0))} 个（含重复）`),
-      statTile('跳转', countLabel(transitions), `${fmtInt(fsms.reduce((sum, fsm) => sum + fsm.samples.length, 0))} 条状态记录`),
+      statTile('状态机', countLabel(scopes.length), [...new Set(scopes.map((scope) => scope.fsm.domain))].join(' · ')),
+      statTile(
+        '状态数',
+        countLabel(allStates.size),
+        `合计 ${fmtInt(stateSlots)} 个（含重复${range === null ? '' : '，区间内'}）`,
+      ),
+      statTile(
+        '跳转',
+        countLabel(transitions),
+        `${fmtInt(records)} 条状态记录${range === null ? '' : '（区间内）'}`,
+      ),
       statTile('自环', countLabel(loops), loops > 0 ? '同一状态连续两次上报' : '没有自环'),
-      statTile('总驻留', countLabel(dwell), '所有状态机之和（周期）'),
+      statTile(
+        '总驻留',
+        countLabel(dwell),
+        range === null ? '所有状态机之和（周期）' : '标记区间内之和（域不匹配的状态机仍为全量）',
+      ),
     ]),
   );
-  container.append(overview.root);
 
   // ---------------------------------------------------------------- 每台状态机各自的占用
   // 不把不同状态机塞进同一张表：每台状态机的状态集合、驻留口径与峰值都不同，
   // 合并后大多数格子会是空的，也看不出"某个模块各状态占了多少周期"。
-  for (const fsm of fsms) container.append(fsmCard(fsm, ctx, state));
+  return [overview.root, ...scopes.map((scope) => fsmCard(scope, range, ctx, state))];
+}
 
+/**
+ * 重算并整份替换统计内容。
+ *
+ * 为什么只在提交时重算：时间轴只在**松手**时提交标记位置（`MarkerBus.move` 只在松手时调用），
+ * 订阅回调因此天然不会在拖拽过程中触发 —— 否则每移动一像素都要把整份状态机统计重算一遍。
+ * 为什么先让出一帧：好让"计算中…"真的被画出来，不然同步的准备阶段会把它一起压后。
+ * 为什么先算完再换 DOM：中途的产物不上屏，免得看到"一半旧数据、一半新数据"的卡片。
+ */
+async function recompute(state: FsmState): Promise<void> {
+  const { ctx } = state;
+  const fsms = visibleFsms(ctx);
+  const range = ctx.markers.range();
+
+  // 上一轮还没算完就作废：否则它的产物可能盖掉这一轮
+  state.token?.abort();
+  const token = abortable();
+  state.token = token;
+
+  const busy = el('span', { class: 'chip', text: '计算中…' });
+  state.chips.replaceChildren(...scopeChips(range, fsms), busy);
+  await nextFrame();
+
+  const scopes = await buildScopes(fsms, range, token.signal, (done, total) => {
+    busy.textContent = total > 0 ? `计算中… ${Math.round((done / total) * 100)}%` : '计算中…';
+  });
+  // 被取消（卸载，或更新的一轮已经接管）：这一轮的产物整个丢掉，DOM 留给接管者
+  if (scopes === null || state.token !== token) return;
+  state.token = null;
+
+  state.highlights = [];
+  state.body.replaceChildren(...buildContent(scopes, range, ctx, state));
+  state.chips.replaceChildren(...scopeChips(range, fsms));
   applySelection(state);
+}
+
+/** 退订 + 取消还没算完的这一轮（卸载、重新挂载时用） */
+function dispose(state: FsmState): void {
+  state.unsubscribe?.();
+  state.unsubscribeMarkers?.();
+  state.unsubscribe = null;
+  state.unsubscribeMarkers = null;
+  state.token?.abort();
+  state.token = null;
 }
 
 function applySelection(state: FsmState): void {
@@ -642,11 +957,27 @@ function applySelection(state: FsmState): void {
 }
 
 function mountView(container: HTMLElement, ctx: ViewContext): void {
-  active?.unsubscribe?.();
-  const state: FsmState = { container, ctx, highlights: [], unsubscribe: null, selectedKey: null };
-  renderFsm(state);
+  if (active !== null) dispose(active);
+  const chips = el('div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap' });
+  // 卡片挂在 `body` 里而不是直接挂在容器下，所以间距得自己给（容器的 `.view` 有 gap: 16px）
+  const body = el('div', { style: 'display:flex;flex-direction:column;gap:16px' });
+  container.replaceChildren(chips, body);
+  const state: FsmState = {
+    container,
+    ctx,
+    highlights: [],
+    unsubscribe: null,
+    unsubscribeMarkers: null,
+    token: null,
+    chips,
+    body,
+    selectedKey: null,
+  };
+  // 先订阅再首算：算的过程中提交了标记也不会漏（新一轮会取消上一轮的令牌）
+  state.unsubscribeMarkers = ctx.markers.subscribe(() => void recompute(state));
   state.unsubscribe = ctx.selection.subscribe(() => applySelection(state));
   active = state;
+  void recompute(state);
 }
 
 export const fsmView: View = {
@@ -666,7 +997,7 @@ export const fsmView: View = {
     applySelection(active);
   },
   unmount() {
-    active?.unsubscribe?.();
+    if (active !== null) dispose(active);
     active = null;
   },
 };

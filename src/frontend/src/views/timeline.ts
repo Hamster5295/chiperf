@@ -35,6 +35,7 @@ import {
   type FsmTrack,
 } from '../../../parser/src/index.ts';
 import { abortable, runChunked } from '../chunk.ts';
+import { MAX_MARKERS } from '../markers.ts';
 import {
   axisTicks,
   card,
@@ -337,6 +338,112 @@ let unsub: (() => void) | null = null;
 let registry: Registry | null = null;
 let hoverSel: Selection = null;
 let lastHoverKey = '';
+/**
+ * 标记层：两条竖线 + 顶部手柄 + 中间区间的浅色底。
+ *
+ * 画在**最上层**（追加在行与选中覆盖层之后），整块绘图区高度，方便抓住。
+ * 拖拽期间只动视觉（改 x 与文字），**松手时才提交**给 `ctx.markers` ——
+ * 提交会触发流水线/状态机重算统计，每移动一像素都提交的话必然卡。
+ */
+function installMarkers(svg: SVGSVGElement, reg: Registry, ctx: ViewContext): void {
+  const layer = svgEl('g', {});
+  const shade = svgEl('rect', { fill: 'var(--warn)', 'fill-opacity': 0.07, display: 'none', 'pointer-events': 'none' });
+  layer.append(shade);
+  const lines: { line: SVGLineElement; handle: SVGRectElement; label: SVGTextElement; hit: SVGRectElement }[] = [];
+  for (let index = 0; index < MAX_MARKERS; index++) {
+    const line = svgEl('line', { y1: reg.plot.top, y2: reg.plot.bottom, stroke: 'var(--warn)', 'stroke-width': 1.5, 'pointer-events': 'none', display: 'none' });
+    const handle = svgEl('rect', { y: reg.plot.top - 2, width: 7, height: 7, rx: 1.5, fill: 'var(--warn)', 'pointer-events': 'none', display: 'none' });
+    const label = svgEl('text', { class: 'axis-label', 'text-anchor': 'middle', y: reg.plot.top - 6, 'pointer-events': 'none', display: 'none' });
+    // 命中区比线宽得多：1.5px 的线几乎抓不住
+    const hit = svgEl('rect', { y: reg.plot.top, width: 11, height: Math.max(1, reg.plot.bottom - reg.plot.top), fill: 'transparent', style: 'pointer-events:all;cursor:col-resize', display: 'none' });
+    lines.push({ line, handle, label, hit });
+    layer.append(line, handle, label, hit);
+  }
+  svg.append(layer);
+
+  const paint = (): void => {
+    const markers = ctx.markers.list();
+    for (const [index, parts] of lines.entries()) {
+      const marker = markers[index];
+      if (marker === undefined) {
+        for (const node of [parts.line, parts.handle, parts.label, parts.hit]) node.setAttribute('display', 'none');
+        continue;
+      }
+      const x = clamp(reg.plot.scale(marker.cycle), reg.plot.x0, reg.plot.x1);
+      parts.line.setAttribute('x1', String(x));
+      parts.line.setAttribute('x2', String(x));
+      parts.handle.setAttribute('x', String(x - 3.5));
+      parts.label.setAttribute('x', String(x));
+      parts.label.setAttribute('fill', 'var(--warn)');
+      parts.label.textContent = `标记 ${marker.cycle}`;
+      parts.hit.setAttribute('x', String(x - 5.5));
+      for (const node of [parts.line, parts.handle, parts.label, parts.hit]) node.setAttribute('display', '');
+    }
+    const range = ctx.markers.range();
+    if (range === null || markers.length < MAX_MARKERS) {
+      shade.setAttribute('display', 'none');
+      return;
+    }
+    const left = clamp(reg.plot.scale(range.from), reg.plot.x0, reg.plot.x1);
+    const right = clamp(reg.plot.scale(range.to), reg.plot.x0, reg.plot.x1);
+    shade.setAttribute('x', String(left));
+    shade.setAttribute('width', String(Math.max(1, right - left)));
+    shade.setAttribute('y', String(reg.plot.top));
+    shade.setAttribute('height', String(Math.max(1, reg.plot.bottom - reg.plot.top)));
+    shade.setAttribute('display', '');
+  };
+  paint();
+  markerUnsub?.();
+  markerUnsub = ctx.markers.subscribe(paint);
+
+  for (const [index, parts] of lines.entries()) {
+    parts.hit.addEventListener('mousedown', (event) => {
+      const me = event as MouseEvent;
+      if (me.button !== 0) return;
+      me.stopPropagation(); // 别让"拖拽缩放"接手
+      me.preventDefault();
+      const move = (moveEvent: MouseEvent): void => {
+        const cycle = cycleAtClientX(moveEvent.clientX);
+        if (cycle === null) return;
+        // 拖拽只动视觉，不动状态
+        const x = clamp(reg.plot.scale(cycle), reg.plot.x0, reg.plot.x1);
+        parts.line.setAttribute('x1', String(x));
+        parts.line.setAttribute('x2', String(x));
+        parts.handle.setAttribute('x', String(x - 3.5));
+        parts.label.setAttribute('x', String(x));
+        parts.label.textContent = `标记 ${cycle}`;
+        parts.hit.setAttribute('x', String(x - 5.5));
+      };
+      const up = (upEvent: MouseEvent): void => {
+        document.removeEventListener('mousemove', move, true);
+        document.removeEventListener('mouseup', up, true);
+        const cycle = cycleAtClientX(upEvent.clientX);
+        if (cycle !== null) ctx.markers.move(index, cycle); // 松手才提交 ⇒ 只重算一次
+        else paint();
+      };
+      document.addEventListener('mousemove', move, true);
+      document.addEventListener('mouseup', up, true);
+    });
+    parts.hit.addEventListener('contextmenu', (event) => {
+      const me = event as MouseEvent;
+      me.preventDefault();
+      me.stopPropagation();
+      openRowMenu(me.clientX, me.clientY, [
+        {
+          title: `标记 ${ctx.markers.list()[index]?.cycle ?? ''}`,
+          items: [
+            { label: '删除这个标记', checked: false, pick: () => ctx.markers.remove(index) },
+            { label: '删除全部标记', checked: false, pick: () => ctx.markers.clear() },
+          ],
+        },
+      ]);
+    });
+  }
+}
+
+/** 标记变化时的重画（每个视图实例一份订阅） */
+let markerUnsub: (() => void) | null = null;
+
 /** 上一次量到的滚动容器宽度（px）：重建时旧容器已摘除，用它保持「适应宽度」稳定 */
 let chartAvail = 0;
 /** 上一次量到的视图容器宽度（px）：ResizeObserver 用它判断是否真的变宽/变窄 */
@@ -729,6 +836,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   installWheelZoom(scroll);
   installDragZoom(svg);
+  installMarkers(svg, reg, ctx);
   scrollEl = scroll;
   registry = reg;
   chartAvail = scroll.clientWidth;
@@ -2016,8 +2124,58 @@ function installRowMenu(node: HTMLElement | SVGElement, row: LaneRow): void {
     me.preventDefault();
     // 右键未选中的行 → 选择收窄到它；右键选中的行 → 菜单作用于整批
     if (!selectedRows.has(row.key)) selectRow(row, 'only');
-    openRowMenu(me.clientX, me.clientY, menuSectionsFor(row));
+    openRowMenu(me.clientX, me.clientY, [...menuSectionsFor(row), ...markerMenuSections(me, row)]);
   });
+}
+
+/**
+ * 波形里右键时追加的「标记」一节。
+ *
+ * 标记是**周期**上的两个点：右键处落在哪一行，就用那一行的域与指针所在的周期。
+ * 最多两个；已经有两个时给"删除全部"，免得再点一次却什么都没发生。
+ */
+function markerMenuSections(event: MouseEvent, row: LaneRow): MenuSection[] {
+  const ctx = ctxRef;
+  const reg = registry;
+  if (!ctx || !reg) return [];
+  const cycle = cycleAtClientX(event.clientX);
+  if (cycle === null) return [];
+  const current = ctx.markers.list();
+  const items: MenuSection['items'] = [];
+  if (current.length < MAX_MARKERS) {
+    items.push({
+      label: `在此处加标记（周期 ${cycle}，已有 ${current.length}/${MAX_MARKERS}）`,
+      checked: false,
+      pick: () => {
+        ctx.markers.add({ domain: row.domain, cycle });
+      },
+    });
+  }
+  if (current.length > 0) {
+    items.push({
+      label: `删除全部标记（现有 ${current.length} 个）`,
+      checked: false,
+      pick: () => ctx.markers.clear(),
+    });
+  }
+  const range = ctx.markers.range();
+  return [
+    {
+      title: range === null ? `标记（${current.length}/${MAX_MARKERS}）` : `标记：${range.domain} 周期 ${range.from} – ${range.to}`,
+      items,
+    },
+  ];
+}
+
+/** 客户端 x 落在哪个周期上（越界夹到可视区间；不在绘图区内返回 null） */
+function cycleAtClientX(clientX: number): number | null {
+  const reg = registry;
+  if (!reg) return null;
+  const box = reg.svg.getBoundingClientRect();
+  if (box.width === 0) return null;
+  const userX = (clientX - box.left) * (reg.plot.width / box.width);
+  if (userX < reg.plot.x0 - 2 || userX > reg.plot.x1 + 2) return null;
+  return clamp(Math.round(reg.plot.scale.invert(clamp(userX, reg.plot.x0, reg.plot.x1))), reg.plot.from, reg.plot.to);
 }
 
 // 系统主题切换会换掉整套 CSS 变量：底色缓存作废，重画一次
@@ -2584,6 +2742,8 @@ export const timelineView: View = {
   unmount() {
     unsub?.();
     unsub = null;
+    markerUnsub?.();
+    markerUnsub = null;
     paintToken?.abort();
     paintToken = null;
     resizeObs?.disconnect();

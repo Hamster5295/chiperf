@@ -13,6 +13,8 @@ export type Selection =
   | { kind: 'record'; seq: number }
   | null;
 
+import type { MarkerBus } from './markers.ts';
+
 export interface SelectionBus {
   get(): Selection;
   set(selection: Selection): void;
@@ -28,6 +30,8 @@ export interface ViewContext {
   /** 全局筛选/选项（如"仅显示某域"），视图读取后自行应用 */
   options: AppOptions;
   selection: SelectionBus;
+  /** 波形上的标记（最多两个）：两个标记之间的区间就是流水线/状态机统计的范围 */
+  markers: MarkerBus;
   /** 请求重新挂载全部视图（数据变化时） */
   rerender(): void;
   /** 打开一个临时详情面板（右侧抽屉） */

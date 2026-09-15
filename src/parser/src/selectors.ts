@@ -5,12 +5,13 @@
  */
 import type {
   CounterTrack,
-  Trace,
   DomainInfo,
   FsmTrack,
   Phase,
+  PipelineItem,
   Position,
   ScalarValue,
+  Trace,
   TrackInfo,
   ValueTrack,
 } from './types.ts';
@@ -196,8 +197,31 @@ export function describeSamples(xs: readonly number[]): Distribution {
 }
 
 /** 延迟统计（同域完成条目，spec §9.4） */
-export function latencyStats(track: TrackInfo): Distribution {
-  return describeSamples(track.latencies);
+/**
+ * 与闭区间 `[from, to]`（周期）**相交**的条目 —— 即"这段区间里在这一级在飞过"的那些。
+ *
+ * 用于视图上的区间统计（在波形上打两个标记，只看两标记之间的数据）：
+ * 跨越边界、但确实在这段区间里待过的条目**算进来**，完全在区间外的**不算**
+ * （"不统计其他地方"）。
+ */
+export function itemsWithin(track: TrackInfo, from: number, to: number): PipelineItem[] {
+  return track.items.filter((item) => {
+    const end = item.closeAnchorCycle ?? track.lastCycle;
+    return item.enter.cycle <= to && end >= from;
+  });
+}
+
+/**
+ * 条目的驻留分布（周期）。给了 `range` 就只统计**与区间相交**的条目，
+ * 口径与 `itemsWithin` 一致；不给则统计全部已结束条目（等价于今天的行为）。
+ */
+export function latencyStats(track: TrackInfo, range?: { from: number; to: number }): Distribution {
+  if (range === undefined) return describeSamples(track.latencies);
+  const values: number[] = [];
+  for (const item of itemsWithin(track, range.from, range.to)) {
+    if (item.latencyCycles !== null) values.push(item.latencyCycles);
+  }
+  return describeSamples(values);
 }
 
 /**
@@ -207,8 +231,16 @@ export function latencyStats(track: TrackInfo): Distribution {
  * 而不是"一共有多少个气泡周期"——后者是 `bubbles.length`，两者不重复：
  * 10 个周期可能是"10 段各 1 拍"，也可能是"1 段 10 拍"。
  */
-export function bubbleStats(track: TrackInfo): Distribution {
-  return describeSamples(track.bubbleRanges.map((range) => range.end - range.start + 1));
+export function bubbleStats(track: TrackInfo, range?: { from: number; to: number }): Distribution {
+  if (range === undefined) return describeSamples(track.bubbleRanges.map((bubble) => bubble.end - bubble.start + 1));
+  // 跨边界的段只算**落在区间里的那部分**：区间外的不统计，也不因为跨界而整段丢掉
+  const lengths: number[] = [];
+  for (const bubble of track.bubbleRanges) {
+    const from = Math.max(bubble.start, range.from);
+    const to = Math.min(bubble.end, range.to);
+    if (to >= from) lengths.push(to - from + 1);
+  }
+  return describeSamples(lengths);
 }
 export function ratioBetween(num: CounterTrack, den: CounterTrack, c1: number, c2: number): number | null {
   const n = counterDeltaBetween(num, c1, c2);

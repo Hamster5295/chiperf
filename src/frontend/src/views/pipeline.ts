@@ -11,10 +11,16 @@
  *
  * 其余内容（气泡区间列表、逐周期占用度曲线、跨域表、条目明细）已按要求移除；
  * 逐周期与逐条目的细节在时间轴视图里看。
+ *
+ * **统计范围**：波形上打了两个同域标记时（`ctx.markers.range()`），本视图的统计只算
+ * 两个标记之间（闭区间）的数据；标记只在**松手提交**时通知，所以拖拽期间不会反复重算。
+ * 不在标记所在域的流水级保持全量统计 —— 周期号跨域不可比 —— 并在卡片上明确写出来。
  */
 import type { TrackInfo } from '../../../parser/src/index.ts';
-import { bubbleStats, latencyStats, type Distribution } from '../../../parser/src/index.ts';
+import { bubbleStats, itemsWithin, latencyStats, type Distribution } from '../../../parser/src/index.ts';
 import { card, countLabel, el, emptyState, hoverTarget, statTile, svgEl, svgRoot } from '../charts.ts';
+import { abortable, runChunked } from '../chunk.ts';
+import type { Marker, MarkerRange } from '../markers.ts';
 import { fmtInt, type Selection, type View, type ViewContext } from '../view.ts';
 
 // ------------------------------------------------------------------ 状态
@@ -29,6 +35,10 @@ interface PipelineState {
   ctx: ViewContext;
   highlights: StageHighlight[];
   unsubscribe: (() => void) | null;
+  /** 标记订阅：标记只在**松手提交**时通知（见 markers.ts），所以拖拽期间不会触发重算 */
+  markerUnsub: (() => void) | null;
+  /** 正在进行的一轮分片重算；新一轮开始或卸载时取消掉它，避免旧结果覆盖新结果 */
+  compute: { signal: AbortSignal; abort: () => void } | null;
 }
 
 let active: PipelineState | null = null;
@@ -39,6 +49,154 @@ function visibleTracks(ctx: ViewContext): TrackInfo[] {
   const shown = domains.length === 0 ? tracks : tracks.filter((track) => domains.includes(track.domain));
   // 按首次出现的周期排：流水级顺序（IF → ID → EX …）就是数据里出现的顺序
   return [...shown].sort((a, b) => a.firstCycle - b.firstCycle || a.name.localeCompare(b.name));
+}
+
+// ------------------------------------------------------------------ 统计范围（标记区间）
+
+/** 该级实际生效的统计区间（闭区间）；`null` = 全量 */
+interface TrackRange {
+  from: number;
+  to: number;
+}
+
+/**
+ * 这一级该按哪个区间统计。
+ *
+ * 只有**标记所在域**的流水级才受区间约束：别的域的周期号和它不可比（spec §6.5），
+ * 拿区间硬套只会得到"这段里一个周期都没有"这种没意义的数字 —— 所以那些级保持全量，
+ * 卡片上会明确写出"不在标记所在域，未按标记筛选"。
+ */
+function effectiveRange(track: TrackInfo, range: MarkerRange | null): TrackRange | null {
+  if (range === null || range.domain !== track.domain) return null;
+  return { from: range.from, to: range.to };
+}
+
+/**
+ * 一级流水在某个统计范围下的全部数字。
+ *
+ * 为什么要一次算完：概览块与每级卡片用的是同一批数（算两遍纯属浪费），
+ * 而且分片重算时要让"算"与"画"在同一片里完成，页面上才不会出现半算完的卡片。
+ *
+ * `range === null`（没打标记 / 这一级不在标记所在域）时，**每个字段都走改动前的原路径**
+ * （`track.closed`、`track.bubbles`、`latencyStats(track)`…），所以"没有标记 ⇒ 数字一个都不变"
+ * 是结构上成立的，而不是靠两套公式凑巧相等。
+ */
+interface StageNumbers {
+  /** 是否真的按标记区间筛过（false = 这一级仍是全量） */
+  filtered: boolean;
+  /** 统计覆盖的周期数 */
+  cycles: number;
+  /** 空泡周期数 */
+  bubbleCycles: number;
+  /** 区间内第一个气泡周期（点图例跳转用）；没有气泡时为 null */
+  firstBubble: number | null;
+  items: number;
+  closed: number;
+  open: number;
+  crossDomain: number;
+  /** 最长气泡段（区间生效时是**落在区间里的那一段**） */
+  widest: { start: number; end: number; length: number } | null;
+  latency: Distribution;
+  bubbleDist: Distribution;
+}
+
+function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers {
+  let widest: StageNumbers['widest'] = null;
+
+  if (range === null) {
+    // 全量：与改动前逐字一致
+    let crossDomain = 0;
+    for (const item of track.items) if (item.crossDomain) crossDomain += 1;
+    for (const bubble of track.bubbleRanges) {
+      const length = bubble.end - bubble.start + 1;
+      if (widest === null || length > widest.length) widest = { start: bubble.start, end: bubble.end, length };
+    }
+    return {
+      filtered: false,
+      cycles: Math.max(0, track.lastCycle - track.firstCycle + 1),
+      bubbleCycles: track.bubbles.length,
+      firstBubble: track.bubbles[0] ?? null,
+      items: track.items.length,
+      closed: track.closed,
+      open: track.open,
+      crossDomain,
+      widest,
+      latency: latencyStats(track),
+      bubbleDist: bubbleStats(track),
+    };
+  }
+
+  // 周期：区间与本级活跃范围的交集（不相交 ⇒ 0 个周期，占用率自然显示 "—"，不会除零）
+  const from = Math.max(track.firstCycle, range.from);
+  const to = Math.min(track.lastCycle, range.to);
+  const cycles = to >= from ? to - from + 1 : 0;
+
+  // 气泡：跨边界的段只算**落在区间里的那部分**（与解析器 bubbleStats 同一口径），
+  // 否则"区间内有 1 个空泡周期"却会计出 10 个周期长的段
+  let bubbleCycles = 0;
+  let firstBubble: number | null = null;
+  for (const bubble of track.bubbleRanges) {
+    const start = Math.max(bubble.start, range.from);
+    const end = Math.min(bubble.end, range.to);
+    if (end < start) continue;
+    const length = end - start + 1;
+    if (firstBubble === null) firstBubble = start;
+    bubbleCycles += length;
+    if (widest === null || length > widest.length) widest = { start, end, length };
+  }
+
+  // 条目：与区间**相交**的算进来（跨边界、但确实在这段里飞过的也算，口径见解析器 itemsWithin）
+  const within = itemsWithin(track, range.from, range.to);
+  let closed = 0;
+  let open = 0;
+  let crossDomain = 0;
+  for (const item of within) {
+    if (item.close === null) open += 1;
+    else closed += 1;
+    if (item.crossDomain) crossDomain += 1;
+  }
+
+  return {
+    filtered: true,
+    cycles,
+    bubbleCycles,
+    firstBubble,
+    items: within.length,
+    closed,
+    open,
+    crossDomain,
+    widest,
+    latency: latencyStats(track, range),
+    bubbleDist: bubbleStats(track, range),
+  };
+}
+
+/**
+ * 顶部的范围说明 —— 任何时刻页面上都要写清楚"这批数字统计的是哪一段"。
+ * 只打了一个标记、或两个标记落在不同域时都算没有区间（`range()` 返回 null），
+ * 这时顺带说清楚原因，免得用户以为筛选坏了。
+ */
+function scopeChip(markers: Marker[], range: MarkerRange | null): HTMLElement {
+  if (range !== null) {
+    return el('span', { class: 'chip chip-ok', text: `标记区间：${range.domain} 周期 ${range.from} – ${range.to}（只统计这一段）` });
+  }
+  if (markers.length === 0) return el('span', { class: 'chip', text: '未打标记：统计全量' });
+  if (markers.length === 1) {
+    const only = markers[0]!;
+    return el('span', { class: 'chip', text: `只有 1 个标记（${only.domain} 周期 ${only.cycle}）：再打一个才有区间，当前统计全量` });
+  }
+  return el('span', { class: 'chip chip-warn', text: '两个标记不在同一时钟域：周期不可比，统计全量' });
+}
+
+/** 卡片上的范围说明：让用户一眼看出这一级被筛了没有 */
+function stageScopeChip(stats: StageNumbers, range: MarkerRange): HTMLElement {
+  if (!stats.filtered) {
+    return el('span', { class: 'chip chip-warn', text: `不在标记所在域（${range.domain}）：该级未按标记筛选` });
+  }
+  return el('span', {
+    class: 'chip chip-ok',
+    text: `标记区间：周期 ${range.from} – ${range.to}（本级只统计这一段：${countLabel(stats.cycles)} 周期 · ${countLabel(stats.items)} 条目）`,
+  });
 }
 
 // ------------------------------------------------------------------ 配色
@@ -143,10 +301,16 @@ function pieLegend(items: { label: string; value: number; color: string; total: 
   );
 }
 
-function occupancyMetric(track: TrackInfo, ctx: ViewContext): HTMLElement {
-  const cycles = Math.max(0, track.lastCycle - track.firstCycle + 1);
-  const bubbles = track.bubbles.length;
-  const occupied = Math.max(0, cycles - bubbles);
+/**
+ * 占用 vs 空泡 —— **按周期数**的饼图。
+ *
+ * 占用度是半开区间 `[enter, close)`，活跃窗口内每个周期非"有内容"即"空泡"，
+ * 所以两张切片的周期数直接相加就是分母；区间生效时分子分母都只算区间内的周期
+ * （"这段区间里有内容的周期数 ÷ 这段区间的周期数"）。
+ */
+function occupancyMetric(track: TrackInfo, stats: StageNumbers, ctx: ViewContext): HTMLElement {
+  const bubbles = stats.bubbleCycles;
+  const occupied = Math.max(0, stats.cycles - bubbles);
   const total = occupied + bubbles;
   const wrap = el('div', { class: 'metric-flex' });
   const ratio = total > 0 ? occupied / total : 0;
@@ -164,9 +328,10 @@ function occupancyMetric(track: TrackInfo, ctx: ViewContext): HTMLElement {
     { label: '有内容', value: occupied, color: OCCUPIED_COLOR, total },
     { label: '空泡', value: bubbles, color: BUBBLE_COLOR, total },
   ]);
-  // 点空泡那一项：把该级第一个气泡周期广播出去（时间轴/其它视图跟着定位）
-  const firstBubble = track.bubbles[0];
-  if (firstBubble !== undefined) {
+  // 点空泡那一项：把该级第一个气泡周期广播出去（时间轴/其它视图跟着定位）。
+  // 区间生效时跳的是**区间内的第一个**气泡，而不是整条轨道上的第一个。
+  const firstBubble = stats.firstBubble;
+  if (firstBubble !== null) {
     const bubbleItem = [...legend.children][1] as HTMLElement | undefined;
     if (bubbleItem) {
       bubbleItem.style.cursor = 'pointer';
@@ -249,49 +414,75 @@ function metric(title: string, hint: string, body: Node[]): HTMLElement {
 
 // ------------------------------------------------------------------ 每级一张大方框
 
-function stageCard(track: TrackInfo, state: PipelineState): HTMLElement {
-  const stats = latencyStats(track);
+/**
+ * 每级一张大方框。
+ *
+ * 卡片里的饼图与两个分布全部按 `stats` 出数：`range` 为 null 时 `stats` 就是全量口径，
+ * 这一段的 DOM 与改动前完全一致；有标记区间时，同一批数字换成区间口径。
+ */
+function stageCard(
+  track: TrackInfo,
+  stats: StageNumbers,
+  range: MarkerRange | null,
+  ctx: ViewContext,
+  highlights: StageHighlight[],
+): HTMLElement {
   const cycles = Math.max(0, track.lastCycle - track.firstCycle + 1);
   const node = card(
     track.name,
+    // 副标题说的是**这条轨道本身**（覆盖范围与条目总数），与统计范围无关，所以不随标记改变
     `域 ${track.domain} · 周期 ${track.firstCycle}–${track.lastCycle}（${countLabel(cycles)} 周期）· ${countLabel(track.items.length)} 条目`,
   );
-  const bubbles = bubbleStats(track);
+  const latency = stats.latency;
+  const bubbleDist = stats.bubbleDist;
+  if (range !== null) node.body.append(el('div', { class: 'row' }, [stageScopeChip(stats, range)]));
   node.body.append(
     el('div', { class: 'stage-grid' }, [
-      metric('占用 vs 空泡', `${countLabel(track.bubbles.length)} 个气泡周期`, [occupancyMetric(track, state.ctx)]),
+      metric(
+        '占用 vs 空泡',
+        `${countLabel(stats.bubbleCycles)} 个气泡周期${stats.filtered ? '（标记区间内）' : ''}`,
+        [occupancyMetric(track, stats, ctx)],
+      ),
       metric(
         '延迟分布',
-        stats.count === 0 ? '没有已结束条目' : `同域已结束 ${fmtInt(stats.count)} 条 · 按次数取前 10`,
+        latency.count === 0
+          ? stats.filtered
+            ? '标记区间内没有已结束条目'
+            : '没有已结束条目'
+          : `同域已结束 ${fmtInt(latency.count)} 条${stats.filtered ? '（标记区间内）' : ''} · 按次数取前 10`,
         [
-          distributionList(stats, {
+          distributionList(latency, {
             unit: '周期',
-            empty: '该级没有已结束条目（未闭合的不计入驻留分布）',
+            empty: stats.filtered ? '标记区间内没有已结束条目（未闭合的不计入驻留分布）' : '该级没有已结束条目（未闭合的不计入驻留分布）',
             tip: (value, count, share) => [`延迟 ${value} 周期`, `${fmtInt(count)} 条`, `占已结束条目 ${(share * 100).toFixed(1)}%`].join('\n'),
             note: (kinds, shown) => `共 ${kinds} 种延迟，这里取出现次数最多的 ${shown} 种`,
           }),
-          distributionMetrics(stats, '条'),
+          distributionMetrics(latency, '条'),
         ],
       ),
       metric(
         '连续空泡数分布',
-        bubbles.count === 0 ? '没有气泡' : `${fmtInt(bubbles.count)} 段 · 合计 ${countLabel(bubbles.count * bubbles.avg)} 周期`,
+        bubbleDist.count === 0
+          ? stats.filtered
+            ? '标记区间内没有气泡'
+            : '没有气泡'
+          : `${fmtInt(bubbleDist.count)} 段 · 合计 ${countLabel(bubbleDist.count * bubbleDist.avg)} 周期${stats.filtered ? '（跨边界的段只算落在区间里的部分）' : ''}`,
         [
-          distributionList(bubbles, {
+          distributionList(bubbleDist, {
             unit: '周期',
-            empty: '该级没有气泡（活跃区间内全程有内容）',
+            empty: stats.filtered ? '标记区间内没有气泡（这一段全程有内容）' : '该级没有气泡（活跃区间内全程有内容）',
             tip: (value, count, share) =>
               [`连续 ${value} 周期空泡`, `${fmtInt(count)} 段`, `占全部气泡段 ${(share * 100).toFixed(1)}%`, '一段 = 该级连续若干周期没有在飞内容'].join('\n'),
             note: (kinds, shown) => `共 ${kinds} 种长度，这里取出现次数最多的 ${shown} 种`,
           }),
-          distributionMetrics(bubbles, '段'),
+          distributionMetrics(bubbleDist, '段'),
         ],
       ),
     ]),
   );
   // 只有"选中了这条轨道上的某个条目"才高亮这一级：按周期选中会把同域的所有级都点亮，
   // 反而看不出是哪一个条目被选中了（周期级的联动交给时间轴自己的整列高光）
-  state.highlights.push({
+  highlights.push({
     node: node.root,
     match: (selection) => selection !== null && selection.kind === 'item' && selection.track === track.name,
   });
@@ -300,58 +491,134 @@ function stageCard(track: TrackInfo, state: PipelineState): HTMLElement {
 
 // ------------------------------------------------------------------ 概览
 
-function renderPipeline(state: PipelineState): void {
-  const { container, ctx } = state;
-  container.replaceChildren();
-  state.highlights = [];
+/** 概览块的累计量：在分片回调里边算边累加，与每级卡片共用同一批数字 */
+interface PipelineTotals {
+  items: number;
+  closed: number;
+  open: number;
+  crossDomain: number;
+  /** 气泡周期数 */
+  bubbles: number;
+  cycles: number;
+  /** 真正被标记区间筛过的级数（概览里据此说明有多少级仍是全量） */
+  filteredStages: number;
+  widest: { track: string; start: number; end: number; length: number; clipped: boolean } | null;
+}
 
-  const tracks = visibleTracks(ctx);
-  if (tracks.length === 0) {
-    const empty = card('流水线', '没有可显示的 pip 轨道');
-    empty.body.append(emptyState(ctx.trace.tracks.size === 0 ? '这份轨迹没有 pip 轨道' : '当前时钟域筛选下没有轨道'));
-    container.append(empty.root);
-    return;
+function addTotals(totals: PipelineTotals, track: TrackInfo, stats: StageNumbers): void {
+  totals.items += stats.items;
+  totals.closed += stats.closed;
+  totals.open += stats.open;
+  totals.crossDomain += stats.crossDomain;
+  totals.bubbles += stats.bubbleCycles;
+  totals.cycles += stats.cycles;
+  if (stats.filtered) totals.filteredStages += 1;
+  const widest = stats.widest;
+  if (widest === null) return;
+  if (totals.widest === null || widest.length > totals.widest.length) {
+    totals.widest = { track: track.name, start: widest.start, end: widest.end, length: widest.length, clipped: stats.filtered };
   }
+}
 
-  let items = 0;
-  let closed = 0;
-  let open = 0;
-  let crossDomain = 0;
-  let bubbles = 0;
-  let cycles = 0;
-  let widest: { track: string; start: number; end: number; length: number } | null = null;
-  for (const track of tracks) {
-    items += track.items.length;
-    closed += track.closed;
-    open += track.open;
-    bubbles += track.bubbles.length;
-    cycles += Math.max(0, track.lastCycle - track.firstCycle + 1);
-    for (const item of track.items) if (item.crossDomain) crossDomain += 1;
-    for (const range of track.bubbleRanges) {
-      const length = range.end - range.start + 1;
-      if (widest === null || length > widest.length) widest = { track: track.name, start: range.start, end: range.end, length };
-    }
-  }
-
-  const overview = card('流水线概览', '占用度是半开区间 [enter, close)；气泡 = 活跃区间内占用为 0 的周期（spec §9.4）');
+/**
+ * 概览：数字全部由 `totals` 给出，而 `totals` 是"每级各自的口径"累加出来的 ——
+ * 标记区间只作用于标记所在域的级，别的域照旧全量，所以副标题里写明筛了几级。
+ */
+function buildOverview(tracks: TrackInfo[], totals: PipelineTotals, range: MarkerRange | null): HTMLElement {
+  const note = '占用度是半开区间 [enter, close)；气泡 = 活跃区间内占用为 0 的周期（spec §9.4）';
+  const subtitle =
+    range === null
+      ? note
+      : `${note}；标记区间 ${range.domain} 周期 ${range.from}–${range.to} ⇒ ${totals.filteredStages}/${tracks.length} 级按区间统计，其余级不在该域（全量）`;
+  const overview = card('流水线概览', subtitle);
   overview.body.append(
     el('div', { class: 'stat-row' }, [
       statTile('流水级', countLabel(tracks.length), `域 ${[...new Set(tracks.map((t) => t.domain))].join(' · ')}`),
-      statTile('在飞条目', countLabel(items), `${closed} 已结束 · ${open} 未闭合`),
+      statTile('在飞条目', countLabel(totals.items), `${totals.closed} 已结束 · ${totals.open} 未闭合`),
       statTile(
         '占用率',
-        cycles > 0 ? `${(((cycles - bubbles) / cycles) * 100).toFixed(1)}%` : '—',
-        `${countLabel(cycles - bubbles)} 有内容 / ${countLabel(bubbles)} 空泡`,
+        totals.cycles > 0 ? `${(((totals.cycles - totals.bubbles) / totals.cycles) * 100).toFixed(1)}%` : '—',
+        `${countLabel(totals.cycles - totals.bubbles)} 有内容 / ${countLabel(totals.bubbles)} 空泡`,
       ),
-      widest
-        ? statTile('最长气泡', `${countLabel(widest.length)} 周期`, `${widest.track} · ${widest.start}–${widest.end}`)
+      totals.widest
+        ? statTile(
+            '最长气泡',
+            `${countLabel(totals.widest.length)} 周期`,
+            `${totals.widest.track} · ${totals.widest.start}–${totals.widest.end}${totals.widest.clipped ? '（区间内片段）' : ''}`,
+          )
         : statTile('最长气泡', '—', '没有气泡'),
-      statTile('跨域条目', countLabel(crossDomain), '不计入周期延迟分布（§6.5）'),
+      statTile('跨域条目', countLabel(totals.crossDomain), '不计入周期延迟分布（§6.5）'),
     ]),
   );
-  container.append(overview.root);
+  return overview.root;
+}
 
-  for (const track of tracks) container.append(stageCard(track, state));
+/**
+ * 重画整页。
+ *
+ * 为什么分片：一次重算要把每个流水级的条目筛一遍（`itemsWithin`/`latencyStats`/`bubbleStats`）
+ * 再建出成百上千个 DOM/SVG 节点，几十级的轨迹上一次性做完会把主线程占满 —— 页面卡住、
+ * 连"正在算"都画不出来。切片粒度就是"一级流水"，片间让出一帧（见 chunk.ts）。
+ *
+ * 为什么不会看到半算完的页面：卡片先造在 `DocumentFragment` 里，中途被取消（标记又变了）
+ * 或视图被卸载就整个丢掉，页面上一个节点都不会落到，最后一次性替换。
+ *
+ * 为什么不会旧结果覆盖新结果：每一轮都有自己的 `abortable()` 令牌，新一轮开始时先取消上一轮，
+ * 被取消的那一轮拿到 `false` 就直接返回。
+ */
+async function renderPipeline(state: PipelineState): Promise<void> {
+  const { container, ctx } = state;
+  const range = ctx.markers.range();
+  const tracks = visibleTracks(ctx);
+
+  const token = abortable();
+  state.compute?.abort();
+  state.compute = token;
+
+  // 计算期间页面上只有"计算中…"与范围说明：宁可短暂空着，也不让上一轮的旧数字留在屏幕上冒充新结果
+  const progress = el('span', { class: 'chip', text: '计算中…' });
+  const scopeRow = el('div', { class: 'row' }, [scopeChip(ctx.markers.list(), range), progress]);
+  container.replaceChildren(scopeRow);
+
+  if (tracks.length === 0) {
+    const empty = card('流水线', '没有可显示的 pip 轨道');
+    empty.body.append(emptyState(ctx.trace.tracks.size === 0 ? '这份轨迹没有 pip 轨道' : '当前时钟域筛选下没有轨道'));
+    progress.remove();
+    state.highlights = [];
+    state.compute = null;
+    container.replaceChildren(scopeRow, empty.root);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const highlights: StageHighlight[] = [];
+  const totals: PipelineTotals = { items: 0, closed: 0, open: 0, crossDomain: 0, bubbles: 0, cycles: 0, filteredStages: 0, widest: null };
+
+  const done = await runChunked(
+    tracks.length,
+    (from, to) => {
+      for (let index = from; index < to; index++) {
+        const track = tracks[index]!;
+        const stats = stageNumbers(track, effectiveRange(track, range));
+        addTotals(totals, track, stats);
+        fragment.append(stageCard(track, stats, range, ctx, highlights));
+      }
+    },
+    { signal: token.signal, budgetMs: 8 },
+  );
+
+  // 被取消（视图卸载，或已经有更新的一轮接手）：这一轮的产物整个丢弃，页面保持上一轮/新那一轮的内容。
+  // 但要把**自己**挂上去的"计算中…"收掉 —— 被取消不等于算完，留着它会一直骗人
+  if (!done || state.compute !== token) {
+    progress.remove();
+    if (state.compute === token) state.compute = null;
+    return;
+  }
+
+  state.compute = null;
+  state.highlights = highlights;
+  progress.remove();
+  container.replaceChildren(scopeRow, buildOverview(tracks, totals, range), fragment);
 
   // 渲染完就把当前选中态套上：切到这个视图时，别处选中的条目/周期也要看得见
   applySelection(state);
@@ -365,11 +632,19 @@ function applySelection(state: PipelineState): void {
 }
 
 function mountView(container: HTMLElement, ctx: ViewContext): void {
+  // 重建（换文件 / 改选项）：上一份订阅与上一轮没算完的重算都要收掉
   active?.unsubscribe?.();
-  const state: PipelineState = { container, ctx, highlights: [], unsubscribe: null };
-  renderPipeline(state);
+  active?.markerUnsub?.();
+  active?.compute?.abort();
+  const state: PipelineState = { container, ctx, highlights: [], unsubscribe: null, markerUnsub: null, compute: null };
+  // 标记订阅就是"只在松手时重算"的落点：`MarkerBus` 只在增删与**拖拽提交**时通知，
+  // 拖拽过程中的每一像素都不发通知，所以这里不会被打成筛子
+  state.markerUnsub = ctx.markers.subscribe(() => {
+    void renderPipeline(state);
+  });
   state.unsubscribe = ctx.selection.subscribe(() => applySelection(state));
   active = state;
+  void renderPipeline(state);
 }
 
 export const pipelineView: View = {
@@ -390,6 +665,9 @@ export const pipelineView: View = {
   },
   unmount() {
     active?.unsubscribe?.();
+    active?.markerUnsub?.();
+    // 卸载时把还没算完的一轮也停掉：算完也没人看，还会往已摘除的容器上写
+    active?.compute?.abort();
     active = null;
   },
 };

@@ -5,7 +5,7 @@
  * async 标记原样带过来、累计值按文件顺序推进（与 `applyCounter` 同一口径）。
  */
 import { describe, expect, test } from 'bun:test';
-import { equalRuns, eventCounters, parseChiperf, scanValue } from '../src/index.ts';
+import { bubbleStats, equalRuns, eventCounters, itemsWithin, latencyStats, parseChiperf, scanValue } from '../src/index.ts';
 
 const SOURCE = `chiperf 1.0
 @domain default, period=1.0ns
@@ -104,5 +104,71 @@ describe('equalRuns', () => {
   test('空列表与单点', () => {
     expect(equalRuns([])).toEqual([]);
     expect(equalRuns(['7'].map(point))).toEqual([{ from: 0, to: 0 }]);
+  });
+});
+
+/**
+ * 区间统计：波形上打两个标记之后，流水线/状态机只统计两标记之间的数据。
+ *
+ * 用手算的轨迹钉住口径：条目按"与区间**相交**"算，气泡段按"落在区间里的**那部分**"算长。
+ * 周期编排：c1 起持有 → c3 变空 → c5 起持有 → c7 变空，域记录到 c9。
+ */
+const RANGE_SOURCE = `chiperf 1.0
+@domain default, period=1.0ns
+[clk] p
+[pip] "t", 1
+[clk] n
+[clk] p
+[clk] n
+[clk] p
+[pip] "t", bubble
+[clk] n
+[clk] p
+[clk] n
+[clk] p
+[pip] "t", 2
+[clk] n
+[clk] p
+[clk] n
+[clk] p
+[pip] "t", bubble
+[clk] n
+[clk] p
+[clk] n
+@end
+`;
+
+const rangeTrack = parseChiperf(RANGE_SOURCE).tracks.get('t')!; // 默认域的追踪键省略域前缀
+
+describe('区间统计（标记）', () => {
+  test('两个条目的驻留都是 2 周期；区间只留下与它相交的那个', () => {
+    expect(latencyStats(rangeTrack).count).toBe(2);
+    expect(latencyStats(rangeTrack).max).toBe(2);
+    // c4–c6：第一条目在 c3 就结束了，第二条目 c5 起 —— 只剩它
+    expect(latencyStats(rangeTrack, { from: 4, to: 6 })).toMatchObject({ count: 1, min: 2, max: 2 });
+    // 覆盖全区间 ⇒ 与不筛完全一样
+    expect(latencyStats(rangeTrack, { from: 1, to: 9 })).toEqual(latencyStats(rangeTrack));
+  });
+
+  test('itemsWithin 按“在区间里在飞过”筛，跨界的那条也算', () => {
+    expect(itemsWithin(rangeTrack, 1, 9)).toHaveLength(2);
+    expect(itemsWithin(rangeTrack, 1, 3)).toHaveLength(1); // 第一条目在 c3 结束，相交
+    expect(itemsWithin(rangeTrack, 4, 4)).toHaveLength(0); // c4 什么都没有
+    expect(itemsWithin(rangeTrack, 6, 8)).toHaveLength(1); // 第二条目 c5–c7，被 c6 切到
+  });
+
+  test('气泡段长按“落在区间里的那部分”算，不因跨界整段丢弃', () => {
+    // 全量：气泡 [3,4] 长 2、[7,7] 长 1
+    expect(bubbleStats(rangeTrack)).toMatchObject({ count: 2, max: 2, min: 1 });
+    // c4–c7：两段各被削成 1 个周期
+    expect(bubbleStats(rangeTrack, { from: 4, to: 7 })).toMatchObject({ count: 2, min: 1, max: 1 });
+    // c5–c6：正落在"有内容"的中段，区间里没有气泡
+    expect(bubbleStats(rangeTrack, { from: 5, to: 6 }).count).toBe(0);
+  });
+
+  test('退化区间（from === to）不产生 NaN', () => {
+    const single = latencyStats(rangeTrack, { from: 6, to: 6 });
+    expect(Number.isFinite(single.count)).toBe(true);
+    expect(bubbleStats(rangeTrack, { from: 6, to: 6 }).count).toBe(0);
   });
 });

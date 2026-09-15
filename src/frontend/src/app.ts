@@ -5,6 +5,7 @@
  */
 import { ChiperfParser, gunzip, isGzip, parseChiperf, UnsupportedVersionError, type Trace } from '../../parser/src/index.ts';
 import { abortable, runChunked } from './chunk.ts';
+import { createMarkerBus, type MarkerBus } from './markers.ts';
 import { el, clear, card, statTile, countLabel } from './charts.ts';
 import { fmtBytes, fmtInt, type AppOptions, type Selection, type SelectionBus, type View, type ViewContext } from './view.ts';
 
@@ -36,6 +37,9 @@ const state: AppState = {
 
 const listeners = new Set<(selection: Selection, kind: 'select' | 'hover') => void>();
 let selection: Selection = null;
+
+/** 波形标记：换文件时清空（周期号只对同一份轨迹有意义） */
+export const markerBus: MarkerBus = createMarkerBus();
 
 export const selectionBus: SelectionBus = {
   get: () => selection,
@@ -186,8 +190,15 @@ function buildMain(): HTMLElement {
   return main;
 }
 
+/** 当前已挂载的视图：切视图/换文件时要先 unmount，否则它的订阅（selection / markers）会继续活着 */
+let mountedView: View | null = null;
+
 function renderMain(): void {
   const main = document.getElementById('main')!;
+  // 切视图/换文件前先卸载上一个视图：它订阅了 selection 与 markers，不卸载就会在脱离文档的
+  // DOM 上继续重算（打标记时每次都要白算一轮）
+  mountedView?.unmount?.();
+  mountedView = null;
   clear(main);
 
   if (state.error) {
@@ -222,6 +233,7 @@ function renderMain(): void {
   const container = el('div', { class: 'view' });
   main.append(buildViewHeader(view), buildToolbar(), container);
   view.mount(container, context());
+  mountedView = view;
 }
 
 function buildViewHeader(view: View): HTMLElement {
@@ -269,6 +281,7 @@ function context(): ViewContext {
     source: state.source,
     options: state.options,
     selection: selectionBus,
+    markers: markerBus,
     rerender: () => renderMain(),
     inspect: (title, rows, body) => openInspector(title, rows, body),
   };
@@ -389,6 +402,7 @@ function setLoadingProgress(frac: number | null): void {
 }
 
 function applyTrace(trace: Trace, source: { name: string; bytes: number; gzip: boolean }): void {
+  markerBus.clear(); // 周期号只对同一份轨迹有意义，换文件就必须清掉
   state.trace = trace;
   state.source = source;
   state.error = null;
