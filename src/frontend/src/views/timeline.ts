@@ -1197,6 +1197,10 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     menu: pipelineMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
+      // 条目按**取值**着色，而不是按行：同一条指令在 IF/ID/EX/MEM/WB 里是同一个颜色，
+      // 一眼就能顺着颜色把一条指令跟到写回。没有标记的条目退回轨道色。
+      const laneColor = colorFor(track.name);
+      const colorOfItem = (item: { tag: ScalarValue | null }): string => (item.tag === null ? laneColor : colorFor(numericKey(item.tag)));
       let tagsDrawn = 0;
       // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
       const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
@@ -1248,8 +1252,8 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 
       const barH = h - 9;
       const barY = y + 4;
-      const color = colorFor(track.name);
       for (const item of shown) {
+        const color = colorOfItem(item);
         const open = item.closed === null;
         const aborted = item.closed === 'X';
         const enterX = reg.plot.scale(item.enter.cycle + phaseOffset(item.enter, item.async));
@@ -1653,6 +1657,17 @@ const valueModes = new Map<string, ValueMode>();
 /** 显示模式：用户选过就用用户的，否则用该行类型的默认（数值=六边形块、计数器=折线） */
 function valueModeOf(key: string, fallback: ValueMode = 'wave'): ValueMode {
   return valueModes.get(key) ?? fallback;
+}
+
+/**
+ * 着色用的键：**只看数值本身**。
+ *
+ * 不能用 `valueKey`（它把声明宽度也算进去）：`16'h9117` 与 `32'h9117` 是同一个
+ * 数值、应该同色，按 valueKey 会分成两种颜色；也不能用格式化后的文本（换个进制
+ * 颜色就变了）。所以位向量取十进制数值，其它类型取原文。
+ */
+function numericKey(value: ScalarValue): string {
+  return value.big !== undefined && value.hasXZ !== true ? `n:${value.big}` : `t:${value.text}`;
 }
 
 /** 宽度估计：声明宽度 / 实际位数，按行取最大值 */
