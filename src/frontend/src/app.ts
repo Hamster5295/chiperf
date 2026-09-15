@@ -3,7 +3,8 @@
  *
  * 数据流：文件/示例 → parser（@chiperf/parser）→ Trace → ViewContext → 各视图
  */
-import { parseChiperf, parseChiperfBytes, UnsupportedVersionError, type Trace } from '../../parser/src/index.ts';
+import { ChiperfParser, gunzip, isGzip, parseChiperf, UnsupportedVersionError, type Trace } from '../../parser/src/index.ts';
+import { abortable, runChunked } from './chunk.ts';
 import { el, clear, card, statTile, countLabel } from './charts.ts';
 import { fmtBytes, fmtInt, type AppOptions, type Selection, type SelectionBus, type View, type ViewContext } from './view.ts';
 
@@ -15,7 +16,12 @@ interface AppState {
   options: AppOptions;
   error: string | null;
   retryableText: string | null;
+  /** 正在解析：0~1 的进度（null = 没在解析）。大文件按片解析，这里给用户一个"在动"的信号 */
+  loading: number | null;
 }
+
+/** 正在进行的载入（分块解析）：换文件/重新载入时把上一轮取消掉 */
+let pendingLoad: { signal: AbortSignal; abort: () => void } | null = null;
 
 const state: AppState = {
   views: [],
@@ -25,6 +31,7 @@ const state: AppState = {
   options: { domains: [], useTimeAxis: true, zoom: 0 },
   error: null,
   retryableText: null,
+  loading: null,
 };
 
 const listeners = new Set<(selection: Selection, kind: 'select' | 'hover') => void>();
@@ -75,6 +82,7 @@ function renderShell(): void {
 
 function buildHeader(): HTMLElement {
   const nameNode = el('span', { class: 'file-name', text: state.trace ? state.source.name || '(未命名)' : '未加载文件' });
+  const progress = state.loading === null ? null : el('span', { class: 'chip', text: `解析中 ${Math.round(state.loading * 100)}%` });
   const loadBtn = el('button', { class: 'btn btn-primary', text: '打开 .chiperf' });
   const input = el('input', {
     type: 'file',
@@ -90,6 +98,7 @@ function buildHeader(): HTMLElement {
   sampleBtn.addEventListener('click', () => void loadSampleInternal());
 
   const chips = el('div', { class: 'header-chips' });
+  if (progress !== null) chips.append(progress);
   if (state.trace) {
     const t = state.trace;
     chips.append(chip(`${countLabel(t.stats.records)} 记录`, 'chip-ok'));
@@ -278,14 +287,25 @@ async function loadFile(file: File): Promise<void> {
   const gzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
   const source = { name: file.name, bytes: buffer.byteLength, gzip };
   state.retryableText = null;
+  const token = abortable();
+  pendingLoad?.abort();
+  pendingLoad = token;
   try {
     if (gzip) {
-      applyTrace(parseChiperfBytes(buffer), source);
+      // 先解压成文本（`gunzip` 是单次同步调用，这一步仍会占住主线程），
+      // 再把文本按片解析 —— 解析是重头，切片后就只剩解压那一下会卡。
+      const text = gunzipToString(buffer);
+      const trace = await parseChunkedText(text, token.signal);
+      if (token.signal.aborted) return;
+      applyTrace(trace, source);
       return;
     }
     const text = new TextDecoder('utf-8').decode(buffer);
-    applyTrace(parseChiperf(text), source);
+    const trace = await parseChunkedText(text, token.signal);
+    if (token.signal.aborted) return;
+    applyTrace(trace, source);
   } catch (err) {
+    if (err instanceof Error && err.message === '__aborted__') return; // 被新一轮载入取代
     if (err instanceof UnsupportedVersionError) {
       state.retryableText = gzip ? null : new TextDecoder('utf-8').decode(buffer);
       state.error = `${err.message}\n\n若只想看个大概，可以用下面的按钮强制按 1.x 解析。`;
@@ -308,6 +328,64 @@ async function loadSampleInternal(): Promise<void> {
   const text = sampleText;
   state.error = null;
   applyTrace(parseChiperf(text), { name: 'sample.chiperf', bytes: new TextEncoder().encode(text).length, gzip: false });
+}
+
+/**
+ * 按片喂给解析器：每片之间让出一帧，页面在解析期间仍能滚动/切换视图，
+ * 顶部 chip 上显示进度。分片只影响"谁占用主线程"，解析结果与一次喂完逐条一致
+ * （解析器本身会把跨片的半行缓存到下一片，`truncated_tail` 只在真正截断时出现）。
+ */
+/** gzip → 文本（流式 inflate 的回调逐块解码，避免再整块 decode 一次） */
+function gunzipToString(bytes: Uint8Array): string {
+  const decoder = new TextDecoder('utf-8');
+  let text = '';
+  gunzip(bytes, (chunk: Uint8Array) => {
+    text += decoder.decode(chunk, { stream: true });
+  });
+  return text + decoder.decode();
+}
+
+async function parseChunkedText(text: string, signal: AbortSignal): Promise<Trace> {
+  state.error = null;
+  setLoadingProgress(0);
+  const parser = new ChiperfParser({});
+  let lastShown = -1;
+  const ok = await runChunked(
+    text.length,
+    (from, to) => parser.feed(text.slice(from, to)),
+    {
+      signal,
+      batch: 256 * 1024,
+      budgetMs: 10,
+      onProgress: (done) => {
+        // 进度只在整百分比变化时更新 DOM：分块的意义就是别让主线程花在重绘上
+        const pct = text.length === 0 ? 100 : Math.floor((done / text.length) * 100);
+        if (pct !== lastShown) {
+          lastShown = pct;
+          setLoadingProgress(pct / 100);
+        }
+      },
+    },
+  );
+  setLoadingProgress(null);
+  if (!ok) throw new Error('__aborted__');
+  return parser.finish();
+}
+
+/** 顶部那枚"解析中 N%"chip（就地更新；换文件时由 renderShell 按 state.loading 重建） */
+let progressChip: HTMLElement | null = null;
+function setLoadingProgress(frac: number | null): void {
+  state.loading = frac;
+  if (frac === null) {
+    progressChip?.remove();
+    progressChip = null;
+    return;
+  }
+  if (progressChip === null || !progressChip.isConnected) {
+    progressChip = chip('解析中 0%', '');
+    document.querySelector('.header-chips')?.prepend(progressChip);
+  }
+  progressChip.textContent = `解析中 ${Math.round(frac * 100)}%`;
 }
 
 function applyTrace(trace: Trace, source: { name: string; bytes: number; gzip: boolean }): void {

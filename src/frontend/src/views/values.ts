@@ -49,6 +49,12 @@ interface Gap {
 
 /** 单张波形最多画这么多采样（超出按周期分桶抽稀，变化点与未知点始终保留） */
 const MAX_STEPS = 3000;
+/**
+ * 每条数值轨最多画多少个变化/异步标记。阶梯线本身是一条 polyline（一个节点），
+ * 但标记是"一个采样一个节点" —— 20 万周期的轨迹在两条轨上就能堆出 4 万个节点。
+ * 超出时只画前 N 个并注明；阶梯线仍然完整，标记只是点缀。
+ */
+const MAX_MARKERS = 400;
 const HISTORY_ROWS = 200;
 
 // ------------------------------------------------------------------ 取值
@@ -361,14 +367,22 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
   }
 
   // 变化事件打点（spec §9.3 的 changes）+ 异步采样打点（spec §6.7 必须能看出不在沿上）
+  // 数量上按节点预算截断：轨迹很长时只标前 MAX_MARKERS 个（下面的 note 会说明）
   const prevOf = new Map<Timed<ScalarValue>, Timed<ScalarValue> | null>();
   let previous: Timed<ScalarValue> | null = null;
   for (const sample of sorted) {
     prevOf.set(sample, previous);
     previous = sample;
   }
+  let markersDrawn = 0;
+  let markersSkipped = 0;
   for (const item of items) {
     if (item.num === null || (!item.changed && !item.async)) continue;
+    if (markersDrawn >= MAX_MARKERS) {
+      markersSkipped++;
+      continue;
+    }
+    markersDrawn++;
     const from = prevOf.get(item.sample) ?? null;
     const marker = item.async
       ? svgEl('circle', {
@@ -399,6 +413,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
       el('span', { text: '● 橙点 = 取值发生变化' }),
       items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.7）' }) : null,
       el('span', { text: '虚线阶梯 = 未知区间（保持值不可知）' }),
+      markersSkipped > 0 ? el('span', { text: `标记只画了前 ${fmtInt(markersDrawn)} 个（其余 ${fmtInt(markersSkipped)} 个省略；阶梯线是完整的）` }) : null,
     ]),
   );
   return node.root;

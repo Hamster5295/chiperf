@@ -206,6 +206,15 @@ export function tooltip(): {
 }
 
 /** 把 hover 提示绑定到任意元素上 */
+/** 画布上的形状没有 DOM 节点，命中测试由调用方自己做，提示气泡借这一个出口显示 */
+export function showTooltip(text: string, clientX: number, clientY: number): void {
+  tooltip().show(text, clientX, clientY);
+}
+
+export function hideTooltip(): void {
+  tooltip().hide();
+}
+
 export function hoverTarget<T extends Element>(
   node: T,
   render: () => string,

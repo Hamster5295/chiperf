@@ -34,6 +34,9 @@ import {
   type CounterTrack,
   type FsmTrack,
 } from '../../../parser/src/index.ts';
+import { abortable, runChunked } from '../chunk.ts';
+import { createRasterBackend, type RasterBackend, type RasterScene } from '../raster.ts';
+import { hideTooltip, showTooltip } from '../charts.ts';
 import {
   axisTicks,
   card,
@@ -108,8 +111,13 @@ const MAX_PLOT_WIDTH = 200000;
 /** 画布总宽下限（px）：缩到一根线就没法看了 */
 const MIN_PLOT_WIDTH = 24;
 /** 每个泳道的条目 / 标记 / 文本上限 */
-const MAX_ITEMS = 4000;
-const MAX_MARKS = 2000;
+/**
+ * 每个泳道最多画多少个图元（**节点预算**，不是数据上限）。
+ * 超出时只画当前视图内的前 N 个并在右下角注明 —— 放大后视图内条目变少，
+ * 于是"放大就能看到被省掉的那些"，而不是永远只画开头一段。
+ */
+const MAX_ITEMS = 1500;
+const MAX_MARKS = 1200;
 /**
  * **每条泳道**的条目文本上限。
  * 曾经是全局一份：几千条记录的轨迹里，靠前的泳道（IF/ID/SG）把额度吃完，
@@ -211,6 +219,8 @@ interface Surface {
 interface Registry extends Surface {
   lanes: LaneRegistration[];
   itemBoxes: Map<string, Box>;
+  /** 形状收集器：实色条目交给画布（WebGPU / Canvas2D），文字与空心/虚线标记仍留在 SVG */
+  shapes: ShapeSink | null;
   selLine: SVGLineElement;
   selBox: SVGRectElement;
   hoverBox: SVGRectElement;
@@ -221,6 +231,19 @@ interface Registry extends Surface {
   hoverTag: SVGTextElement;
   /** 渲染循环在调用 row.draw 前写入，供 cycleSurface 捕获（不改各泳道的绘制签名） */
   currentRow: { key: string; y: number; h: number; color: string } | null;
+}
+
+/**
+ * 形状收集器：把"实色内容块"收进画布场景，而不是变成 SVG 节点。
+ *
+ * 大文件的时间轴里，光流水线条目就能堆出上万个 `<path>` —— 每个节点都带自己的悬停处理，
+ * 缩放一次要重建它们全部（实测 1.7 秒）。形状改由画布一遍画完后，
+ * 节点数与重建开销与条目数**无关**；文字标签、空心/虚线标记（气泡、未闭合）仍画在 SVG 上，
+ * 因为那几样数量很小，而且需要 DOM 才有的交互与虚线描边。
+ */
+interface ShapeSink {
+  /** 左右切角的实色块（`hexPath` 的等价物）：画布坐标系 = SVG 用户坐标系 */
+  box(x0: number, x1: number, top: number, bottom: number, chamfer: number, color: string, alpha: number): void;
 }
 
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
@@ -634,11 +657,29 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   const svg = svgRoot(plot.width, plot.height, { style: 'flex:0 0 auto' });
   axisLayer(svg, plot, primary, ctx);
 
+  // 画布：和 SVG 同尺寸、绝对定位在它下面（形状在下、文字/悬停在上），随滚动一起移动。
+  // 每次重建都新建 canvas 会让"后端绑定在旧画布上"（WebGPU 的 context 不能换），
+  // 所以整个视图共用一个 canvas，只改尺寸。
+  const scene: RasterScene = { width: plot.width, height: plot.height, boxes: [], paths: [] };
+  const canvas = rasterCanvas();
+  canvas.width = Math.max(1, Math.round(plot.width));
+  canvas.height = Math.max(1, Math.round(plot.height));
+  canvas.style.cssText = `position:absolute;left:0;top:0;width:${plot.width}px;height:${plot.height}px;pointer-events:none`;
+  const raster = ensureRaster(canvas);
+  const shapes: ShapeSink | null = raster.ok
+    ? {
+        box: (x0, x1, top, bottom, chamfer, color, alpha) => {
+          scene.boxes.push({ x: x0, y: top, w: Math.max(0.6, x1 - x0), h: Math.max(0.6, bottom - top), color: c2hex(color), alpha, chamfer });
+        },
+      }
+    : null;
+
   const reg: Registry = {
     svg,
     plot,
     lanes: [],
     itemBoxes: new Map(),
+    shapes,
     selLine: svgEl('line', {}),
     selBox: svgEl('rect', {}),
     hoverBox: svgEl('rect', {}),
@@ -662,19 +703,19 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   rowCells.clear();
   let y = AXIS_H;
+  // 先同步把"每行一个空组 + 行头"搭起来：布局、滚动条、行名立刻正确，
+  // 用户马上看到文件有多少行；波形内容随后按片填（见下面的 paintRowsChunked）
+  const pendingRows: { g: SVGGElement; row: LaneRow; y: number; h: number }[] = [];
   for (const row of rows) {
     const h = rowHeight(row);
     const g = svgEl('g', {});
     svg.append(g);
-    // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
-    reg.currentRow = { key: row.key, y, h, color: row.color };
-    row.draw(g, reg, y, h);
-    reg.currentRow = null;
     reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
     const cell = gutterCell(row, h, ctx);
     rowCells.set(row.key, cell);
     gutter.append(cell);
     installRowMenu(g, row);
+    pendingRows.push({ g, row, y, h });
     y += h + ROW_GAP;
   }
   // 单元格是新建的，把批量选中态重新套上
@@ -710,7 +751,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     ]),
   );
   const scroll = el('div', { class: 'chart-scroll', style: 'max-width:100%' });
-  scroll.append(el('div', { style: 'display:flex;align-items:flex-start;min-width:max-content' }, [gutter, svg]));
+  const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [canvas, svg]);
+  scroll.append(el('div', { style: 'display:flex;align-items:flex-start;min-width:max-content' }, [gutter, plotWrap]));
   cardNode.body.append(scroll);
   host.append(cardNode.root);
 
@@ -719,7 +761,165 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   registry = reg;
   chartAvail = scroll.clientWidth;
   lastHostW = host.clientWidth;
+  // 画布上的条目没有 DOM 节点可挂事件，命中测试统一用 reg.itemBoxes（矩形仍然逐条登记）
+  installCanvasItemHover(svg, ctx);
+  // 形状画完之后贴上去（分片绘制期间画布是空的，避免"半成品"闪一下）
+  latestScene = scene;
+  paintRowsChunked(pendingRows, reg, ctx, {
+    onDone: () => {
+      raster.backend?.draw(scene);
+    },
+  });
+  if (raster.backend !== null) raster.backend.draw(scene);
 }
+
+/** 视图共用的画布元素（后端与它绑定，见 ensureRaster） */
+let sharedCanvas: HTMLCanvasElement | null = null;
+function rasterCanvas(): HTMLCanvasElement {
+  if (sharedCanvas === null) {
+    sharedCanvas = document.createElement('canvas');
+    sharedCanvas.className = 'tl-raster';
+  }
+  return sharedCanvas;
+}
+
+/** 最近一帧的场景：后端异步就绪后补画一次，不用整页重排 */
+let latestScene: RasterScene | null = null;
+
+/**
+ * 画布后端：进程内只建一次（请求 adapter 是异步的），失败则整条路径退回 SVG。
+ * `?gpu=0` 强制 Canvas2D、`?gpu=1` 强制 WebGPU（两者在 raster.ts 里处理）。
+ */
+const rasterState: { ok: boolean; backend: RasterBackend | null } = { ok: true, backend: null };
+let rasterStarted = false;
+function ensureRaster(canvas: HTMLCanvasElement): { ok: boolean; backend: RasterBackend | null } {
+  if (!rasterStarted) {
+    rasterStarted = true;
+    void createRasterBackend(canvas)
+      .then((backend) => {
+        rasterState.backend = backend;
+        // 后端是异步就绪的：把当前这一帧补画到画布上（不重排 DOM）
+        if (latestScene !== null) backend.draw(latestScene);
+      })
+      .catch((err: unknown) => {
+        // 画布起不来 ⇒ 后面的渲染把形状交回 SVG；重画一次把这一帧（画布版）补成 SVG 版
+        rasterState.ok = false;
+        rasterState.backend = null;
+        console.warn('画布后端不可用，形状退回 SVG：', err);
+        rebuild(false, currentCenterCycle());
+      });
+  }
+  return rasterState;
+}
+
+/**
+ * 画布条目的悬停/点击：形状搬进画布后，`itemBoxes` 里登记的矩形就是唯一的命中依据。
+ * 命中后再从对应轨道取回条目，复用与 SVG 条目完全一样的提示与选中行为。
+ */
+function installCanvasItemHover(svg: SVGSVGElement, ctx: ViewContext): void {
+  let current: string | null = null;
+  const pick = (event: MouseEvent): { key: string; item: PipelineItem; track: TrackInfo } | null => {
+    const reg = registry;
+    if (!reg) return null;
+    // 指针压在 SVG 条目上时由它自己的处理器负责，这里不重复弹提示
+    if ((event.target as Element | null)?.closest?.('[data-item]') !== null && event.target !== svg) {
+      const el0 = event.target as Element;
+      if (el0.closest('[data-item]')) return null;
+    }
+    const box = svg.getBoundingClientRect();
+    if (box.width === 0 || box.height === 0) return null;
+    const x = (event.clientX - box.left) * (reg.plot.width / box.width);
+    const y = (event.clientY - box.top) * (reg.plot.height / box.height);
+    for (const [key, b] of reg.itemBoxes) {
+      if (x < b.x || x > b.x + b.w || y < b.y || y > b.y + b.h) continue;
+      const [trackName, seq] = key.split('\u0000');
+      const track = ctx.trace.tracks.get(trackName!);
+      const item = track?.items.find((it) => it.enterSeq === Number(seq));
+      if (track && item) return { key, item, track };
+    }
+    return null;
+  };
+  const onMove = (event: MouseEvent): void => {
+    const found = pick(event);
+    if (found === null) {
+      if (current !== null) {
+        current = null;
+        hideTooltip();
+        broadcastHover(ctx, null);
+      }
+      return;
+    }
+    if (found.key !== current) {
+      current = found.key;
+      broadcastHover(ctx, { kind: 'item', track: found.track.name, enterSeq: found.item.enterSeq });
+    }
+    showTooltip(pipTip(found.track, found.item, found.item.close === null), event.clientX, event.clientY);
+  };
+  svg.addEventListener('mousemove', onMove);
+  svg.addEventListener('mouseleave', () => {
+    if (current === null) return;
+    current = null;
+    hideTooltip();
+    broadcastHover(ctx, null);
+  });
+  svg.addEventListener('click', (event) => {
+    const found = pick(event as MouseEvent);
+    if (found === null) return;
+    ctx.selection.set({ kind: 'item', track: found.track.name, enterSeq: found.item.enterSeq });
+  });
+}
+
+/** `#rgb`/`rgb()`/`rgba()` 归一到 `#rrggbb`（raster 那边只认十六进制） */
+function c2hex(color: string): string {
+  if (color.startsWith('#')) return color.length === 4 ? `#${color[1]}${color[1]}${color[2]}${color[2]}${color[3]}${color[3]}` : color;
+  const m = /rgba?\(([^)]+)\)/.exec(color);
+  if (!m) return '#888888';
+  const [r, g, b] = m[1]!.split(/[\s,/]+/).map((v) => Math.max(0, Math.min(255, Math.round(Number(v)))));
+  return `#${[r, g, b].map((v) => (v ?? 0).toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * 波形内容按行分片绘制：每片最多 8ms，片间让出一帧。
+ *
+ * 20 万周期的轨迹里，一次性把几十个泳道画完会把主线程占满近一秒（页面完全无响应）。
+ * 分片之后首屏立刻可用、能滚动能切视图；缩放重建时上一轮的绘制会被取消（同一个令牌），
+ * 不会出现"旧内容画到一半又叠上新内容"。
+ */
+function paintRowsChunked(
+  pending: { g: SVGGElement; row: LaneRow; y: number; h: number }[],
+  reg: Registry,
+  ctx: ViewContext,
+  hooks: { onDone?: () => void } = {},
+): void {
+  if (pending.length === 0) return;
+  const token = abortable();
+  paintToken?.abort();
+  paintToken = token;
+  void runChunked(
+    pending.length,
+    (from, to) => {
+      for (let i = from; i < to; i++) {
+        const { g, row, y, h } = pending[i]!;
+        // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
+        reg.currentRow = { key: row.key, y, h, color: row.color };
+        row.draw(g, reg, y, h);
+        reg.currentRow = null;
+      }
+    },
+    {
+      signal: token.signal,
+      budgetMs: 8,
+      onProgress: (done, total) => {
+        if (done !== total) return;
+        applyState();
+        hooks.onDone?.();
+      },
+    },
+  );
+}
+
+/** 正在进行的行绘制（重建/卸载时取消掉上一轮） */
+let paintToken: { signal: AbortSignal; abort: () => void } | null = null;
 
 // ------------------------------------------------------------------ 卡片附属
 
@@ -1269,8 +1469,6 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
   const sorted =
     track.items.length > 1 ? [...track.items].sort((a, b) => a.enter.cycle - b.enter.cycle || a.enterSeq - b.enterSeq) : track.items;
-  const shown = sorted.length > MAX_ITEMS ? sorted.slice(0, MAX_ITEMS) : sorted;
-  const truncated = shown.length < sorted.length;
   return {
     kind: 'lane',
     key: `pip:${track.name}`,
@@ -1283,6 +1481,10 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     menu: pipelineMenu(track),
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
+      // 先按"与当前视图相交"筛一遍：放大之后视图内条目变少，被省掉的就会补上
+      const inView = sorted.filter((it) => it.enter.cycle <= reg.plot.to + 1 && (it.close?.cycle ?? track.lastCycle) >= reg.plot.from - 1);
+      const shown = inView.length > MAX_ITEMS ? inView.slice(0, MAX_ITEMS) : inView;
+      const truncated = shown.length < inView.length;
       // 条目按**取值**着色，而不是按行：同一条指令在 IF/ID/EX/MEM/WB 里是同一个颜色，
       // 一眼就能顺着颜色把一条指令跟到写回。没有标记的条目退回轨道色。
       const laneColor = colorFor(track.name);
@@ -1354,35 +1556,41 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const w = Math.max(1.5, right - x);
         reg.itemBoxes.set(`${track.name}\u0000${item.enterSeq}`, { x, y: barY, w, h: barH });
 
-        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的取值分界。
-        // 未闭合条目（文件结束时仍持有）用虚线框；不画到域末尾之外，也不伪造结束周期。
+        // 每个条目在画布上是一个切角六边形：两端切角处就是它与相邻条目的取值分界。
+        // 已结束的条目进画布（数量最大的一类，节点数因此与条目数无关）；
+        // 未闭合条目要虚线框，画布那套只做实色块，所以留在 SVG。
         const hollow = false;
-        const rect = svgEl('path', {
-          d: hexPath(x, x + w, barY, barY + barH, 4),
-          fill: color,
-          'fill-opacity': BLOCK_FILL,
-          stroke: color,
-          'stroke-width': 1.2,
-          'stroke-linejoin': 'round',
-          ...(open ? { 'stroke-dasharray': '4 3' } : {}),
-        });
-        g.append(rect);
-        // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
-        const sliver = w < 7;
-        const target = sliver
-          ? svgEl('rect', { x: x + w / 2 - 3.5, y: barY - 1, width: 7, height: barH + 2, fill: 'transparent', style: 'pointer-events:all' })
-          : rect;
-        if (sliver) {
-          rect.setAttribute('pointer-events', 'none');
-          g.append(target);
+        if (!open && reg.shapes !== null) {
+          reg.shapes.box(x, x + w, barY, barY + barH, 4, color, BLOCK_FILL);
+        } else {
+          const rect = svgEl('path', {
+            d: hexPath(x, x + w, barY, barY + barH, 4),
+            fill: color,
+            'fill-opacity': BLOCK_FILL,
+            stroke: color,
+            'stroke-width': 1.2,
+            'stroke-linejoin': 'round',
+            ...(open ? { 'stroke-dasharray': '4 3' } : {}),
+          });
+          rect.setAttribute('data-item', '1');
+          g.append(rect);
+          // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
+          const sliver = w < 7;
+          const target = sliver
+            ? svgEl('rect', { x: x + w / 2 - 3.5, y: barY - 1, width: 7, height: barH + 2, fill: 'transparent', style: 'pointer-events:all' })
+            : rect;
+          if (sliver) {
+            rect.setAttribute('pointer-events', 'none');
+            g.append(target);
+          }
+          hoverTarget(
+            target,
+            () => pipTip(track, item, open),
+            () => ctx.selection.set({ kind: 'item', track: track.name, enterSeq: item.enterSeq }),
+          );
+          target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
+          target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
         }
-        hoverTarget(
-          target,
-          () => pipTip(track, item, open),
-          () => ctx.selection.set({ kind: 'item', track: track.name, enterSeq: item.enterSeq }),
-        );
-        target.addEventListener('mouseenter', () => broadcastHover(ctx, { kind: 'item', track: track.name, enterSeq: item.enterSeq }));
-        target.addEventListener('mouseleave', () => broadcastHover(ctx, null));
         if (item.async) {
           g.append(
             svgEl('circle', { cx: x, cy: barY + barH / 2, r: 2.6, fill: 'var(--surface)', stroke: color, 'stroke-width': 1.2, 'pointer-events': 'none' }),
@@ -1401,7 +1609,15 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         }
       }
       if (truncated) {
-        g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 6, class: 'axis-label', text: `仅绘制前 ${shown.length} 条（共 ${sorted.length} 条）` }));
+        g.append(
+          svgEl('text', {
+            x: reg.plot.x1 - 6,
+            y: y + h - 6,
+            class: 'axis-label',
+            'text-anchor': 'end',
+            text: `视图内有 ${fmtInt(inView.length)} 条，只画了前 ${fmtInt(shown.length)} 条（放大可看全）`,
+          }),
+        );
       }
     },
   };
@@ -2177,10 +2393,14 @@ function placeBox(box: SVGRectElement, sel: Selection, reg: Registry, solid: boo
  * 每周期像素：`fitWidth` = 适应宽度；`options.zoom > 0` = 用户显式选择；`0` = 自动铺满但至少 8px/周期。
  * 缩放本身不设上下限（滚轮/± 按钮可以一直放大缩小），只保留画布总宽的保险。
  */
-function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
+function availablePlotWidth(host?: HTMLElement): number {
   // 重建时旧滚动容器已从文档摘掉（clientWidth = 0），此时用上一次量到的宽度或容器宽度估算
-  const live = scrollEl?.isConnected ? scrollEl.clientWidth : chartAvail > 0 ? chartAvail : host.clientWidth;
-  const avail = Math.max(200, live - GUTTER - SIDE * 2 - 2);
+  const live = scrollEl?.isConnected ? scrollEl.clientWidth : chartAvail > 0 ? chartAvail : (host?.clientWidth ?? 0);
+  return Math.max(200, live - GUTTER - SIDE * 2 - 2);
+}
+
+function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
+  const avail = availablePlotWidth(host);
   const ceiling = MAX_PLOT_WIDTH / Math.max(1, span);
   const floor = MIN_PLOT_WIDTH / Math.max(1, span);
   // 「适应宽度」要正好铺满，所以不受手动缩放的像素上限约束
@@ -2324,6 +2544,9 @@ export const timelineView: View = {
   unmount() {
     unsub?.();
     unsub = null;
+    paintToken?.abort();
+    paintToken = null;
+    latestScene = null;
     resizeObs?.disconnect();
     resizeObs = null;
     hostEl = null;

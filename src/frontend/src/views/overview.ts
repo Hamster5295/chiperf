@@ -73,34 +73,68 @@ function donut(items: { label: string; value: number; color: string }[], size = 
   return svg;
 }
 
+/**
+ * 每周期事件数。
+ *
+ * 柱宽由画布宽度决定（上限 1600px），所以周期数一多，"每周期一根柱"就会细到看不见、
+ * 而且要为每一根建一个 DOM 节点与一个悬停目标 —— 20 万周期的轨迹在这里就能堆出 20 万个节点。
+ * 因此超过 `MAX_BARS` 根时按周期**分桶**：桶高 = 桶内记录总数，提示里仍然给区间与峰值。
+ */
+const MAX_BARS = 400;
+
 function recordsPerCycleChart(trace: Trace, domain: string, height = 120): SVGSVGElement {
   const info = trace.domains.get(domain)!;
   const to = Math.max(1, info.lastCycle);
   const width = Math.max(320, Math.min(1600, to * 10 + 60));
   const svg = svgRoot(width, height + 22);
   const counts = new Map<number, number>();
+  let maxPerCycle = 0;
   for (const record of trace.records) {
     if (record.pos.domain !== domain) continue;
-    counts.set(record.pos.cycle, (counts.get(record.pos.cycle) ?? 0) + 1);
+    const next = (counts.get(record.pos.cycle) ?? 0) + 1;
+    counts.set(record.pos.cycle, next);
+    if (next > maxPerCycle) maxPerCycle = next;
   }
-  const max = Math.max(1, ...counts.values());
+  const bucket = Math.max(1, Math.ceil(to / MAX_BARS));
+  const slots = new Map<number, { sum: number; peak: number }>();
+  for (const [cycle, value] of counts) {
+    const key = Math.floor((cycle - 1) / bucket) * bucket + 1;
+    const slot = slots.get(key) ?? { sum: 0, peak: 0 };
+    slot.sum += value;
+    slot.peak = Math.max(slot.peak, value);
+    slots.set(key, slot);
+  }
+  const max = bucket === 1 ? Math.max(1, maxPerCycle) : Math.max(1, ...[...slots.values()].map((s) => s.sum));
   const pad = { left: 34, right: 8, top: 8, bottom: 18 };
   const x = linearScale(1, to + 1, pad.left, width - pad.right);
   const y = linearScale(0, max, height - pad.bottom, pad.top);
   numericAxis(svg, { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom, min: 0, max });
-  for (let cycle = 1; cycle <= to; cycle++) {
-    const value = counts.get(cycle) ?? 0;
+  const bar = (from: number, value: number, tip: () => string): void => {
     const rect = svgEl('rect', {
-      x: x(cycle) + 0.5,
+      x: x(from) + 0.5,
       y: y(value),
-      width: Math.max(1, x(cycle + 1) - x(cycle) - 1),
+      width: Math.max(1, x(from + bucket) - x(from) - 1),
       height: Math.max(0, height - pad.bottom - y(value)),
       fill: 'var(--accent)',
       opacity: 0.75,
       rx: 1.5,
     });
-    hoverTarget(rect, () => `周期 ${cycle}\n${value} 条记录`);
+    hoverTarget(rect, tip);
     svg.append(rect);
+  };
+  if (bucket === 1) {
+    for (let cycle = 1; cycle <= to; cycle++) {
+      const value = counts.get(cycle) ?? 0;
+      bar(cycle, value, () => `周期 ${cycle}\n${value} 条记录`);
+    }
+  } else {
+    for (let from = 1; from <= to; from += bucket) {
+      const end = Math.min(to, from + bucket - 1);
+      const slot = slots.get(from) ?? { sum: 0, peak: 0 };
+      bar(from, slot.sum, () =>
+        [`周期 ${from}${end > from ? ` – ${end}` : ''}（${end - from + 1} 个周期合并成一根柱）`, `合计 ${fmtInt(slot.sum)} 条记录`, `其中最多的一个周期 ${fmtInt(slot.peak)} 条`].join('\n'),
+      );
+    }
   }
   cycleAxis(svg, { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom, from: 1, to });
   return svg;

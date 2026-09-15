@@ -17,6 +17,7 @@
 export * from './types.ts';
 export { ChiperfParser, parseChiperf, UnsupportedVersionError, type ParseOptions } from './parse.ts';
 export { parseChiperfBytes, isGzip } from './gzip.ts';
+export { gunzip, type GunzipOutcome, type GunzipStatus } from './inflate.ts';
 export { Deriver, deriveRecords, type DeriveContext } from './derive.ts';
 export { scanValue, formatValue, valueKey, symIs, asInt } from './value.ts';
 export { parseArgs, stripComment, splitTopLevel, decodeAt, type Arg } from './lexer.ts';
