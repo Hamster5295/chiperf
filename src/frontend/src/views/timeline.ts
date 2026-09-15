@@ -606,7 +606,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   cardNode.body.append(
     legend([
       { label: '完成（O）', color: colorFor('pip') },
-      { label: '冲刷（X，斜纹）', color: COLOR.abort },
+      { label: '冲刷（X，空心斜纹）', color: COLOR.abort },
       { label: '未闭合（虚线）', color: colorFor('pip') },
       { label: '孤立条目（空心 ×）', color: COLOR.orphan },
       { label: '气泡周期', color: COLOR.bubble },
@@ -833,12 +833,16 @@ function drawGrid(g: SVGGElement, plot: Plot): void {
   }
 }
 
-/** 斜纹填充：用于「冲刷（X）」条目 */
+/**
+ * 斜纹：用于「冲刷（X）」条目。
+ * 冲刷条目本身不填充（空心），所以斜纹必须是冲刷色 —— 原来那条白色斜纹
+ * 是画在实色底上的提亮线，白底上看不见。
+ */
 function buildDefs(): SVGDefsElement {
   const defs = svgEl('defs', {});
   defs.append(
     svgEl('pattern', { id: 'tl-stripe', width: 6, height: 6, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' }, [
-      svgEl('line', { x1: 0, y1: 0, x2: 0, y2: 6, stroke: '#ffffff', 'stroke-width': 2, 'stroke-opacity': 0.6 }),
+      svgEl('line', { x1: 0, y1: 0, x2: 0, y2: 6, stroke: COLOR.abort, 'stroke-width': 1.6, 'stroke-opacity': 0.85 }),
     ]),
   );
   return defs;
@@ -1056,15 +1060,21 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const w = Math.max(1.5, right - x);
         reg.itemBoxes.set(`${track.name}\u0000${item.enterSeq}`, { x, y: barY, w, h: barH });
 
-        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的数值分界
+        // 每个条目画成六边形（不再用圆角矩形）：两端切角处就是它与相邻条目的数值分界。
+        // 冲刷（X）条目不填充：靠「空心 + 斜纹 + 虚线框」表达，虚线框与空泡同一套画法，
+        // 于是"这个周期没有内容"和"有内容但被冲掉"一眼能分开，又不会误认成实心条目。
+        const hollow = item.orphan || aborted;
         const rect = svgEl('path', {
           d: hexPath(x, x + w, barY, barY + barH, 4),
-          fill: item.orphan ? 'var(--surface)' : aborted ? COLOR.abort : color,
-          'fill-opacity': item.orphan ? 1 : open ? 0.3 : 0.88,
+          ...(item.orphan
+            ? { fill: 'var(--surface)' }
+            : aborted
+              ? { fill: 'none' }
+              : { fill: color, 'fill-opacity': open ? 0.3 : 0.88 }),
           stroke: item.orphan ? COLOR.orphan : aborted ? COLOR.abort : color,
-          'stroke-width': 1.2,
+          'stroke-width': aborted ? 1 : 1.2,
           'stroke-linejoin': 'round',
-          ...(open ? { 'stroke-dasharray': '4 3' } : {}),
+          ...(open || aborted ? { 'stroke-dasharray': '4 3' } : {}),
         });
         g.append(rect);
         // 退化宽度（孤立条目 / 同拍开闭）的条目仍然好点：套一个隐形命中矩形
@@ -1110,7 +1120,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             svgEl('text', {
               x: x + 3,
               y: y + h - 11,
-              style: `font-size:10px;font-weight:600;fill:${inkOn(item.orphan ? '#ffffff' : aborted ? COLOR.abort : color, item.orphan ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
+              style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? '#ffffff' : color, hollow ? 1 : open ? 0.3 : 0.88)};pointer-events:none`,
               text: clip(formatScalarBy(item.tag, valueFormatOf(`pip:${track.name}`)), w - 6),
             }),
           );
