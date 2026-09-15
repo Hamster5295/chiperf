@@ -1,13 +1,15 @@
 /**
  * 计数器视图 —— 累计曲线、每周期增量、终值占比与区间差工具（spec §9.2）
  *
- * 数据来源：`Trace.counters`（追踪键 = (域, 名字)）。三条必须守住的口径：
+ * 数据来源：`Trace.counters`（追踪键 = (域, 名字)）+ `eventCounters()`：`[evt]` 轨
+ * 按"每条 +1"折算成计数器一起展示（显示名带 `[evt]` 前缀，键带 `evt:` 前缀，
+ * 所以同名的 `[cnt]`/`[evt]` 是两条独立轨道）。四条必须守住的口径：
  *  - `abs=` 回读记录只置总量、不贡献增量（`samples[].delta === null`，spec §9.2）
  *  - 累计值取"该周期末"的取值（`counterTotalAt` 的判据是 position ≤ (cycle, n)）
  *  - `async=1` 的记录不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.7）
  */
 import type { CounterTrack, DomainInfo } from '../../../parser/src/index.ts';
-import { counterDeltaBetween, counterTotalAt, ratioBetween } from '../../../parser/src/index.ts';
+import { counterDeltaBetween, counterTotalAt, eventCounters, ratioBetween } from '../../../parser/src/index.ts';
 import {
   barRect,
   card,
@@ -86,6 +88,9 @@ function chartWidth(span: number, available: number): number {
   return Math.max(available, Math.min(3000, span * 12 + 100));
 }
 
+/** 卡片、图例、下拉里的显示名：evt 折算来的加前缀，免得跟同名 `[cnt]` 看混 */
+const labelOf = (track: CounterTrack): string => (track.source === 'evt' ? `[evt] ${track.name}` : track.name);
+
 /** 卡片列宽：先放同样数量的占位卡片让 auto-fit 定下真实列数，再量列宽（图表至少占满一列） */
 function columnWidth(grid: HTMLElement, count: number): number {
   const probes = Array.from({ length: Math.max(1, count) }, () => el('div', { class: 'card', style: 'visibility:hidden;height:0;border:0' }));
@@ -143,20 +148,27 @@ function statsRow(tracks: CounterTrack[], shown: CounterTrack[]): HTMLElement {
   let absCount = 0;
   let asyncCount = 0;
   let deltaSum = 0;
+  let cntTracks = 0;
+  let evtTracks = 0;
   for (const track of tracks) {
+    if (track.source === 'evt') evtTracks++;
+    else cntTracks++;
     for (const sample of track.samples) {
+      // 异步是"记录不在时钟沿上"，两种来源都算；其余口径只对真 `[cnt]` 记录有意义
+      if (sample.async) asyncCount++;
+      if (track.source === 'evt') continue;
       samples++;
       if (sample.delta === null) absCount++;
       else deltaSum += sample.delta;
-      if (sample.async) asyncCount++;
     }
   }
   return el('div', { class: 'stat-row' }, [
-    statTile('计数器', countLabel(tracks.length), shown.length === tracks.length ? '每个 (域, 名字) 一条' : `当前筛选显示 ${shown.length} 个`),
+    statTile('计数器', countLabel(cntTracks), '每个 (域, 名字) 一条 cnt 轨道'),
+    statTile('事件计数', countLabel(evtTracks), '每个 [evt] 轨道按"每条 +1"折算（spec §9.1）'),
     statTile('cnt 记录', countLabel(samples), '每条 cnt 记录一次采样'),
     statTile('abs= 回读', countLabel(absCount), '只置总量，不贡献增量（spec §9.2）'),
     statTile('Δ 合计', countLabel(deltaSum), '所有 delta 之和（不含 abs= 回读）'),
-    statTile('异步记录', countLabel(asyncCount), '不在时钟沿上（spec §6.7）'),
+    statTile('异步记录', countLabel(asyncCount), shown.length === tracks.length ? '不在时钟沿上（spec §6.7），cnt/evt 都算' : `当前筛选显示 ${countLabel(shown.length)} 条轨道`),
   ]);
 }
 
@@ -166,7 +178,7 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
   const points = orderedPoints(track);
   const color = colorFor(track.key);
   const absCount = points.filter((p) => p.abs).length;
-  const node = card(track.name, `${track.domain} · ${fmtInt(track.samples.length)} 条采样 · 终值 ${countLabel(track.total)}`, [
+  const node = card(labelOf(track), `${track.source === 'evt' ? '[evt] 轨（每条事件算一次 +1）· ' : ''}${track.domain} · ${fmtInt(track.samples.length)} 条采样 · 终值 ${countLabel(track.total)}`, [
     (() => {
       const btn = el('button', { class: 'btn btn-ghost', text: '详情' });
       btn.addEventListener('click', () => inspectCounter(track, ctx));
@@ -242,7 +254,11 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
       [
         x.label(p.cycle),
         `累计 ${fmtInt(p.total)}`,
-        p.abs ? `绝对值回读 abs（spec §9.2，不贡献增量）` : '增量采样',
+        track.source === 'evt'
+          ? '事件记录：每条算一次 +1（spec §9.1）'
+          : p.abs
+            ? `绝对值回读 abs（spec §9.2，不贡献增量）`
+            : '增量采样',
         p.async ? '异步记录：不在时钟沿上，画在周期区间内部（spec §6.7）' : '时钟沿采样',
         `源文件第 ${p.line} 行`,
       ].join('\n');
@@ -253,7 +269,10 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
         ['位置', x.label(p.cycle)],
         ['周期', String(p.cycle)],
         ['该点累计值', fmtInt(p.total)],
-        ['记录类型', p.abs ? 'abs= 绝对值回读' : p.async ? '异步增量' : '普通增量'],
+        [
+          '记录类型',
+          track.source === 'evt' ? '事件记录（每条 +1）' : p.abs ? 'abs= 绝对值回读' : p.async ? '异步增量' : '普通增量',
+        ],
         ['源文件行', String(p.line)],
       ]);
     });
@@ -264,6 +283,7 @@ function cumulativeCard(track: CounterTrack, dom: DomainInfo | undefined, useTim
 
   const dotted = el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
     el('span', { text: `${fmtInt(points.length)} 条采样（图上抽稀到 ${fmtInt(drawn.length)} 点）` }),
+    track.source === 'evt' ? el('span', { text: '[evt] 轨：每条事件算一次 +1' }) : null,
     absCount > 0 ? el('span', { text: `○ 空心黄点 = abs= 回读（${fmtInt(absCount)} 次）` }) : null,
     el('span', { text: '虚线空心点 = 异步记录（不在时钟沿上）' }),
     el('span', { text: '点击图形或标记可广播选中' }),
@@ -291,6 +311,7 @@ function inspectCounter(track: CounterTrack, ctx: ViewContext): void {
     `计数器 · ${track.name}`,
     [
       ['域', track.domain],
+      ['来源', track.source === 'evt' ? '由 [evt] 轨道折算：每条事件 +1（spec §9.1）' : '[cnt] 记录'],
       ['追踪键', track.key.replace('\u0000', ' / ')],
       ['终值', fmtInt(track.total)],
       ['采样条数', fmtInt(track.samples.length)],
@@ -386,7 +407,7 @@ function deltaChart(track: CounterTrack, ctx: ViewContext, useTime: boolean, ava
   const deltaSum = [...track.deltaByCycle.values()].reduce((a, b) => a + b, 0);
   return el('div', {}, [
     el('div', { class: 'row' }, [
-      el('span', { class: 'mono', text: track.name }),
+      el('span', { class: 'mono', text: labelOf(track) }),
       el('span', { class: 'badge', text: track.domain }),
       el('span', { class: 'badge', text: `Δ合计 ${countLabel(deltaSum)}` }),
       el('span', { class: 'badge', text: `${fmtInt(cycles.length)} 个周期有增量` }),
@@ -451,7 +472,7 @@ function shareCard(tracks: CounterTrack[], ctx: ViewContext): HTMLElement {
     const items = list
       .filter((t) => t.total > 0)
       .sort((a, b) => b.total - a.total)
-      .map((t) => ({ key: t.key, label: t.name, value: t.total, color: colorFor(t.key) }));
+      .map((t) => ({ key: t.key, label: labelOf(t), value: t.total, color: colorFor(t.key) }));
     const total = items.reduce((sum, item) => sum + item.value, 0);
     const block = el('div', {}, [
       el('div', { class: 'row' }, [
@@ -490,8 +511,8 @@ function intervalCard(tracks: CounterTrack[], ctx: ViewContext, range: { from: n
   const numSel = el('select', { style: selectStyle });
   const denSel = el('select', { style: selectStyle });
   for (const track of tracks) {
-    numSel.append(el('option', { value: track.key, text: track.name }));
-    denSel.append(el('option', { value: track.key, text: track.name }));
+    numSel.append(el('option', { value: track.key, text: labelOf(track) }));
+    denSel.append(el('option', { value: track.key, text: labelOf(track) }));
   }
   numSel.value = tracks[0]?.key ?? '';
   denSel.value = tracks[1]?.key ?? tracks[0]?.key ?? '';
@@ -515,7 +536,7 @@ function intervalCard(tracks: CounterTrack[], ctx: ViewContext, range: { from: n
       const t1 = counterTotalAt(track, c1);
       const t2 = counterTotalAt(track, c2);
       const share = delta !== null && sum !== 0 ? `${((delta / sum) * 100).toFixed(1)}%` : '—';
-      const name = el('button', { class: 'btn btn-ghost mono', text: track.name, style: 'padding:0;font-size:12px' });
+      const name = el('button', { class: 'btn btn-ghost mono', text: labelOf(track), style: 'padding:0;font-size:12px' });
       name.addEventListener('click', () => {
         ctx.selection.set({ kind: 'counter', key: track.key });
         inspectCounter(track, ctx);
@@ -575,14 +596,14 @@ function render(ctx: ViewContext): void {
   if (!containerRef) return;
   clear(containerRef);
   highlights.clear();
-  const all = [...ctx.trace.counters.values()];
+  const all = [...ctx.trace.counters.values(), ...eventCounters(ctx.trace)];
   const shown = all
     .filter((t) => ctx.options.domains.length === 0 || ctx.options.domains.includes(t.domain))
     .sort((a, b) => (a.domain === b.domain ? a.name.localeCompare(b.name) : a.domain.localeCompare(b.domain)));
 
   if (shown.length === 0) {
     const node = card('计数器');
-    node.body.append(emptyState(all.length === 0 ? '这份轨迹没有 cnt 记录' : '当前时钟域筛选下没有计数器'));
+    node.body.append(emptyState(all.length === 0 ? '这份轨迹没有 cnt 记录，也没有 evt 记录' : '当前时钟域筛选下没有计数器'));
     containerRef.append(node.root);
     return;
   }
@@ -632,7 +653,7 @@ function render(ctx: ViewContext): void {
 export const countersView: View = {
   id: 'counters',
   title: '计数器',
-  hint: '累计曲线、每周期增量、比率',
+  hint: '累计曲线、每周期增量、比率；[evt] 按每条 +1 与计数器一起展示',
   mount(container, ctx) {
     // app.ts 每次重挂载都会新建容器：先退订上一次，避免监听器累积
     unsubscribe?.();
