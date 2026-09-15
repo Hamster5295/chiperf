@@ -152,14 +152,20 @@ export function sampleTrace(): string {
     put(index, slot.wbOut, `[cnt] "core.retired"`);
   }
 
+  // X 标在"冲刷生效的那个沿"，而不是解析出预测错误的当拍：被冲刷的指令确实占用了
+  // mispredictCycle 这一拍（stageAt 说它此刻在 IF/ID 里），撤走发生在该拍末尾 ——
+  // 位置取后一拍才与它自己那份 O 记录（O 也写在离开的那一拍）同一套约定。
+  // 若把 X 写在 mispredictCycle 当拍，条目会成为零宽 `[c, c)`：按 §9.4 那类条目
+  // 不计入任何周期的占用度，图上只剩周期交界处的一个薄片，占用度曲线里也看不到它。
+  const flushCycle = mispredictCycle + 1;
   for (const index of killedIndices) {
     const slot = slots[index]!;
-    at(mispredictCycle, `[pip] "core.${stageAt(slot, mispredictCycle)}", X, ${hex(slot.instr.pc)}`);
+    at(flushCycle, `[pip] "core.${stageAt(slot, mispredictCycle)}", X, ${hex(slot.instr.pc)}`);
   }
   at(mispredictCycle, `[cnt] "core.br.miss"`);
   at(mispredictCycle, `[evt] "core.flush", ${hex(PROGRAM[MISPREDICT_INDEX]!.pc)}`);
   at(mispredictCycle, `[val] "core.if.valid", 0`);
-  at(mispredictCycle + 1, `[evt] "core.redirect", ${hex(PROGRAM[REDIRECT_TARGET_INDEX]!.pc)}`);
+  at(flushCycle, `[evt] "core.redirect", ${hex(PROGRAM[REDIRECT_TARGET_INDEX]!.pc)}`);
 
   // 控制状态机
   at(slots[0]!.ifIn, '[fsm] "core.ctrl", FETCH');
