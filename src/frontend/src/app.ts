@@ -113,13 +113,38 @@ function chip(text: string, cls: string): HTMLElement {
   return el('span', { class: `chip ${cls}`.trim(), text });
 }
 
+/** 侧边栏图标：内联 12×12 描边图形，统一用 currentColor，避免依赖图标字体 */
+const RAIL_ICONS: Record<string, string> = {
+  overview: 'M2 2h4v4H2zM8 2h4v7H8zM2 8h4v4H2zM8 11h4v1H8z',
+  timeline: 'M1 3h10M1 7h7M1 11h9',
+  pipeline: 'M1 3h4v6H1zM7 3h4v3H7zM7 8h4v3H7z',
+  fsm: 'M2 3h3v3H2zM7 8h3v3H7zM5 4.5h3.5v5',
+  counters: 'M2 10V6M5 10V3M8 10V5M11 10V2',
+  values: 'M1 8c2 0 2-5 4-5s2 6 4 6 1-3 2-3',
+  table: 'M1 3h10M1 6.5h10M1 10h10M4 3v7.5M8 3v7.5',
+};
+
+function viewIcon(id: string): SVGElement {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 12 12');
+  svg.setAttribute('class', 'rail-icon');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.4');
+  svg.setAttribute('stroke-linecap', 'round');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', RAIL_ICONS[id] ?? 'M1 6h10');
+  svg.append(path);
+  return svg;
+}
+
 function buildRail(): HTMLElement {
   const rail = el('nav', { class: 'rail' });
   rail.id = 'rail';
   for (const view of state.views) {
-    const link = el('a', { class: 'rail-item', href: `#/${view.id}` }, [
+    const link = el('a', { class: 'rail-item', href: `#/${view.id}`, title: view.hint }, [
+      viewIcon(view.id),
       el('span', { class: 'rail-title', text: view.title }),
-      el('span', { class: 'rail-hint', text: view.hint }),
     ]);
     if (view.id === state.currentId) link.classList.add('is-active');
     rail.append(link);
