@@ -26,7 +26,8 @@ export function stripComment(line: string): string {
 }
 
 /** 按顶层逗号切分字段，字符串内的逗号不切（spec §5.1） */
-export function splitTopLevel(s: string): string[] {
+/** 顶层切分：引号内的分隔符不算（`sep` 决定哪些字符算分隔符） */
+function splitOn(s: string, isSep: (c: string) => boolean): string[] {
   const out: string[] = [];
   let cur = '';
   let inString = false;
@@ -37,7 +38,7 @@ export function splitTopLevel(s: string): string[] {
       cur += c;
       continue;
     }
-    if (c === ',' && !inString) {
+    if (!inString && isSep(c)) {
       out.push(cur);
       cur = '';
       continue;
@@ -46,6 +47,21 @@ export function splitTopLevel(s: string): string[] {
   }
   out.push(cur);
   return out;
+}
+
+/** 记录字段的顶层切分：只认逗号（spec §5.1） */
+export function splitTopLevel(s: string): string[] {
+  return splitOn(s, (c) => c === ',');
+}
+
+/**
+ * 指令字段的顶层切分（spec §8）：逗号**或空白**都算分隔符。
+ * 指令的语法写作 `@ <名> [位置参数...] [属性...]`，§8.1 的例子就是空白分隔的
+ * （`@meta design="x" tool="y"`），而 `@domain core, period=1.0ns` 又是逗号分隔，
+ * 两种写法都在用，所以两种都收 —— 未加引号的记号本来就不含空白，切分无歧义。
+ */
+export function splitDirectiveFields(s: string): string[] {
+  return splitOn(s, (c) => c === ',' || c === ' ' || c === '\t');
 }
 
 /** 找出顶层（不在字符串内）的第一个 `=` 的位置 */
@@ -65,15 +81,20 @@ const RE_AT_VALUE = /^-?\d+[pn]?$/;
  * 解析一条记录的字段列表。
  * 消歧规则（spec §5.1）：字段首记号后紧跟 `=` ⇒ 属性；否则位置参数。
  */
-export function parseArgs(fieldText: string, opts: { allowAttrs?: boolean } = {}): Arg[] {
+export function parseArgs(fieldText: string, opts: { allowAttrs?: boolean; spaceSeparated?: boolean } = {}): Arg[] {
   const trimmed = fieldText.trim();
   if (trimmed.length === 0) return [];
   const args: Arg[] = [];
   let sawAttr = false;
 
-  for (const rawField of splitTopLevel(trimmed)) {
+  // 指令允许空白分隔（splitDirectiveFields），记录只认逗号（§5.1）
+  const fields = opts.spaceSeparated === true ? splitDirectiveFields(trimmed) : splitTopLevel(trimmed);
+  for (const rawField of fields) {
     const field = rawField.trim();
     if (field.length === 0) {
+      // 指令里 `, ` 这种"逗号 + 空白"的组合会产生空段，忽略；
+      // 记录里空字段是语法错误（§5.1：不允许空字段）
+      if (opts.spaceSeparated === true) continue;
       args.push({ kind: 'error', reason: '空字段（多余的逗号）', text: rawField });
       continue;
     }

@@ -193,18 +193,25 @@ export class ChiperfParser {
     }
     if (name === 'meta') {
       if (rest.trim().length === 0) return;
-      const args = parseArgs(rest);
-      if (args.some((a) => a.kind !== 'attr' && a.kind !== 'error')) {
+      const args = parseArgs(rest, { spaceSeparated: true });
+      const bad = args.find((a) => a.kind === 'error');
+      if (bad !== undefined) {
+        // 以前这里把解析错误悄悄吞掉：写错分隔符会静默丢光元数据
+        this.skip('invalid_record', this.lineNo, body, `@meta 的字段必须都是 键=值（${bad.reason}）`);
+        return;
+      }
+      if (args.some((a) => a.kind !== 'attr')) {
         this.skip('invalid_record', this.lineNo, body, '@meta 的字段必须都是 键=值');
         return;
       }
       const attrs = this.collectAttrs(args);
       if (attrs === null) return;
-      for (const [key, value] of attrs) this.meta[key] = value === null ? '' : formatValue(value);
+      // 字符串值取解码后的正文（与 @domain 的 note 一致）；其它类型保留格式化后的形式
+      for (const [key, value] of attrs) this.meta[key] = value === null ? '' : value.kind === 'str' ? value.text : formatValue(value);
       return;
     }
     if (name === 'domain') {
-      const args = parseArgs(rest);
+      const args = parseArgs(rest, { spaceSeparated: true });
       if (args.some((a) => a.kind === 'error')) {
         this.skip('invalid_record', this.lineNo, body, args.find((a) => a.kind === 'error')!.reason);
         return;
