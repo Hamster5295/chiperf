@@ -1290,20 +1290,23 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
           }
           g.append(svgEl('path', { d: stepPath(points), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linejoin': 'round' }));
         }
-        for (const entry of numeric) {
-          const x = xOf(entry.sample.pos, entry.sample.async);
-          const unknown = entry.sample.value.hasXZ === true;
-          g.append(
-            svgEl('circle', {
-              cx: x,
-              cy: yOf(entry.value),
-              r: unknown ? 2.6 : 1.8,
-              fill: unknown ? 'var(--surface)' : color,
-              stroke: color,
-              'stroke-width': 1.1,
-              ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
-            }),
-          );
+        // 采样点标记：块的边界本身就是采样位置，块里也写着值，所以六边形块模式不画点
+        if (mode !== 'blocks') {
+          for (const entry of numeric) {
+            const x = xOf(entry.sample.pos, entry.sample.async);
+            const unknown = entry.sample.value.hasXZ === true;
+            g.append(
+              svgEl('circle', {
+                cx: x,
+                cy: yOf(entry.value),
+                r: unknown ? 2.6 : 1.8,
+                fill: unknown ? 'var(--surface)' : color,
+                stroke: color,
+                'stroke-width': 1.1,
+                ...(unknown ? { 'stroke-dasharray': '2 1.5' } : {}),
+              }),
+            );
+          }
         }
       } else {
         // 非数值（字符串/符号）：只标变化点，值写在提示里
