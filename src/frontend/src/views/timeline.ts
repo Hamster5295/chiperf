@@ -1411,18 +1411,34 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
               `气泡：${track.name}`,
               `周期 ${start}${end > start ? ` – ${end}` : ''}（共 ${end - start + 1} 周期）`,
               inferred
-                ? `推断：第 ${track.lastCycle} 周期之后该轨道没有记录，而域 ${track.domain} 还在记录 —— 沿用"无内容"直到轨迹末尾`
+                ? [
+                    start <= track.lastCycle
+                      ? `其中周期 ${start}${track.lastCycle > start ? ` – ${track.lastCycle}` : ''} 是实测的"没有内容"`
+                      : null,
+                    `推断：第 ${track.lastCycle} 周期之后该轨道没有记录，而域 ${track.domain} 还在记录 —— 沿用"无内容"直到轨迹末尾`,
+                  ]
+                    .filter((line): line is string => line !== null)
+                    .join('\n')
                 : '这些周期该轨道没有在飞内容',
             ].join('\n'),
           () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: start }),
         );
         g.append(box);
       };
-      for (const range of track.bubbleRanges) bubble(range.start, range.end, false);
+      // 末尾那个气泡段与"保持到轨迹末尾"的尾巴是**同一个气泡**：必须连成一段画。
+      // 分开画会得到"一个单周期六边形 + 一个拉到最右侧的六边形"两截，中间多一条接缝 ——
+      // 看上去像气泡结束过一次又开始了。
+      const tailFrom = track.lastCycle + 1;
+      const holdTail = (track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd;
+      const trailing =
+        holdTail ? (track.bubbleRanges.filter((range) => range.end === track.lastCycle).pop() ?? null) : null;
+      for (const range of track.bubbleRanges) {
+        if (trailing !== null && range.start === trailing.start && range.end === trailing.end) continue;
+        bubble(range.start, range.end, false);
+      }
       // 推断的气泡尾巴：末尾已知"无内容"，且该域仍在继续（写到域自己的末周期为止，
       // 再往后这个域根本没有记录，画出去就是编造）
-      const tailFrom = track.lastCycle + 1;
-      if ((track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd) bubble(tailFrom, domainEnd, true);
+      if (holdTail) bubble(trailing?.start ?? tailFrom, domainEnd, true);
 
       const barH = h - 9;
       const barY = y + 4;
