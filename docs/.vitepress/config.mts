@@ -1,11 +1,17 @@
 import { defineConfig } from "vitepress";
 
+// 部署到 GitHub Pages 的路径：https://<user>.github.io/chiperf/docs/
+const DOCS_BASE = process.env.DOCS_BASE ?? '/chiperf/docs/'
+
 export default defineConfig({
+    base: DOCS_BASE,
     lang: 'zh-CN',
     title: 'Chiperf',
     description: '硬件微架构性能分析与可视化的通用文件格式',
     cleanUrls: true,
     lastUpdated: true,
+    // 内容目录叫 docs/，这里把路由前缀去掉，页面直接位于 .../docs/ 下
+    rewrites: (id) => id.replace(/^docs\//, ''),
     // .chiperf 语料以静态文件形式经 public/ 提供，不是站点页面
     ignoreDeadLinks: [/\.chiperf$/],
     head: [
@@ -21,43 +27,45 @@ export default defineConfig({
     },
     themeConfig: {
         nav: [
-            { text: '指南', link: '/docs/guide' },
-            { text: '规范', link: '/docs/spec' },
-            { text: '示例', link: '/docs/examples/' },
+            { text: '简介', link: '/intro' },
+            { text: '事件', link: '/events/' },
+            { text: '规范', link: '/spec/v1.0' },
+            { text: '示例', link: '/examples' },
+            { text: '工具链', link: '/toolchain' },
         ],
         sidebar: [
             {
                 text: '开始',
                 items: [
-                    { text: '这是什么？', link: '/docs/intro' },
-                    { text: '工具链', link: '/docs/toolchain' },
-                    { text: '示例', link: '/docs/examples' }
+                    { text: '这是什么？', link: '/intro' },
+                    { text: '工具链', link: '/toolchain' },
+                    { text: '示例', link: '/examples' },
                 ],
             },
             {
                 text: '事件',
                 items: [
-                    { text: '总览', link: '/docs/events/' },
-                    { text: 'clk 时钟沿', link: '/docs/events/clk' },
-                    { text: 'cnt 计数器', link: '/docs/events/cnt' },
-                    { text: 'val 数值采样', link: '/docs/events/val' },
-                    { text: 'pip 在飞条目', link: '/docs/events/pip' },
-                    { text: 'fsm 状态机', link: '/docs/events/fsm' },
-                    { text: 'evt 瞬时事件', link: '/docs/events/evt' },
-                    { text: 'msg 自由文本', link: '/docs/events/msg' },
-                    { text: 'rst 系统复位', link: '/docs/events/rst' },
+                    { text: '总览', link: '/events/' },
+                    { text: 'clk 时钟沿', link: '/events/clk' },
+                    { text: 'cnt 计数器', link: '/events/cnt' },
+                    { text: 'val 数值采样', link: '/events/val' },
+                    { text: 'pip 在飞条目', link: '/events/pip' },
+                    { text: 'fsm 状态机', link: '/events/fsm' },
+                    { text: 'evt 瞬时事件', link: '/events/evt' },
+                    { text: 'msg 自由文本', link: '/events/msg' },
+                    { text: 'rst 系统复位', link: '/events/rst' },
                 ],
             },
             {
                 text: 'Spec',
-                items: [{ text: 'V1.0', link: '/docs/spec/v1.0' }],
+                items: [{ text: 'V1.0', link: '/spec/v1.0' }],
             },
         ],
         outline: { level: [2, 3], label: '本页目录' },
         search: { provider: 'local' },
         editLink: {
-            pattern: 'https://codeberg.org/hamster5295/chiperf/_edit/main/docs/:path',
-            text: '在 Codeberg 上编辑此页',
+            pattern: 'https://github.com/Hamster5295/chiperf/edit/main/docs/:path',
+            text: '在 GitHub 上编辑此页',
         },
         docFooter: { prev: '上一篇', next: '下一篇' },
         lastUpdated: { text: '最后更新于' },

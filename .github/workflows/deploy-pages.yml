@@ -1,0 +1,72 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 允许读取仓库、使用 Pages 部署、获取 OIDC token
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一个部署
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # 文档站：base 在 docs/.vitepress/config.mts 中固定为 /chiperf/docs/
+      - name: Build docs (VitePress)
+        working-directory: docs
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      # 可视化器：产出仓库根目录 dist/index.html（单文件，CSS/JS 已内联）
+      - name: Build visualize (src/frontend)
+        working-directory: src/frontend
+        run: bun run build
+
+      # 组装站点：
+      #   /chiperf/docs/       <- 文档站
+      #   /chiperf/visualize/  <- 可视化器
+      #   /chiperf/            <- 入口页
+      - name: Assemble site
+        run: |
+          mkdir -p _site/docs _site/visualize
+          cp -r docs/.vitepress/dist/. _site/docs/
+          cp dist/index.html _site/visualize/index.html
+          cp .github/pages/index.html _site/index.html
+          touch _site/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

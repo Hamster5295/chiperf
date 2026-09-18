@@ -7,10 +7,10 @@ hero:
   actions:
     - theme: brand
       text: 立即体验
-      link: /docs/intro
+      link: /intro
     - theme: alt
       text: Spec V1.0
-      link: /docs/spec/v1.0
+      link: /spec/v1.0
 
 features:
   - title: 🚀 事件驱动

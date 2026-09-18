@@ -1,1 +1,147 @@
-../../../docs/examples/rv32i-pipeline.chiperf
+chiperf 1.0
+@meta design="rv32i-demo" tool="hand-written" note="演示轨迹：覆盖 7 种记录类型，非时序精确模型"
+@domain default, period=1.0ns, note="单一时钟，只插桩上升沿"
+# 指令表（tag 即 PC）：
+#   A 0x80000000 addi a0,a0,1
+#   B 0x80000004 lw   a1,0(a0)      <- I-cache miss
+#   C 0x80000008 beq  a0,a1,+8      <- 预测错误，第 5 周期在 EX 解析，第 6 周期冲刷
+#   D 0x8000000c addi a2,a2,1       <- 错误路径，被冲刷
+#   E 0x80000010 addi a2,a2,1       <- 错误路径，被冲刷
+#   F 0x80000100 addi a3,a3,1       <- 重定向目标
+#
+# 流水级（进入周期 -> 离开周期）：
+#   A: if 1->2  id 2->3  ex 3->4  mem 4->5  wb 5->6
+#   B: if 2->3  id 3->4  ex 4->5  mem 5->6  wb 6->7
+#   C: if 3->4  id 4->5  ex 5->6  mem 6->7  wb 7->8
+#   D: if 4->5  id 5->6(冲刷)
+#   E: if 5->6(冲刷)
+#   F: if 7->8  id 8->9  ex 9->10 mem 10->11 wb 11->12
+
+# ---- 时钟之前：复位阶段（cycle 0, phase -）----
+[msg] reset released; trace is synthetic and illustrative
+[fsm] "core.ctrl", RESET
+[fsm] "core.icache.ctrl", IDLE
+[cnt] "core.retired", abs=0
+[val] "core.if.pc", x
+[val] "core.if.valid", 0
+
+# ---- cycle 1 ----
+[clk] p
+[fsm] "core.ctrl", FETCH
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_0000
+[val] "core.if.valid", 1
+[pip] "core.if", 0x80000000
+
+# ---- cycle 2 ----
+[clk] p
+[fsm] "core.ctrl", RUN
+[fsm] "core.icache.ctrl", LOOKUP
+[cnt] "core.icache.access"
+[cnt] "core.icache.miss"
+[val] "core.if.pc", 32'h8000_0004
+[pip] "core.if", 0x80000004
+[pip] "core.if", 0x80000004
+[pip] "core.id", 0x80000000
+[val] "core.id.instr", 32'h00150513          # addi a0,a0,1
+
+# ---- cycle 3 ----
+[clk] p
+[fsm] "core.icache.ctrl", FILL
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_0008
+[pip] "core.if", 0x80000008
+[pip] "core.if", 0x80000008
+[pip] "core.id", 0x80000004
+[val] "core.id.instr", 32'h00052583          # lw a1,0(a0)
+[pip] "core.id", 0x80000004
+[pip] "core.ex", 0x80000000
+
+# ---- cycle 4 ----
+[clk] p
+[fsm] "core.icache.ctrl", FILL               # 自环：填充需要两个周期
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_000c
+[pip] "core.if", 0x8000000c
+[pip] "core.if", 0x8000000c
+[pip] "core.id", 0x80000008
+[val] "core.id.instr", 32'h00b50463          # beq a0,a1,+8
+[pip] "core.id", 0x80000008
+[pip] "core.ex", 0x80000004
+[pip] "core.ex", 0x80000004
+[pip] "core.mem", 0x80000000
+
+# ---- cycle 5 ----
+[clk] p
+[fsm] "core.icache.ctrl", IDLE
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_0010
+[pip] "core.if", 0x80000010
+[pip] "core.if", 0x80000010
+[pip] "core.id", 0x8000000c
+[val] "core.id.instr", 32'h00160613          # addi a2,a2,1
+[pip] "core.id", 0x8000000c
+[pip] "core.ex", 0x80000008
+[pip] "core.ex", 0x80000008
+[pip] "core.mem", 0x80000004
+[pip] "core.mem", 0x80000004
+[pip] "core.wb", 0x80000000
+
+# ---- cycle 6：分支在 EX 解析出预测错误，重定向并冲刷年轻指令 ----
+[clk] p
+[cnt] "core.br.miss"
+[evt] "core.redirect", 0x80000100
+[val] "core.if.valid", 0
+[pip] "core.if", bubble # E 被冲刷（if 内驻留 1 周期）
+[pip] "core.id", bubble # D 被冲刷（id 内驻留 1 周期）
+[pip] "core.ex", bubble
+[pip] "core.mem", 0x80000008
+[pip] "core.mem", 0x80000008
+[pip] "core.wb", 0x80000004
+[pip] "core.wb", 0x80000004
+[cnt] "core.retired"
+
+# ---- cycle 7 ----
+[clk] p
+[fsm] "core.ctrl", FETCH
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_0100
+[val] "core.if.valid", 1
+[pip] "core.if", 0x80000100
+[pip] "core.mem", bubble
+[pip] "core.wb", 0x80000008
+[pip] "core.wb", 0x80000008
+[cnt] "core.retired"
+
+# ---- cycle 8 ----
+[clk] p
+[fsm] "core.ctrl", RUN
+[val] "core.if.valid", 0
+[pip] "core.if", bubble
+[pip] "core.id", 0x80000100
+[val] "core.id.instr", 32'h00168693          # addi a3,a3,1
+[pip] "core.wb", bubble
+[cnt] "core.retired"
+
+# ---- cycle 9 ----
+[clk] p
+[pip] "core.id", bubble
+[pip] "core.ex", 0x80000100
+
+# ---- cycle 10 ----
+[clk] p
+[pip] "core.ex", bubble
+[pip] "core.mem", 0x80000100
+
+# ---- cycle 11 ----
+[clk] p
+[fsm] "core.ctrl", DRAIN
+[pip] "core.mem", bubble
+[pip] "core.wb", 0x80000100
+
+# ---- cycle 12 ----
+[clk] p
+[pip] "core.wb", bubble
+[cnt] "core.retired"
+[fsm] "core.ctrl", DONE
+@end
