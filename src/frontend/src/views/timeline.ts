@@ -2,16 +2,18 @@
  * 时间轴视图 —— 时钟 · 状态机 · 流水线 · 占用度 · 计数器 · 事件 · 异步事件的**共用横轴**
  *
  * 设计要点：
- *  - 横轴是周期：周期 c 占据 `[scale(c), scale(c+1))`；`useTimeAxis` 且域声明了 period 时，
- *    刻度改标时间（ns），换算用「主域」（优先 `default`）的 period。
- *  - 所有泳道共用同一个周期映射；宽 SVG 由 `.chart-scroll` 横向滚动，左侧标签列用 `position:sticky`
- *    钉在滚动窗口左边，横滚时轨道名不会跑掉。
+ *  - 横轴是周期：周期 c 占据 `[scale(c), scale(c+1))`。
+ *  - 所有泳道共用同一个周期映射；画布就是**可见窗口**（宽度 = 可视宽度），缩放改的是窗口覆盖多少周期，
+ *    平移用滚轮；因此放大没有上限，缩小下限是整条轨迹铺满宽度。
  *  - `async=1` 的记录（`record.async`，spec §6.7）不吸附到时钟沿：一律画在**周期区间中点**
  *    （两个时钟沿之间），空心标记 + 虚线连回所在区间；另有一条「异步事件」泳道汇总。
  *  - 半开区间：流水线条目、占用度、状态带都按 `[enter, close)` 画；
  *    未闭合条目（`closed === null`）只画到 `track.lastCycle`，**不伪造**退出周期。
- *  - 大文件：`records` 只扫一遍聚合成每域的沿集合；每个泳道最多画 MAX_ITEMS 个条目，
- *    文字标签有全局预算，占用度在低缩放下退化成阶梯折线。
+ *  - 大文件：沿集合按（轨迹, 可见域）缓存，重建不再重扫 `records`；每条泳道的排序/下采样
+ *    只准备一次（WeakMap，换文件自动释放）
+ *  - 缩放分级：缩小时逐像素聚合成**轮廓**（不碰全量数据）；放大时按可见窗口二分读取，
+ *    只渲染看得见的一段，窗口外的条目不建节点
+ *  - 绘制一律按行分片、片间让出主线程，可被新一轮重建取消；文字标签有全局预算
  */
 import type {
   DomainInfo,
@@ -103,12 +105,6 @@ function inkOn(fill: string | null, alpha = 1): string {
   return inkOnBackdrop(fill, alpha, backdrop ?? [255, 255, 255]);
 }
 
-/** 自动铺满时每周期的最小像素（默认视图别太挤） */
-const PX_DEFAULT = 8;
-/** 画布总宽上限（不是缩放上限）：几十万像素的 SVG 浏览器渲染会明显吃力 */
-const MAX_PLOT_WIDTH = 200000;
-/** 画布总宽下限（px）：缩到一根线就没法看了 */
-const MIN_PLOT_WIDTH = 24;
 /** 每个泳道的条目 / 标记 / 文本上限 */
 /**
  * 每个泳道最多画多少个图元（**节点预算**，不是数据上限）。
@@ -199,6 +195,8 @@ interface LaneRegistration {
   y: number;
   h: number;
   color: string;
+  /** 滚动后原地重画要用（重建分组节点，避免在旧节点上叠加事件监听） */
+  row: LaneRow;
 }
 
 interface Box {
@@ -212,6 +210,18 @@ interface Box {
 interface Surface {
   svg: SVGSVGElement;
   plot: Plot;
+}
+
+/**
+ * 一次绘制所覆盖的用户坐标 / 周期窗口（含两侧缓冲）。
+ * 每轮绘制只从滚动容器量一次，各泳道共用 —— 否则每条泳道都读一次 `scrollLeft/clientWidth`，
+ * 在泳道之间又穿插了 DOM 写入，会反复触发同步布局。
+ */
+interface Viewport {
+  x0: number;
+  x1: number;
+  c0: number;
+  c1: number;
 }
 
 /** 渲染期共享的注册表：`applyState()` 用它做选中/悬停高亮，不必重建 DOM */
@@ -228,6 +238,8 @@ interface Registry extends Surface {
   hoverTag: SVGTextElement;
   /** 渲染循环在调用 row.draw 前写入，供 cycleSurface 捕获（不改各泳道的绘制签名） */
   currentRow: { key: string; y: number; h: number; color: string } | null;
+  /** 本轮绘制的可见窗口（懒计算，各泳道共用） */
+  viewport: Viewport | null;
 }
 
 /** 行分组：仅用于给行头背景上色（界面上不再显示小标题） */
@@ -332,13 +344,21 @@ function menuTargets(row: LaneRow): LaneRow[] {
   if (selectedRows.size <= 1 || !selectedRows.has(row.key)) return [row];
   return allRows.filter((candidate) => selectedRows.has(candidate.key));
 }
-let scrollEl: HTMLElement | null = null;
-/**
- * 期望的横向滚动位置。`paint()` 会 `clear(host)` 后整棵重建，新的 `.chart-scroll` 从 0 开始；
- * 聚合窗口若直接读元素，重建后画出来的就是窗口最左端那一屏（而不是用户看的那一屏）。
- * 所以滚动位置单独记一份，建好新 scroller 立刻回填（泳道是之后才画的）。
- */
-let scrollWanted = 0;
+/** 卡片内容容器（量宽度用；surfaceEl 存在时优先用它） */
+let bodyEl: HTMLElement | null = null;
+/** 实际绘图容器：宽度即画布宽度 */
+let surfaceEl: HTMLElement | null = null;
+/** 轨迹完整周期范围（视图窗口只能落在这个范围内） */
+let traceFrom = 1;
+let traceTo = 1;
+/** 视图窗口中心（周期）；缩放围绕它变化，平移改它 */
+let viewCenter = 0;
+/** 是否已初始化过视图窗口（换文件时重置） */
+let viewReady = false;
+/** 标记层重画回调（视图窗口变化时重定位标记） */
+let repaintMarkers: (() => void) | null = null;
+/** 工具栏读数的更新回调 */
+let updateReadout: ((plot: Plot) => void) | null = null;
 let ctxRef: ViewContext | null = null;
 let unsub: (() => void) | null = null;
 let registry: Registry | null = null;
@@ -359,13 +379,9 @@ type Lod = 'full' | 'coarse';
 const LOD_AGG_PX = 6;
 let lodLast: Lod = 'full';
 
-/**
- * **实际**每周期像素：画布宽度有上限（`MAX_PLOT_WIDTH`），所以 `plot.pxPerCycle`（缩放请求值）
- * 在长轨迹上会被截住 —— 65 MB 那支轨迹请求 66 px/周期、实际只有 0.56 px/周期。
- * 分级必须看实际值，否则会按"看不存在的细节"去画。
- */
+/** 实际每周期像素（画布即窗口，等于 `pxPerCycle`；按浮点跨度重算，避免边界误差） */
 function effectivePxPerCycle(reg: Registry): number {
-  const span = Math.max(1, reg.plot.to - reg.plot.from + 1);
+  const span = Math.max(1e-9, reg.plot.to - reg.plot.from + 1);
   return reg.plot.width / span;
 }
 
@@ -418,43 +434,86 @@ function paintLodColumns(g: SVGGElement, columns: LodColumn[], alpha: number, x0
   return rects;
 }
 
-/** 可见窗口（用户坐标 x 与周期）：聚合只算看得见的那一段，顺带把工作量钉在"一屏像素"上 */
-function visibleWindow(reg: Registry): { x0: number; x1: number; c0: number; c1: number } {
-  const live = scrollEl?.isConnected ? scrollEl : null;
-  const left = live === null ? 0 : live.scrollLeft - GUTTER;
-  const width = Math.max(64, live === null ? reg.plot.width : live.clientWidth - GUTTER);
-  // 两侧各留 35% 缓冲：滚动到缓冲以内不必重画（重画由 installScrollLod 按 1/3 屏的步长触发）
-  const pad = width * 0.35;
-  const x0 = clamp(left - pad, 0, reg.plot.width);
-  const x1 = clamp(left + width + pad, 0, reg.plot.width);
-  return { x0, x1, c0: reg.plot.scale.invert(x0), c1: reg.plot.scale.invert(x1) };
+/** 逐列带不透明度的聚合（流水线低缩放：气泡按密度决定橙色深浅） */
+interface LodShade {
+  color: string | null;
+  y0: number;
+  y1: number;
+  alpha: number;
+}
+
+function paintLodShades(g: SVGGElement, columns: LodShade[], x0: number, x1: number): number {
+  const colX = (i: number): number => x0 + ((x1 - x0) * i) / columns.length;
+  const runs = new Map<string, string[]>();
+  const quant = (a: number): number => Math.round(a * 20) / 20; // 不透明度分 20 档，便于合并
+  let rects = 0;
+  for (let i = 0; i < columns.length; ) {
+    const col = columns[i]!;
+    if (col.color === null) {
+      i++;
+      continue;
+    }
+    const alpha = quant(col.alpha);
+    let y0 = col.y0;
+    let y1 = col.y1;
+    let j = i + 1;
+    while (j < columns.length) {
+      const next = columns[j]!;
+      if (next.color !== col.color || quant(next.alpha) !== alpha) break;
+      if (next.y0 < y0) y0 = next.y0;
+      if (next.y1 > y1) y1 = next.y1;
+      j++;
+    }
+    const key = `${col.color}\u0000${alpha}`;
+    const xa = round2(colX(i));
+    const xb = round2(colX(j));
+    const d = `M${xa},${round2(y1)}H${xb}V${round2(y0)}H${xa}Z`;
+    const list = runs.get(key);
+    if (list === undefined) runs.set(key, [d]);
+    else list.push(d);
+    rects++;
+    i = j;
+  }
+  for (const [key, paths] of runs) {
+    const [color, alpha] = key.split('\u0000');
+    g.append(svgEl('path', { d: paths.join(''), fill: color!, 'fill-opacity': Number(alpha), 'pointer-events': 'none' }));
+  }
+  return rects;
+}
+
+/** 可见窗口 = 整个绘图区（画布即窗口，不再有滚动缓冲） */
+function visibleWindow(reg: Registry): Viewport {
+  const cached = reg.viewport;
+  if (cached !== null) return cached;
+  const viewport: Viewport = { x0: reg.plot.x0, x1: reg.plot.x1, c0: reg.plot.from, c1: reg.plot.to + 1 };
+  reg.viewport = viewport;
+  return viewport;
 }
 
 /**
- * 聚合只覆盖"看得见的一段 + 缓冲"，所以**滚动之后必须补画**。
- * 细节分级下不做这件事：那时所有形状本来就已经在 DOM 里，滚动是纯浏览器行为。
- * 用 `rebuild(true, …)` 保留滚动位置，不会反过来触发滚动事件。
+ * 仅重画波形内容：轴、行头、覆盖层原地不动，只把每条泳道的分组节点换新后重画。
+ *
+ * 替换分组节点（而不是清空重填）是为了把 `cycleSurface` / 右键菜单挂在旧节点上的监听一起丢掉，
+ * 否则每次缩放/平移都会叠加一层监听器。重建的只有窗口内的图元，节点数由预算钉住。
  */
-function installScrollLod(scroll: HTMLElement): void {
-  let lastLeft = scroll.scrollLeft;
-  let scheduled = false;
-  scroll.addEventListener(
-    'scroll',
-    () => {
-      if (scheduled) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
-        const reg = registry;
-        if (reg === null || lodOf(effectivePxPerCycle(reg)) !== 'coarse') return;
-        if (Math.abs(scroll.scrollLeft - lastLeft) < scroll.clientWidth / 3) return;
-        lastLeft = scroll.scrollLeft;
-        scrollWanted = scroll.scrollLeft;
-        rebuild(true, null);
-      });
-    },
-    { passive: true },
-  );
+function repaintLanes(reg: Registry): void {
+  // 载入分片可能还在画：取消它并确保图层最终可见
+  paintToken?.abort();
+  paintToken = null;
+  if (paintReveal !== null) {
+    paintReveal.style.visibility = '';
+    paintReveal = null;
+  }
+  reg.itemBoxes.clear();
+  for (const lane of reg.lanes) {
+    const g = svgEl('g', {});
+    lane.node.replaceWith(g);
+    lane.node = g;
+    reg.currentRow = { key: lane.key, y: lane.y, h: lane.h, color: lane.color };
+    lane.row.draw(g, reg, lane.y, lane.h);
+    reg.currentRow = null;
+    installRowMenu(g, lane.row);
+  }
 }
 
 /**
@@ -512,6 +571,7 @@ function installMarkers(svg: SVGSVGElement, reg: Registry, ctx: ViewContext): vo
     shade.setAttribute('display', '');
   };
   paint();
+  repaintMarkers = paint;
   markerUnsub?.();
   markerUnsub = ctx.markers.subscribe(paint);
 
@@ -563,14 +623,10 @@ function installMarkers(svg: SVGSVGElement, reg: Registry, ctx: ViewContext): vo
 /** 标记变化时的重画（每个视图实例一份订阅） */
 let markerUnsub: (() => void) | null = null;
 
-/** 上一次量到的滚动容器宽度（px）：重建时旧容器已摘除，用它保持「适应宽度」稳定 */
-let chartAvail = 0;
 /** 上一次量到的视图容器宽度（px）：ResizeObserver 用它判断是否真的变宽/变窄 */
 let lastHostW = 0;
 /** 监听容器尺寸变化（比 window.resize 可靠：侧栏/筛选变化也会触发） */
 let resizeObs: ResizeObserver | null = null;
-/** 「适应宽度」模式：重画时按容器宽度重算 px/周期 */
-let fitWidth = false;
 /** 正在做"拖拽缩放"：拖拽期间不画整列悬停高光，避免两套指示互相打架 */
 let dragZooming = false;
 
@@ -673,13 +729,12 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
   for (const rec of trace.records) {
     const name = rec.pos.domain;
     if (!visible.has(name)) continue;
-    const e = bucket(name);
     const c = rec.pos.cycle;
-    if (c < e.lo) e.lo = c;
-    if (c > e.hi) e.hi = c;
     if (c < from) from = c;
     if (c > to) to = c;
+    // 只有时钟沿与异步记录需要进扫描结果；其余记录（多数是流水线/数值）只贡献周期范围
     if (rec.kind === 'clk') {
+      const e = bucket(name);
       e.hasClk = true;
       const list = rec.edge === 'p' ? e.p : e.n;
       const set = rec.edge === 'p' ? e.pSet : e.nSet;
@@ -687,8 +742,9 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
         set.add(c);
         list.push(c);
       }
+    } else if (rec.async) {
+      asyncRecords.push(rec);
     }
-    if (rec.async) asyncRecords.push(rec);
   }
   if (!Number.isFinite(from) || !Number.isFinite(to)) {
     from = 1;
@@ -708,6 +764,29 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
   }
   asyncRecords.sort((a, b) => a.seq - b.seq);
   return { edges, asyncRecords, from, to };
+}
+
+/**
+ * `scanRecords` 的结果按（轨迹, 可见域集合）缓存。
+ *
+ * 之前每次缩放/滚动重建都会重扫**全部**记录（几百万条），这是交互卡顿的主因之一；
+ * 沿集合与异步记录只在换文件或切换时钟域时才可能变，缓存后重建不再碰 records。
+ * WeakMap 与 Trace 同生命周期，换文件自然失效、可被 GC 回收。
+ */
+const scanCache = new WeakMap<Trace, Map<string, Scan>>();
+
+function scanRecordsCached(trace: Trace, visible: Set<string>): Scan {
+  let byKey = scanCache.get(trace);
+  if (byKey === undefined) {
+    byKey = new Map();
+    scanCache.set(trace, byKey);
+  }
+  const key = [...visible].sort().join('\u0000');
+  const found = byKey.get(key);
+  if (found !== undefined) return found;
+  const scan = scanRecords(trace, visible);
+  byKey.set(key, scan);
+  return scan;
 }
 
 // ------------------------------------------------------------------ 交互基元
@@ -842,32 +921,44 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   }
   // 每次渲染重新解析一次画布底色（跟着主题走），供 inkOn 判断字色
   backdrop = computeBackdrop(host);
-  const scan = scanRecords(trace, new Set(domains.map((d) => d.name)));
+  const scan = scanRecordsCached(trace, new Set(domains.map((d) => d.name)));
 
   // 时间轴换算的主域：优先 default，其次任意声明了 period 的可见域
   const timeDomain =
     domains.find((d) => d.name === 'default' && d.periodNs !== undefined) ?? domains.find((d) => d.periodNs !== undefined);
   const primary = timeDomain ?? domains[0]!;
 
-  const rows = buildRows(trace, ctx, domains, scan, visible);
+  // 轨迹的完整周期范围（视图窗口只能落在这个范围内）
+  traceFrom = scan.from;
+  traceTo = scan.to;
+  if (!viewReady) {
+    viewCenter = (traceFrom + traceTo + 1) / 2;
+    viewReady = true;
+  }
 
-  const span = Math.max(1, scan.to - scan.from + 1);
-  const px = pixelScale(ctx, host, span);
-  const plotW = Math.max(1, span * px);
+  const rows = buildRows(trace, ctx, domains, scan, visible);
   // 行之间留白：总高 = 轴 + Σ行高 + 行间距（末尾不加）
   const height = AXIS_H + rows.reduce((sum, row) => sum + rowHeight(row) + ROW_GAP, 0) - ROW_GAP;
-  const plot: Plot = {
-    scale: linearScale(scan.from, scan.to + 1, SIDE, SIDE + plotW),
-    from: scan.from,
-    to: scan.to,
-    x0: SIDE,
-    x1: SIDE + plotW,
-    top: AXIS_H,
-    bottom: height,
-    pxPerCycle: px,
-    width: plotW + SIDE * 2,
-    height,
-  };
+
+  const cardNode = card(
+    '时间轴',
+    '共用横轴：周期（各时钟域独立计数）。行头可拖拽排序；Ctrl/⌘ + 滚轮缩放，横向滚动平移',
+  );
+  cardNode.body.append(buildStats(domains, scan, trace));
+  // 先把卡片挂上去再量宽度：绘图区宽度 = 卡片内容宽度，之后不再依赖滚动容器
+  host.append(cardNode.root);
+  bodyEl = cardNode.body;
+
+  const plot = computeViewPlot(ctx, height);
+  cardNode.body.append(buildControls(ctx, plot));
+  cardNode.body.append(
+    legend([
+      { label: '条目（该级此刻持有它）', color: colorFor('pip') },
+      { label: '未闭合（虚线：文件结束时仍持有）', color: colorFor('pip') },
+      { label: '气泡周期（该级为空）', color: COLOR.bubble },
+      { label: '异步记录（区间中点・空心）', color: COLOR.async },
+    ]),
+  );
 
   const svg = svgRoot(plot.width, plot.height, { style: 'flex:0 0 auto' });
   axisLayer(svg, plot, primary, ctx);
@@ -885,29 +976,29 @@ function build(host: HTMLElement, ctx: ViewContext): void {
     hoverCell: svgEl('rect', {}),
     hoverTag: svgEl('text', {}),
     currentRow: null,
+    viewport: null,
   };
 
   // 网格线先画：它在泳道之下，不会盖住波形（选中/悬停高光仍在最上层）
-  const underlay = svgEl('g', { 'pointer-events': 'none' });
-  drawGrid(underlay, plot);
-  svg.append(underlay);
+  gridGroup = svgEl('g', { 'pointer-events': 'none' });
+  svg.append(gridGroup);
 
   const gutter = el('div', {
     // padding 让每行的圆角色块与左右两条边线（画布外沿 / 分隔线）留白，不贴着线
-    style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--border);padding:0 8px;box-sizing:border-box`,
+    style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;background:var(--surface);border-right:1px solid var(--border);padding:0 8px;box-sizing:border-box`,
   });
   gutter.append(axisGutterCell(plot));
 
   rowCells.clear();
   let y = AXIS_H;
-  // 先同步把"每行一个空组 + 行头"搭起来：布局、滚动条、行名立刻正确，
-  // 用户马上看到文件有多少行；波形内容随后按片填（见下面的 paintRowsChunked）
+  // 先同步把"每行一个空组 + 行头"搭起来：布局、行名立刻正确，
+  // 用户马上看到文件有多少行；波形内容随后填（载入时分片）
   const pendingRows: { g: SVGGElement; row: LaneRow; y: number; h: number }[] = [];
   for (const row of rows) {
     const h = rowHeight(row);
     const g = svgEl('g', {});
     svg.append(g);
-    reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color });
+    reg.lanes.push({ key: row.key, domain: row.domain, node: g, y, h, color: row.color, row });
     const cell = gutterCell(row, h, ctx);
     rowCells.set(row.key, cell);
     gutter.append(cell);
@@ -932,47 +1023,89 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   overlay.append(reg.hoverCol, reg.hoverCell, reg.hoverBox, reg.selBox, reg.selLine, reg.selLabel, reg.hoverTag);
   svg.append(overlay);
 
-  // 卡片
-  const cardNode = card(
-    '时间轴',
-    '共用横轴：周期（各时钟域独立计数）。行头可拖拽排序；Ctrl/⌘ + 滚轮缩放',
-  );
-  cardNode.body.append(buildStats(domains, scan, trace));
-  cardNode.body.append(buildControls(ctx, plot, span));
-  cardNode.body.append(
-    legend([
-      { label: '条目（该级此刻持有它）', color: colorFor('pip') },
-      { label: '未闭合（虚线：文件结束时仍持有）', color: colorFor('pip') },
-      { label: '气泡周期（该级为空）', color: COLOR.bubble },
-      { label: '异步记录（区间中点・空心）', color: COLOR.async },
-    ]),
-  );
-  const scroll = el('div', { class: 'chart-scroll', style: 'max-width:100%' });
+  // 绘图区：宽度就是可视宽度，不再靠一个超宽画布 + 原生滚动条；平移靠滚轮（见 installWheelZoom）
+  const surface = el('div', { class: 'chart-scroll', style: 'max-width:100%;overflow:hidden' });
   const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [svg]);
-  scroll.append(el('div', { style: 'display:flex;align-items:flex-start;min-width:max-content' }, [gutter, plotWrap]));
-  cardNode.body.append(scroll);
-  host.append(cardNode.root);
+  surface.append(el('div', { style: 'display:flex;align-items:flex-start' }, [gutter, plotWrap]));
+  cardNode.body.append(surface);
 
-  installWheelZoom(scroll);
+  installWheelZoom(surface);
   installDragZoom(svg);
   installMarkers(svg, reg, ctx);
-  scrollEl = scroll;
-  scroll.scrollLeft = scrollWanted;
-  installScrollLod(scroll);
+  surfaceEl = surface;
   registry = reg;
-  chartAvail = scroll.clientWidth;
   lastHostW = host.clientWidth;
+  paintAxisGrid(reg);
   const isLoad = buildingForLoad && !hasBuilt;
   buildingForLoad = false;
   hasBuilt = true;
   paintRowsChunked(pendingRows, reg, ctx, {
     load: isLoad,
-    reveal: plotWrap,
+    reveal: isLoad ? plotWrap : null,
     onDone: () => {},
   });
 }
 
-/** 这一轮 build 是不是"刚载入文件"（分片画 + 画完才揭开）；交互重建走同步一遍过 */
+/**
+ * 当前视图窗口 → Plot。
+ *
+ * `options.zoom` 是每周期像素（显式值）；没设或 <=0 时按"整条轨迹铺满可视宽度"。
+ * 缩放上限**不设**（可以一直放大到看清单个周期），下限就是铺满宽度：
+ * 视图跨度 `span = 可视宽度 / zoom`，始终夹在 `[极小值, 整条轨迹]` 之间。
+ */
+function computeViewPlot(ctx: ViewContext, height: number): Plot {
+  const avail = availablePlotWidth();
+  const full = Math.max(1, traceTo - traceFrom + 1);
+  const zoom = ctx.options.zoom;
+  const requested = Number.isFinite(zoom) && zoom > 0 ? zoom : avail / full;
+  let span = avail / requested;
+  if (!(span > 0)) span = full;
+  if (span >= full) span = full;
+  span = Math.max(span, 1e-9);
+  let from: number;
+  if (span >= full) {
+    from = traceFrom;
+  } else {
+    const center = clamp(viewCenter, traceFrom + span / 2, traceTo + 1 - span / 2);
+    from = center - span / 2;
+  }
+  const to = from + span;
+  viewCenter = (from + to) / 2;
+  return {
+    scale: linearScale(from, to, SIDE, SIDE + avail),
+    from,
+    to: to - 1,
+    x0: SIDE,
+    x1: SIDE + avail,
+    top: AXIS_H,
+    bottom: height,
+    pxPerCycle: avail / span,
+    width: avail + SIDE * 2,
+    height,
+  };
+}
+
+/** 只改视图窗口（缩放/平移）：更新比例尺后原地重画轴、网格、泳道、标记 */
+function updateView(): void {
+  const reg = registry;
+  const ctx = ctxRef;
+  if (reg === null || ctx === null) return;
+  const next = computeViewPlot(ctx, reg.plot.height);
+  reg.plot.scale = next.scale;
+  reg.plot.from = next.from;
+  reg.plot.to = next.to;
+  reg.plot.x0 = next.x0;
+  reg.plot.x1 = next.x1;
+  reg.plot.pxPerCycle = next.pxPerCycle;
+  reg.viewport = null;
+  paintAxisGrid(reg);
+  repaintLanes(reg);
+  repaintMarkers?.();
+  applyState();
+  updateReadout?.(reg.plot);
+}
+
+/** 这一轮 build 是不是"刚载入文件"（分片画 + 画完才揭开） */
 let buildingForLoad = false;
 let hasBuilt = false;
 
@@ -980,8 +1113,11 @@ let hasBuilt = false;
  * 波形内容按行分片绘制：每片最多 8ms，片间让出一帧。
  *
  * 20 万周期的轨迹里，一次性把几十个泳道画完会把主线程占满近一秒（页面完全无响应）。
- * 分片之后首屏立刻可用、能滚动能切视图；缩放重建时上一轮的绘制会被取消（同一个令牌），
- * 不会出现"旧内容画到一半又叠上新内容"。
+ * 分片之后首屏立刻可用、能滚动能切视图；缩放重建时上一轮的绘制会被取消（同一个令牌）。
+ *
+ * 分片**只用于载入**：载入时整帧画完才揭开，期间分片让出主线程。
+ * 缩放/拖动等交互重建必须**一次画完** —— 否则用户连续滚轮时每一帧都会取消上一轮绘制，
+ * 波形永远画不完整，看起来就是不停闪烁。交互重建只画可见窗口，本来就被节点预算钉住了。
  */
 function paintRowsChunked(
   pending: { g: SVGGElement; row: LaneRow; y: number; h: number }[],
@@ -989,7 +1125,6 @@ function paintRowsChunked(
   ctx: ViewContext,
   hooks: { onDone?: () => void; load?: boolean; reveal?: HTMLElement | null } = {},
 ): void {
-  if (pending.length === 0) return;
   const paintOne = (i: number): void => {
     const { g, row, y, h } = pending[i]!;
     // 悬停高亮需要知道"鼠标在哪一行"，这里在绘制前登记（各泳道的绘制签名保持不变）
@@ -998,25 +1133,32 @@ function paintRowsChunked(
     reg.currentRow = null;
   };
   const finish = (): void => {
-    // 揭开：整帧画完之前一直藏着，所以不会看到"画了一半"的波形
     if (hooks.reveal != null) hooks.reveal.style.visibility = '';
+    paintReveal = null;
     applyState();
     hooks.onDone?.();
   };
 
-  // 交互重建（缩放/拖动/改选项）：**一次画完**。宁可这一帧多花几十毫秒，也不要分帧填出半成品 ——
-  // 滚轮已经被合并成"一帧最多重建一次"，所以这里的耗时就是用户感知到的那一下。
+  // 无论哪种绘制都先取消上一轮；顺带把上一轮藏起来的图层揭开
+  paintToken?.abort();
+  paintToken = null;
+  if (paintReveal !== null) {
+    paintReveal.style.visibility = '';
+    paintReveal = null;
+  }
+
   if (hooks.load !== true) {
     for (let i = 0; i < pending.length; i++) paintOne(i);
     finish();
     return;
   }
 
-  // 首次载入：分片画（大文件几十个泳道，一次画完会卡住首屏），但期间**藏着**，画完再揭开
   const token = abortable();
-  paintToken?.abort();
   paintToken = token;
-  if (hooks.reveal != null) hooks.reveal.style.visibility = 'hidden';
+  if (hooks.reveal != null) {
+    hooks.reveal.style.visibility = 'hidden';
+    paintReveal = hooks.reveal;
+  }
   void runChunked(
     pending.length,
     (from, to) => {
@@ -1027,6 +1169,7 @@ function paintRowsChunked(
       budgetMs: 8,
       onProgress: (done, total) => {
         if (done !== total) return;
+        paintToken = null;
         finish();
       },
     },
@@ -1035,6 +1178,8 @@ function paintRowsChunked(
 
 /** 正在进行的行绘制（重建/卸载时取消掉上一轮） */
 let paintToken: { signal: AbortSignal; abort: () => void } | null = null;
+/** 载入分片绘制期间被藏起来的图层：被滚动重画打断时要记得揭开 */
+let paintReveal: HTMLElement | null = null;
 
 // ------------------------------------------------------------------ 卡片附属
 
@@ -1063,29 +1208,27 @@ function buildStats(domains: DomainInfo[], scan: Scan, trace: Trace): HTMLElemen
   ]);
 }
 
-function buildControls(ctx: ViewContext, plot: Plot, span: number): HTMLElement {
+function buildControls(ctx: ViewContext, plot: Plot): HTMLElement {
   const row = el('div', { class: 'row' });
   const button = (text: string, title: string, active: boolean, handler: () => void): HTMLButtonElement => {
     const node = el('button', { class: `chip chip-toggle${active ? ' is-on' : ''}`, text, title, style: 'font:inherit;cursor:pointer' });
     node.addEventListener('click', handler);
     return node;
   };
+  const readout = el('span', { class: 'muted nowrap' });
+  updateReadout = (p: Plot): void => {
+    const cycles = Math.max(1, p.to - p.from + 1);
+    readout.textContent = `当前 1 周期 ≈ ${p.pxPerCycle.toFixed(3)} px · 可见 ${countLabel(Math.round(cycles))} 周期 · 共 ${countLabel(traceTo - traceFrom + 1)} 周期`;
+  };
+  updateReadout(plot);
   row.append(
     el('span', { class: 'toolbar-label', text: '横向缩放' }),
     button('−', '缩小（每周期像素 ÷1.5）', false, () => stepZoom(1 / 1.5)),
     button('+', '放大（每周期像素 ×1.5）', false, () => stepZoom(1.5)),
-    button('适应宽度', '让全部周期正好铺满可视宽度', fitWidth, () => {
-      fitWidth = true;
-      rebuildAnchored(null);
-    }),
+    button('适应宽度', '让全部周期正好铺满可视宽度', !(ctx.options.zoom > 0), () => fitToWidth()),
     el('span', { class: 'toolbar-spacer' }),
   );
-  row.append(
-    el('span', {
-      class: 'muted nowrap',
-      text: `当前 1 周期 ≈ ${plot.pxPerCycle.toFixed(2)} px · ${countLabel(span)} 周期 · 画布 ${countLabel(Math.round(plot.width))} px`,
-    }),
-  );
+  row.append(readout);
   return row;
 }
 
@@ -1271,28 +1414,15 @@ function installRowDrag(node: HTMLElement, row: LaneRow): void {
 
 // ------------------------------------------------------------------ 轴 / 网格 / defs
 
-function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, ctx: ViewContext): void {
-  const g = svgEl('g', {});
-  g.append(svgEl('rect', { x: plot.x0, y: 0, width: plot.x1 - plot.x0, height: AXIS_H, fill: 'var(--surface-2)', 'fill-opacity': 0.55 }));
-  // 时间轴只标周期数：不显示真实时间（各域周期号本来就不同刻度，换成 ns 更容易误读）
-  for (const t of axisTicks(plot.from, plot.to, tickCount(plot))) {
-    const x = plot.scale(t);
-    g.append(svgEl('line', { x1: x, x2: x, y1: AXIS_H - 5, y2: AXIS_H, stroke: 'var(--border-strong)' }));
-    g.append(svgEl('text', { x, y: 15, class: 'axis-label', 'text-anchor': 'middle', text: String(t) }));
-  }
-  g.append(svgEl('line', { x1: plot.x0, x2: plot.x1, y1: AXIS_H - 0.5, y2: AXIS_H - 0.5, stroke: 'var(--border-strong)' }));
-  g.append(
-    svgEl('text', {
-      x: plot.x0 + 4,
-      y: 15,
-      class: 'axis-label axis-title',
-      'text-anchor': 'start',
-      text: '周期',
-    }),
-  );
-  svg.append(g);
+/** 刻度/网格的容器：内容随可见窗口重画（见 `paintAxisGrid`） */
+let axisGroup: SVGGElement | null = null;
+let gridGroup: SVGGElement | null = null;
 
-  // 轴背景：点击 / 悬停广播周期
+function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, ctx: ViewContext): void {
+  axisGroup = svgEl('g', {});
+  svg.append(axisGroup);
+
+  // 轴背景：点击 / 悬停广播周期（刻度内容由 paintAxisGrid 填）
   const hit = svgEl('rect', {
     x: plot.x0,
     y: 0,
@@ -1312,21 +1442,45 @@ function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, ctx: Vie
   );
 }
 
-/** 刻度密度：约每 76 px 一个主刻度（对应 10px 刻度文字宽度 + 呼吸空间），至少 2 个、至多 40 个 */
-function tickCount(plot: Plot): number {
-  return clamp(Math.floor((plot.x1 - plot.x0) / 76), 2, 40);
-}
-
-function drawGrid(g: SVGGElement, plot: Plot): void {
-  for (const t of axisTicks(plot.from, plot.to, tickCount(plot))) {
-    const x = plot.scale(t);
-    g.append(svgEl('line', { x1: x, x2: x, y1: plot.top, y2: plot.bottom, class: 'grid-line' }));
+/**
+ * 画轴刻度与网格，**只覆盖可见窗口**。
+ *
+ * 之前刻度按整条轨迹取（最多 40 个），在几百万像素宽的画布上相邻刻度隔着几十万像素 ——
+ * 放大后视口里一个刻度都看不到。改成按窗口取刻度，滚动/缩放后重画。
+ */
+function paintAxisGrid(reg: Registry): void {
+  const plot = reg.plot;
+  const win = visibleWindow(reg);
+  const count = clamp(Math.floor((win.x1 - win.x0) / 76), 2, 40);
+  const ticks = axisTicks(win.c0, win.c1, count);
+  const from = Math.max(plot.from, Math.floor(win.c0));
+  const to = Math.min(plot.to + 1, Math.ceil(win.c1));
+  if (axisGroup !== null) {
+    clear(axisGroup);
+    axisGroup.append(svgEl('rect', { x: plot.x0, y: 0, width: plot.x1 - plot.x0, height: AXIS_H, fill: 'var(--surface-2)', 'fill-opacity': 0.55 }));
+    // 时间轴只标周期数：不显示真实时间（各域周期号本来就不同刻度，换成 ns 更容易误读）
+    for (const t of ticks) {
+      if (t < win.c0 || t > win.c1) continue;
+      const x = plot.scale(t);
+      axisGroup.append(svgEl('line', { x1: x, x2: x, y1: AXIS_H - 5, y2: AXIS_H, stroke: 'var(--border-strong)' }));
+      axisGroup.append(svgEl('text', { x, y: 15, class: 'axis-label', 'text-anchor': 'middle', text: String(Number(t.toFixed(6))) }));
+    }
+    axisGroup.append(svgEl('line', { x1: plot.x0, x2: plot.x1, y1: AXIS_H - 0.5, y2: AXIS_H - 0.5, stroke: 'var(--border-strong)' }));
+    axisGroup.append(svgEl('text', { x: plot.x0 + 4, y: 15, class: 'axis-label axis-title', 'text-anchor': 'start', text: '周期' }));
   }
-  // 放大后补每周期淡网格，方便逐周期读数
-  if (plot.pxPerCycle >= 22 && plot.to - plot.from <= 2000) {
-    for (let c = plot.from; c <= plot.to + 1; c++) {
-      const x = plot.scale(c);
-      g.append(svgEl('line', { x1: x, x2: x, y1: plot.top, y2: plot.bottom, stroke: 'var(--border)', 'stroke-width': 1, 'stroke-opacity': 0.45 }));
+  if (gridGroup !== null) {
+    clear(gridGroup);
+    for (const t of ticks) {
+      if (t < win.c0 || t > win.c1) continue;
+      const x = plot.scale(t);
+      gridGroup.append(svgEl('line', { x1: x, x2: x, y1: plot.top, y2: plot.bottom, class: 'grid-line' }));
+    }
+    // 放大后补每周期淡网格，方便逐周期读数
+    if (plot.pxPerCycle >= 22 && to - from <= 2000) {
+      for (let c = from; c <= to; c++) {
+        const x = plot.scale(c);
+        gridGroup.append(svgEl('line', { x1: x, x2: x, y1: plot.top, y2: plot.bottom, stroke: 'var(--border)', 'stroke-width': 1, 'stroke-opacity': 0.45 }));
+      }
     }
   }
 }
@@ -1385,12 +1539,7 @@ function applyRowOrder(rows: LaneRow[]): LaneRow[] {
 
 /** 重画时间轴（拖拽排序后调用；顺序存在 rowOrder 里，刷新视图也不会丢） */
 function rerenderTimeline(): void {
-  const host = hostEl;
-  const ctx = ctxRef;
-  if (!host || !ctx) return;
-  host.replaceChildren();
-  build(host, ctx);
-  if (registry !== null && registry.lanes.length > 0) applyState();
+  rebuild();
 }
 
 /** 拖拽结束：把被拖的行插到目标行的前/后，并记住顺序 */
@@ -1430,7 +1579,8 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
       const hit = laneCanvas(g, reg, y, h);
       const high = y + 4;
       const low = y + h - 4;
-      g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low), fill: 'none', stroke: clockColor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
+      const win = visibleWindow(reg);
+      g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low, win.c0, win.c1), fill: 'none', stroke: clockColor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
       if (!edges.hasClk) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: `域 ${d.name} 没有 [clk] 记录` }));
       cycleSurface(hit, reg, d.name, ctx, (probe) => {
         const c = probe.cycle;
@@ -1450,32 +1600,68 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
   };
 }
 
-/** 方波折线：p 沿占前半格、n 沿占后半格（只有 p 记录的域，n 沿由扫描阶段按周期中点补出） */
-function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number): string {
-  const step = Math.max(1, Math.ceil((plot.to + 1 - plot.from) / 4000));
+/**
+ * 方波折线：p 沿占前半格、n 沿占后半格（只有 p 记录的域，n 沿由扫描阶段按周期中点补出）。
+ * 只画可见窗口 `[from, to]`：放大后逐沿精确画，缩小时才按块聚合（否则几十万个沿逐个建点）。
+ */
+function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number, from: number, to: number): string {
+  const level0 = levelAt(edges, from, 0);
+  const pLo = lowerBound(edges.p, from);
+  const pHi = lowerBound(edges.p, to + 1);
+  const nLo = lowerBound(edges.n, from - 0.5);
+  const nHi = lowerBound(edges.n, to + 1);
   const pts: [number, number][] = [];
-  let level = false;
-  let pi = lowerBound(edges.p, plot.from);
-  let ni = lowerBound(edges.n, plot.from);
-  for (let block = plot.from; block <= plot.to; block += step) {
-    const next = Math.min(block + step, plot.to + 1);
-    let hasP = false;
-    while (pi < edges.p.length && edges.p[pi]! < next) {
-      hasP = true;
-      pi++;
+  if (pHi - pLo + (nHi - nLo) > 4000) {
+    // 低缩放：按块聚合，最多约 4000 个点
+    const span = Math.max(1, to + 1 - from);
+    const step = Math.max(1, Math.ceil(span / 4000));
+    let level = level0;
+    let pi = pLo;
+    let ni = nLo;
+    for (let block = from; block <= to + 1; block += step) {
+      const next = Math.min(block + step, to + 1);
+      let hasP = false;
+      while (pi < pHi && edges.p[pi]! < next) {
+        hasP = true;
+        pi++;
+      }
+      let hasN = false;
+      while (ni < nHi && edges.n[ni]! < next) {
+        hasN = true;
+        ni++;
+      }
+      if (hasP) level = true;
+      const x0 = plot.scale(block);
+      const xm = plot.scale(block + step / 2);
+      const x1 = plot.scale(next);
+      pts.push([x0, level ? high : low], [xm, level ? high : low]);
+      if (hasN) level = false;
+      pts.push([xm, level ? high : low], [x1, level ? high : low]);
     }
-    let hasN = false;
-    while (ni < edges.n.length && edges.n[ni]! < next) {
-      hasN = true;
-      ni++;
+  } else {
+    // 细节缩放：逐沿精确画（p 在周期起点、n 在周期中点）
+    let level = level0;
+    let pi = pLo;
+    let ni = nLo;
+    pts.push([plot.scale(from), level ? high : low]);
+    while (pi < pHi || ni < nHi) {
+      const pTime = pi < pHi ? edges.p[pi]! : Number.POSITIVE_INFINITY;
+      const nTime = ni < nHi ? edges.n[ni]! + 0.5 : Number.POSITIVE_INFINITY;
+      if (pTime <= nTime) {
+        const x = plot.scale(pTime);
+        pts.push([x, level ? high : low]);
+        level = true;
+        pts.push([x, level ? high : low]);
+        pi++;
+      } else {
+        const x = plot.scale(nTime);
+        pts.push([x, level ? high : low]);
+        level = false;
+        pts.push([x, level ? high : low]);
+        ni++;
+      }
     }
-    if (hasP) level = true;
-    const x0 = plot.scale(block);
-    const xm = plot.scale(block + step / 2);
-    const x1 = plot.scale(next);
-    pts.push([x0, level ? high : low], [xm, level ? high : low]);
-    if (hasN) level = false;
-    pts.push([xm, level ? high : low], [x1, level ? high : low]);
+    pts.push([plot.scale(to + 1), level ? high : low]);
   }
   if (pts.length === 0) return '';
   return `M${pts.map((p) => `${round2(p[0])},${round2(p[1])}`).join('L')}`;
@@ -1483,13 +1669,43 @@ function clockPoints(edges: DomainEdges, plot: Plot, high: number, low: number):
 
 // ------------------------------ 状态机
 
+type FsmSegment = { state: string; start: number; end: number; open: boolean };
+
+/** 状态区段只算一次，并抽出 start 数组供二分定位（悬停、低缩放、窗口裁剪都要用） */
+interface FsmPrep {
+  segments: FsmSegment[];
+  starts: number[];
+}
+
+const fsmPreps = new WeakMap<FsmTrack, FsmPrep>();
+
+function fsmPrepOf(fsm: FsmTrack): FsmPrep {
+  const cached = fsmPreps.get(fsm);
+  if (cached !== undefined) return cached;
+  const segments = stateSegments(fsm);
+  const starts = new Array<number>(segments.length);
+  for (let i = 0; i < segments.length; i++) starts[i] = segments[i]!.start;
+  const prep: FsmPrep = { segments, starts };
+  fsmPreps.set(fsm, prep);
+  return prep;
+}
+
+/** 某周期落在哪个区段：先二分出最后一个 `start <= cycle`，再校验上界 */
+function segmentAt(prep: FsmPrep, cycle: number): FsmSegment | null {
+  const index = lowerBound(prep.starts, cycle + 1) - 1;
+  if (index < 0) return null;
+  const seg = prep.segments[index]!;
+  return cycle >= seg.start && cycle <= seg.end ? seg : null;
+}
+
 /**
  * 状态机：每个状态驻留段画成**六边形**（与流水线条目、数值块同一套形状语言），
  * 两端切角正好落在状态切换处 —— 于是"这一拍是什么状态、哪一拍换的"一条泳道看完。
  * 每台状态机一条泳道（`[fsm] "名字", 状态` 的名字）。
  */
 function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
-  const segments = stateSegments(fsm);
+  const prep = fsmPrepOf(fsm);
+  const segments = prep.segments;
   return {
     kind: 'lane',
     group: 'fsm',
@@ -1503,7 +1719,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       cycleSurface(hit, reg, fsm.domain, ctx, (probe) => {
-        const at = segments.find((s) => probe.cycle >= s.start && probe.cycle <= s.end);
+        const at = segmentAt(prep, probe.cycle);
         return [
           `状态机 ${fsm.name}（域 ${fsm.domain}）`,
           cycleLabel(probe.cycle),
@@ -1512,13 +1728,16 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
         ].join('\n');
       });
       const last = segments[segments.length - 1];
+      const win = visibleWindow(reg);
       // 低缩放：一列一个状态颜色（该列中心周期所在区段），连续同色合并成矩形
       if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
-        const win = visibleWindow(reg);
         const domainEndC = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
         const columns: LodColumn[] = [];
-        let si = 0;
+        // 指针由二分定位到窗口起点，放大后只走可见区段，不再从头扫
+        let si = lowerBound(prep.starts, win.c0);
+        if (si >= segments.length) si = segments.length - 1;
+        else if (si > 0 && prep.starts[si]! > win.c0) si--;
         for (let i = 0; i < cols; i++) {
           const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
           while (si < segments.length - 1 && segments[si]!.end < cycle) si++;
@@ -1534,12 +1753,17 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
       // 但它只到"最后一次上报"为止是确定的，之后纯属推断，所以照 §9.5 用开放样式区分。
       const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
       const openEnd = domainEnd + 1;
-      for (const seg of segments) {
+      // 只遍历与窗口相交的区段（段按 start 升序），放大后不再从头扫
+      let sLo = lowerBound(prep.starts, win.c0);
+      if (sLo > 0 && segments[sLo - 1]!.end >= win.c0) sLo--;
+      for (let si = sLo; si < segments.length; si++) {
+        const seg = segments[si]!;
         if (drawn >= MAX_ITEMS) break;
+        if (seg.start > win.c1) break;
         // 区段是半开区间 [start, 下一采样)；最后一段延伸到轨迹末尾
         const segEnd = seg === last ? Math.max(seg.end + 1, openEnd) : seg.end;
-        const from = Math.max(seg.start, reg.plot.from);
-        const to = Math.min(segEnd, reg.plot.to + 1);
+        const from = Math.max(seg.start, win.c0);
+        const to = Math.min(segEnd, win.c1);
         if (to <= from) continue;
         const left = reg.plot.scale(from);
         const right = Math.max(left + 1.5, reg.plot.scale(to));
@@ -1598,29 +1822,126 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
 
 // ------------------------------ 流水线
 
+/**
+ * 流水线轨道的预处理：条目排序一次，并抽出 `enter` / `end` 数组。
+ * 有了数组就能用二分把绘制范围夹到"可见窗口 + 一条在飞条目"，放大后不再遍历整条轨道。
+ */
+interface PipPrep {
+  /** 按 enter 周期升序的条目（文件里通常已升序，此时直接用原数组，不复制/排序） */
+  items: PipelineItem[];
+  /** 末尾那段"延续到轨迹末尾"的气泡，只算一次 */
+  trailing: { start: number; end: number } | null;
+  menu: LaneRow['menu'];
+}
+
+const pipPreps = new WeakMap<TrackInfo, PipPrep>();
+
+/** 条目在轨道上占据的末周期：已闭合取结束锚点，未闭合取 +∞（一直延续到域末尾） */
+function itemEnd(item: PipelineItem): number {
+  return item.close === null ? Number.POSITIVE_INFINITY : (item.closeAnchorCycle ?? item.enter.cycle);
+}
+
+function pipLowerBound(items: PipelineItem[], v: number): number {
+  let lo = 0;
+  let hi = items.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (items[mid]!.enter.cycle < v) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function pipPrepOf(track: TrackInfo): PipPrep {
+  const cached = pipPreps.get(track);
+  if (cached !== undefined) return cached;
+  let ordered = true;
+  const source = track.items;
+  for (let i = 1; i < source.length; i++) {
+    if (source[i]!.enter.cycle < source[i - 1]!.enter.cycle) {
+      ordered = false;
+      break;
+    }
+  }
+  const items = ordered ? source : [...source].sort((a, b) => a.enter.cycle - b.enter.cycle || a.enterSeq - b.enterSeq);
+  const prep: PipPrep = {
+    items,
+    trailing: track.bubbleRanges.filter((range) => range.end === track.lastCycle).pop() ?? null,
+    menu: pipelineMenu(track),
+  };
+  pipPreps.set(track, prep);
+  return prep;
+}
+
+/**
+ * 与 [from,to] 相交的条目区间 `[lo, hi)`。
+ *
+ * 一条流水线轨道同一时刻至多持有**一个**条目，所以"早于 from 进入但仍未结束"的最多一条：
+ * 从 `enter >= from` 的第一条回退一步即可；向前只走到 `enter > to` 为止。
+ */
+function pipWindow(prep: PipPrep, from: number, to: number): [number, number] {
+  const items = prep.items;
+  let lo = pipLowerBound(items, from);
+  if (lo > 0 && itemEnd(items[lo - 1]!) >= from - 1) lo--;
+  const hi = pipLowerBound(items, to + 2);
+  return [lo, hi];
+}
+
+/** 条目颜色：同一条指令在各级同色（按取值着色），气泡/无值退回轨道色 */
+function pipItemColor(laneColor: string, item: PipelineItem): string {
+  return item.value === null ? laneColor : colorFor(numericKey(item.value));
+}
+
+/** 气泡区间的二分：第一个 `start >= v` 的下标（区间按 start 升序，由派生层顺序生成） */
+function lowerBoundRanges(ranges: { start: number; end: number }[], v: number): number {
+  let lo = 0;
+  let hi = ranges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid]!.start < v) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** `[from, to)` 内落在气泡区间（闭区间 `[start, end]`）里的周期数 */
+function bubbleCyclesIn(ranges: { start: number; end: number }[], from: number, to: number): number {
+  if (to <= from) return 0;
+  let i = lowerBoundRanges(ranges, from);
+  if (i > 0 && ranges[i - 1]!.end >= from) i--;
+  let total = 0;
+  for (; i < ranges.length; i++) {
+    const range = ranges[i]!;
+    if (range.start >= to) break;
+    const a = Math.max(range.start, from);
+    const b = Math.min(range.end + 1, to);
+    if (b > a) total += b - a;
+  }
+  return total;
+}
+
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
-  const sorted =
-    track.items.length > 1 ? [...track.items].sort((a, b) => a.enter.cycle - b.enter.cycle || a.enterSeq - b.enterSeq) : track.items;
+  const laneColor = colorFor(track.name);
+  const prep = pipPrepOf(track);
   return {
     kind: 'lane',
     key: `pip:${track.name}`,
     group: 'pipeline',
     domain: track.domain,
     label: track.name,
-    color: colorFor(track.name),
+    color: laneColor,
     height: H.pip,
     hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
-    menu: pipelineMenu(track),
+    menu: prep.menu,
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
-      // 先按"与当前视图相交"筛一遍：放大之后视图内条目变少，被省掉的就会补上
-      const inView = sorted.filter((it) => it.enter.cycle <= reg.plot.to + 1 && (it.close?.cycle ?? track.lastCycle) >= reg.plot.from - 1);
-      const shown = inView.length > MAX_ITEMS ? inView.slice(0, MAX_ITEMS) : inView;
-      const truncated = shown.length < inView.length;
-      // 条目按**取值**着色，而不是按行：同一条指令在 IF/ID/EX/MEM/WB 里是同一个颜色，
-      // 一眼就能顺着颜色把一条指令跟到写回。没有标记的条目退回轨道色。
-      const laneColor = colorFor(track.name);
-      const colorOfItem = (item: { value: ScalarValue | null }): string => (item.value === null ? laneColor : colorFor(numericKey(item.value)));
+      // 真正的可见窗口（含两侧缓冲）：`plot.from/to` 是整条轨迹，不能拿来当窗口
+      const win = visibleWindow(reg);
+      // 只取与当前视图相交的条目区间：放大之后窗口变窄，二分直接跳过窗口外的条目
+      const [lo, hi] = pipWindow(prep, win.c0, win.c1);
+      const inViewCount = Math.max(0, hi - lo);
+      const shownCount = Math.min(inViewCount, MAX_ITEMS);
+      const truncated = inViewCount > shownCount;
       let tagsDrawn = 0;
       // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
       const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
@@ -1635,27 +1956,39 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 
       const barH = h - 9;
       const barY = y + 4;
-      // 低缩放：一列一个颜色（该列中心周期上"装着什么"，空则留白 ⇒ 直接看出占用分布）
+      // 低缩放：只表达两件事 —— 有没有值（按**行色**，每行不同）与气泡有多密（橙色，越密越不透明）。
+      // 气泡是**叠加**在行色之上的独立一层：否则"气泡很少但成片出现"的区域会被有值那一层盖掉、
+      // 整段看不出橙色。逐条目的取值着色在这一比例下没有意义，不做。
       if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
-        const win = visibleWindow(reg);
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
-        const columns: LodColumn[] = [];
-        let ii = 0;
+        const activeFrom = track.firstCycle;
+        const activeTo = track.lastCycle + 1;
+        const ranges = track.bubbleRanges;
+        const valueCols: LodShade[] = [];
+        const bubbleCols: LodShade[] = [];
+        const blank = (): LodShade => ({ color: null, y0: barY, y1: barY + barH, alpha: 1 });
         for (let i = 0; i < cols; i++) {
-          const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
-          // 有没有内容**直接问 occupancy**（悬停提示、统计用的都是它）：
-          // 单周期条目（同一周期先入后出）的区间是空的，只看区间会让整条泳道在低缩放下消失
-          const at = Math.round(clamp(cycle, reg.plot.from, reg.plot.to));
-          // 颜色取"这一列中心那一拍装着的东西"；取不到就退回轨道色，绝不留空
-          while (ii < sorted.length - 1 && sorted[ii]!.enter.cycle < cycle) ii++;
-          const it = sorted[ii];
-          // 有没有内容：优先问 occupancy（悬停提示、统计用的都是它）。
-          // 另外把"这一拍有条目进入"也算上 —— 同拍进出的条目区间是空的，只看 occupancy 会在低缩放下消失
-          const held = (track.occupancy.get(at) ?? 0) > 0 || (it !== undefined && Math.round(it.enter.cycle) === at);
-          const col = held ? (it !== undefined && it.value !== null ? colorOfItem(it) : laneColor) : null;
-          columns.push({ color: col, y0: barY, y1: barY + barH });
+          const c0 = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * i) / cols);
+          const c1 = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 1)) / cols);
+          const from = Math.max(c0, activeFrom);
+          const to = Math.min(c1, activeTo);
+          if (to <= from) {
+            valueCols.push(blank());
+            bubbleCols.push(blank());
+            continue;
+          }
+          const active = to - from;
+          const bubbles = bubbleCyclesIn(ranges, from, to);
+          valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
+          // 只要这一列有气泡就叠加橙色：密度用 √ 放大，少而集中的区域也能看见
+          bubbleCols.push(
+            bubbles > 0
+              ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: clamp(0.15 + 0.8 * Math.sqrt(bubbles / active), 0.15, 0.95) }
+              : blank(),
+          );
         }
-        paintLodColumns(g, columns, BLOCK_FILL, win.x0, win.x1);
+        paintLodShades(g, valueCols, win.x0, win.x1);
+        paintLodShades(g, bubbleCols, win.x0, win.x1);
         return;
       }
       // 气泡：该级本周期没有内容 —— 用虚线框标出来
@@ -1701,12 +2034,16 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       // 看上去像气泡结束过一次又开始了。
       const tailFrom = track.lastCycle + 1;
       const holdTail = (track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd;
-      const trailing =
-        holdTail ? (track.bubbleRanges.filter((range) => range.end === track.lastCycle).pop() ?? null) : null;
-      // 气泡也要受节点预算约束：以前只限制了条目，气泡段多的时候（几万段）照样能把节点数顶上去
+      const trailing = holdTail ? prep.trailing : null;
+      // 气泡也要受节点预算约束：以前只限制了条目，气泡段多的时候（几万段）照样能把节点数顶上去。
+      // 区间的 start 升序，二分找到窗口起点后只走可见的一段。
+      const ranges = track.bubbleRanges;
+      let bLo = lowerBoundRanges(ranges, win.c0);
+      if (bLo > 0 && ranges[bLo - 1]!.end >= win.c0) bLo--;
       let bubblesDrawn = 0;
-      for (const range of track.bubbleRanges) {
-        if (bubblesDrawn >= MAX_ITEMS) break;
+      for (let bi = bLo; bi < ranges.length && bubblesDrawn < MAX_ITEMS; bi++) {
+        const range = ranges[bi]!;
+        if (range.start > win.c1) break;
         if (trailing !== null && range.start === trailing.start && range.end === trailing.end) continue;
         bubblesDrawn++;
         bubble(range.start, range.end, false);
@@ -1715,8 +2052,9 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       // 再往后这个域根本没有记录，画出去就是编造）
       if (holdTail) bubble(trailing?.start ?? tailFrom, domainEnd, true);
 
-      for (const item of shown) {
-        const color = colorOfItem(item);
+      for (let index = lo; index < lo + shownCount; index++) {
+        const item = prep.items[index]!;
+        const color = pipItemColor(laneColor, item);
         const open = item.close === null;
         const enterX = reg.plot.scale(item.enter.cycle + phaseOffset(item.enter, item.async));
         // 同域用结束周期作锚点；跨域锚点在起始域上（spec §9.4），不再叠加结束记录的相位；
@@ -1784,7 +2122,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
             y: y + h - 6,
             class: 'axis-label',
             'text-anchor': 'end',
-            text: `视图内有 ${fmtInt(inView.length)} 条，只画了前 ${fmtInt(shown.length)} 条（放大可看全）`,
+            text: `视图内有 ${fmtInt(inViewCount)} 条，只画了前 ${fmtInt(shownCount)} 条（放大可看全）`,
           }),
         );
       }
@@ -1824,6 +2162,113 @@ function numericOf(value: ScalarValue): number | null {
   return null;
 }
 
+/** 数值轨/计数器轨的预处理：下采样轮廓与取值范围只算一次，缩放重建时直接复用 */
+interface SeriesPoint {
+  pos: Position;
+  async: boolean;
+  value: ScalarValue;
+  numeric: number;
+  unknown: boolean;
+}
+
+interface SeriesPrep {
+  /** 低缩放轮廓用的采样点（≤ MAX_MARKS，按文件顺序） */
+  points: SeriesPoint[];
+  /** 没有数值时的"变化点"（字符串/符号轨） */
+  marks: { pos: Position; async: boolean }[];
+  rangeLo: number;
+  rangeHi: number;
+  hasRange: boolean;
+}
+
+/** 采样序列的二分：第一个 `pos.cycle >= v` 的下标（采样按文件顺序，周期通常升序） */
+function sampleLowerBound<T extends { pos: Position }>(samples: T[], v: number): number {
+  let lo = 0;
+  let hi = samples.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (samples[mid]!.pos.cycle < v) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+const valuePreps = new WeakMap<ValueTrack, SeriesPrep>();
+const counterPreps = new WeakMap<CounterTrack, SeriesPrep>();
+
+/** 大采样序列的下采样步长：始终保留首点，末点由 `filter` 的步进决定 */
+function sampleOutline<T>(samples: T[]): T[] {
+  if (samples.length <= MAX_MARKS) return samples;
+  return samples.filter((_, index) => index % Math.ceil(samples.length / MAX_MARKS) === 0);
+}
+
+function valuePrepOf(track: ValueTrack): SeriesPrep {
+  const cached = valuePreps.get(track);
+  if (cached !== undefined) return cached;
+  const shown = sampleOutline(track.samples);
+  const points: SeriesPoint[] = [];
+  let rangeLo = Number.POSITIVE_INFINITY;
+  let rangeHi = Number.NEGATIVE_INFINITY;
+  for (const sample of shown) {
+    const numeric = numericOf(sample.value);
+    if (numeric === null) continue;
+    points.push({ pos: sample.pos, async: sample.async, value: sample.value, numeric, unknown: sample.value.hasXZ === true });
+    if (numeric < rangeLo) rangeLo = numeric;
+    if (numeric > rangeHi) rangeHi = numeric;
+  }
+  const prep: SeriesPrep = { points, marks: shown, rangeLo, rangeHi, hasRange: points.length > 0 };
+  valuePreps.set(track, prep);
+  return prep;
+}
+
+function counterPrepOf(track: CounterTrack): SeriesPrep {
+  const cached = counterPreps.get(track);
+  if (cached !== undefined) return cached;
+  const samples = sampleOutline(track.samples);
+  const points: SeriesPoint[] = samples.map((sample) => ({
+    pos: sample.pos,
+    async: sample.async,
+    value: intScalar(sample.total),
+    numeric: sample.total,
+    unknown: false,
+  }));
+  let rangeLo = Number.POSITIVE_INFINITY;
+  let rangeHi = Number.NEGATIVE_INFINITY;
+  for (const sample of samples) {
+    if (sample.total < rangeLo) rangeLo = sample.total;
+    if (sample.total > rangeHi) rangeHi = sample.total;
+  }
+  const prep: SeriesPrep = { points, marks: [], rangeLo, rangeHi, hasRange: points.length > 0 };
+  counterPreps.set(track, prep);
+  return prep;
+}
+
+/** 数值轨的窗口读取：二分到窗口左端前一条（保持值），向后读到右端为止 */
+function valueWindow(track: ValueTrack, from: number, to: number, max: number): SeriesPoint[] {
+  const out: SeriesPoint[] = [];
+  const start = Math.max(0, sampleLowerBound(track.samples, from) - 1);
+  for (let i = start; i < track.samples.length && out.length < max; i++) {
+    const sample = track.samples[i]!;
+    if (sample.pos.cycle > to) break;
+    const numeric = numericOf(sample.value);
+    if (numeric === null) continue;
+    out.push({ pos: sample.pos, async: sample.async, value: sample.value, numeric, unknown: sample.value.hasXZ === true });
+  }
+  return out;
+}
+
+/** 计数器轨的窗口读取（同上） */
+function counterWindow(track: CounterTrack, from: number, to: number, max: number): SeriesPoint[] {
+  const out: SeriesPoint[] = [];
+  const start = Math.max(0, sampleLowerBound(track.samples, from) - 1);
+  for (let i = start; i < track.samples.length && out.length < max; i++) {
+    const sample = track.samples[i]!;
+    if (sample.pos.cycle > to) break;
+    out.push({ pos: sample.pos, async: sample.async, value: intScalar(sample.total), numeric: sample.total, unknown: false });
+  }
+  return out;
+}
+
 /** 采样序列泳道的差异点：几何画法共用，取数与提示各管各的 */
 interface SeriesConfig {
   /** 行键（也是隐藏/记忆用的键，如 `val:core.ipc` / `cnt:core.retired`） */
@@ -1835,12 +2280,19 @@ interface SeriesConfig {
   height: number;
   hover: Selection;
   /** 有数值的采样点（按文件顺序） */
-  points: { pos: Position; async: boolean; value: ScalarValue; numeric: number; unknown: boolean }[];
+  points: SeriesPoint[];
   /** 没有数值时的"变化点"（字符串/符号轨） */
   marks: { pos: Position; async: boolean }[];
   defaultMode: ValueMode;
   /** 是否提供 rv32/rv64（计数器这类非指令流不给） */
   allowRv: boolean;
+  /** 纵轴取值范围（来自全量，缩放/平移时保持稳定） */
+  range: [number, number];
+  /**
+   * 放大后的窗口读取：只取可见（含左端一条保持值）采样，最多 `max` 个。
+   * 返回 null 表示该轨回退到下采样轮廓（`at=` 导致顺序不可二分时）。
+   */
+  window: ((from: number, to: number, max: number) => SeriesPoint[] | null) | null;
   tip: (cycle: number, format: ValueFormat) => string;
 }
 
@@ -1872,43 +2324,44 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
       const pad = 7;
       const top = y + pad;
       const bottom = y + h - pad;
-      const numeric = cfg.points;
-      // 逐项求极值：`Math.min(...arr)` 在大轨迹（几十万采样）上会因为实参过多直接爆栈
-      let min = Number.POSITIVE_INFINITY;
-      let max = Number.NEGATIVE_INFINITY;
-      for (const entry of numeric) {
-        if (entry.numeric < min) min = entry.numeric;
-        if (entry.numeric > max) max = entry.numeric;
-      }
-      if (numeric.length === 0) {
+      const lod = lodOf(effectivePxPerCycle(reg));
+      const win = visibleWindow(reg);
+      const outline = cfg.points;
+      // 放大（full）：按可见窗口读取全量采样，只 materialize 看得见的那一段；
+      // 缩小（coarse）：用下采样轮廓做逐像素聚合，不碰全量数据。
+      const numeric = lod === 'full' && cfg.window !== null ? (cfg.window(win.c0, win.c1, MAX_ITEMS) ?? outline) : outline;
+      // 纵轴用全量取值范围，缩放/平移时不跟着窗口内的极值抖
+      let min = cfg.range[0];
+      let max = cfg.range[1];
+      if (!(min < max)) {
         min = 0;
         max = 1;
       }
       const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
-      // 低缩放：一列一个纵向区间（这段周期里的最小–最大）+ 该列中心取值的颜色 ⇒ 既看得见"分布"
-      // 又保留按取值着色的信息；逐点画在几百周期/像素下毫无意义
-      if (numeric.length > 0 && lodOf(effectivePxPerCycle(reg)) === 'coarse') {
-        const win = visibleWindow(reg);
+      // 低缩放：忽略显示模式（波形/折线/六边形块在这一比例下都退化成一回事），
+      // 每列取该列所在周期的**保持值**，连成一条折线看变化趋势 —— 不画填充块
+      if (numeric.length > 0 && lod === 'coarse') {
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
-        const columns: LodColumn[] = [];
+        const pts: [number, number][] = [];
         let pi = 0;
         for (let i = 0; i < cols; i++) {
           const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
           while (pi < numeric.length - 2 && numeric[pi + 1]!.pos.cycle <= cycle) pi++;
           const entry = numeric[pi];
-          if (entry === undefined) break;
-          let lo = entry.numeric;
-          let hi = entry.numeric;
-          for (let k = pi; k < numeric.length && numeric[k]!.pos.cycle <= cycle + Math.max(1, (win.c1 - win.c0) / cols); k++) {
-            if (numeric[k]!.numeric < lo) lo = numeric[k]!.numeric;
-            if (numeric[k]!.numeric > hi) hi = numeric[k]!.numeric;
-          }
-          const mid = mode === 'blocks' ? colorFor(numericKey(entry.value)) : cfg.color;
-          columns.push({ color: mid, y0: Math.min(yOf(hi), yOf(lo)), y1: Math.max(yOf(hi), yOf(lo)) + 1 });
+          // 首个采样之前没有值：不连过去（保持型由 full 模式的推断段负责）
+          if (entry === undefined || entry.pos.cycle > cycle) continue;
+          pts.push([win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols, yOf(entry.numeric)]);
         }
-        paintLodColumns(g, columns, mode === 'blocks' ? BLOCK_FILL : 0.9, win.x0, win.x1);
+        if (pts.length >= 2) {
+          g.append(
+            svgEl('path', { d: linePath(pts), fill: 'none', stroke: cfg.color, 'stroke-width': 1.6, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }),
+          );
+        } else if (pts.length === 1) {
+          const p = pts[0]!;
+          g.append(svgEl('circle', { cx: p[0], cy: p[1], r: 1.6, fill: cfg.color }));
+        }
         return;
       }
       if (numeric.length > 0) {
@@ -2013,7 +2466,7 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
             );
           }
         }
-      } else {
+      } else if (cfg.points.length === 0) {
         // 非数值（字符串/符号）：只标变化点，值写在提示里
         for (const change of cfg.marks) {
           const x = xOf(change.pos, change.async);
@@ -2021,6 +2474,7 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
         }
         g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: '非数值轨：只标变化点' }));
       }
+      // 窗口内没有采样（放大到两条采样之间的空档）：什么都不画
 
       cycleSurface(hit, reg, cfg.domain, ctx, (probe) => cfg.tip(probe.cycle, format));
     },
@@ -2029,27 +2483,7 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
 
 /** 数值轨：保持型采样序列，默认按六边形块画（每段一个值） */
 function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
-  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
-  const points = shown
-    .map((sample) => ({ sample, numeric: numericOf(sample.value) }))
-    .filter((entry): entry is { sample: (typeof shown)[number]; numeric: number } => entry.numeric !== null)
-    .map((entry) => ({
-      pos: entry.sample.pos,
-      async: entry.sample.async,
-      value: entry.sample.value,
-      numeric: entry.numeric,
-      unknown: entry.sample.value.hasXZ === true,
-    }));
-  // 采样点的取值范围（悬停提示要显示）：**一次算好**。
-  // 以前是每次悬停都 `points.map(...)` 再 `Math.min(...arr)` —— 几十万采样时既慢、又会因为
-  // 实参过多直接 `Maximum call stack size exceeded`。
-  let rangeLo = Number.POSITIVE_INFINITY;
-  let rangeHi = Number.NEGATIVE_INFINITY;
-  for (const point of points) {
-    if (point.numeric < rangeLo) rangeLo = point.numeric;
-    if (point.numeric > rangeHi) rangeHi = point.numeric;
-  }
-  const hasRange = Number.isFinite(rangeLo) && Number.isFinite(rangeHi);
+  const prep = valuePrepOf(track);
   return seriesLane(
     {
       key: `val:${track.key}`,
@@ -2059,10 +2493,13 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       color: colorFor(track.key),
       height: H.value,
       hover: { kind: 'value', key: track.key },
-      points,
-      marks: shown,
+      points: prep.points,
+      marks: prep.marks,
       defaultMode: 'blocks',
       allowRv: true,
+      range: [prep.rangeLo, prep.rangeHi],
+      // `at=` 出现过时采样周期不保证单调，二分窗口不成立，退回下采样轮廓
+      window: ctx.trace.hasAtOverride ? null : (from, to, max) => valueWindow(track, from, to, max),
       tip: (cycle, format) => {
         const current = valueAt(track, cycle);
         const numericNow = current === null ? null : numericOf(current);
@@ -2070,7 +2507,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
           `数值 ${track.name}（域 ${track.domain}）`,
           cycleLabel(cycle),
           `该周期末取值 ${current === null ? '（尚未采样）' : formatScalarBy(current, format)}`,
-          numericNow === null || !hasRange ? '' : `区间 ${fmtCompact(rangeLo)} – ${fmtCompact(rangeHi)}`,
+          numericNow === null || !prep.hasRange ? '' : `区间 ${fmtCompact(prep.rangeLo)} – ${fmtCompact(prep.rangeHi)}`,
           `${track.samples.length} 次采样 · ${track.changes.length} 次变化`,
           current !== null && current.hasXZ === true ? '含未知位/高阻位（x/z）' : '',
         ]
@@ -2084,14 +2521,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
 
 /** 计数器轨：累计值是一条普通数值序列，默认按折线画 */
 function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
-  const shown = track.samples.length > MAX_MARKS ? track.samples.filter((_, index) => index % Math.ceil(track.samples.length / MAX_MARKS) === 0) : track.samples;
-  const points = shown.map((sample) => ({
-    pos: sample.pos,
-    async: sample.async,
-    value: intScalar(sample.total),
-    numeric: sample.total,
-    unknown: false,
-  }));
+  const prep = counterPrepOf(track);
   return seriesLane(
     {
       key: `cnt:${track.key}`,
@@ -2101,10 +2531,12 @@ function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
       color: colorFor(track.key),
       height: H.cnt,
       hover: { kind: 'counter', key: track.key },
-      points,
+      points: prep.points,
       marks: [],
       defaultMode: 'line',
       allowRv: false,
+      range: [prep.rangeLo, prep.rangeHi],
+      window: ctx.trace.hasAtOverride ? null : (from, to, max) => counterWindow(track, from, to, max),
       tip: (cycle, format) => {
         const total = counterTotalAt(track, cycle);
         const delta = track.deltaByCycle.get(cycle) ?? 0;
@@ -2406,6 +2838,94 @@ document.addEventListener('keydown', (event) => {
 
 // ------------------------------ 事件 / 消息
 
+/**
+ * 采样序列的窗口裁剪：只取与 `[from-1, to]` 相交、最多 `max` 个的采样。
+ * 位置通常按周期升序（二分找起点）；`at=` 覆盖会让它不再单调，此时退回线性过滤。
+ */
+function windowSamples<T extends { pos: Position }>(samples: T[], from: number, to: number, max: number, assumeSorted: boolean): T[] {
+  if (!assumeSorted) {
+    const out: T[] = [];
+    for (const sample of samples) {
+      const c = sample.pos.cycle;
+      if (c < from - 1 || c > to) continue;
+      out.push(sample);
+      if (out.length >= max) break;
+    }
+    return out;
+  }
+  let a = 0;
+  let b = samples.length;
+  while (a < b) {
+    const m = (a + b) >> 1;
+    if (samples[m]!.pos.cycle < from - 1) a = m + 1;
+    else b = m;
+  }
+  const out: T[] = [];
+  for (let i = a; i < samples.length && out.length < max; i++) {
+    const c = samples[i]!.pos.cycle;
+    if (c > to) break;
+    out.push(samples[i]!);
+  }
+  return out;
+}
+
+/** 每周期发生次数：悬停提示用，按数组对象缓存一次，避免每次 mousemove 重扫全表 */
+const countsByCycleCache = new WeakMap<object, Map<number, number>>();
+function countsByCycle(owner: object, samples: readonly { pos: Position }[]): Map<number, number> {
+  const cached = countsByCycleCache.get(owner);
+  if (cached !== undefined) return cached;
+  const map = new Map<number, number>();
+  for (const sample of samples) map.set(sample.pos.cycle, (map.get(sample.pos.cycle) ?? 0) + 1);
+  countsByCycleCache.set(owner, map);
+  return map;
+}
+
+/** 每周期次数的前缀和：低缩放画频率条带时，按列 O(log n) 求区间计数 */
+interface CyclePrefix {
+  cycles: number[];
+  /** cum[i] = 周期 <= cycles[i] 的累计次数 */
+  cum: number[];
+}
+const prefixCache = new WeakMap<object, CyclePrefix>();
+function cyclePrefix(owner: object, samples: readonly { pos: Position }[]): CyclePrefix {
+  const cached = prefixCache.get(owner);
+  if (cached !== undefined) return cached;
+  const counts = countsByCycle(owner, samples);
+  const cycles = [...counts.keys()].sort((a, b) => a - b);
+  const cum = new Array<number>(cycles.length);
+  let running = 0;
+  for (let i = 0; i < cycles.length; i++) {
+    running += counts.get(cycles[i]!) ?? 0;
+    cum[i] = running;
+  }
+  const prefix: CyclePrefix = { cycles, cum };
+  prefixCache.set(owner, prefix);
+  return prefix;
+}
+
+/** `[from, to)` 周期区间内的事件次数 */
+function countInRange(prefix: CyclePrefix, from: number, to: number): number {
+  const a = lowerBound(prefix.cycles, from);
+  const b = lowerBound(prefix.cycles, to);
+  if (b <= a) return 0;
+  return prefix.cum[b - 1]! - (a > 0 ? prefix.cum[a - 1]! : 0);
+}
+
+/** 每周期记录列表：消息/异步事件悬停提示要列出正文，同样只算一次 */
+const listByCycleCache = new WeakMap<object, Map<number, unknown[]>>();
+function listByCycle<T extends { pos: Position }>(owner: object, samples: readonly T[]): Map<number, T[]> {
+  const cached = listByCycleCache.get(owner);
+  if (cached !== undefined) return cached as Map<number, T[]>;
+  const map = new Map<number, T[]>();
+  for (const sample of samples) {
+    const list = map.get(sample.pos.cycle);
+    if (list === undefined) map.set(sample.pos.cycle, [sample]);
+    else list.push(sample);
+  }
+  listByCycleCache.set(owner, map as Map<number, unknown[]>);
+  return map;
+}
+
 function eventLane(
   name: string,
   domain: string,
@@ -2413,32 +2933,81 @@ function eventLane(
   samples: { value: ScalarValue | null; pos: Position; async: boolean }[],
   ctx: ViewContext,
 ): LaneRow {
-  const shown = samples.length > MAX_MARKS ? samples.slice(0, MAX_MARKS) : samples;
+  const counts = countsByCycle(samples, samples);
+  const prefix = cyclePrefix(samples, samples);
+  const color = colorFor(key);
   return {
     kind: 'lane',
     key: `evt:${key}`,
     group: 'event',
     domain,
     label: name,
-    color: colorFor(key),
+    color,
     height: H.evt,
     hover: { kind: 'cycle', domain, cycle: samples.length > 0 ? samples[0]!.pos.cycle : 1 },
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
+      const win = visibleWindow(reg);
       cycleSurface(hit, reg, domain, ctx, (probe) =>
         [
           `事件 ${name}（域 ${domain}）`,
           cycleLabel(probe.cycle),
-          `本周期触发 ${samples.filter((s) => s.pos.cycle === probe.cycle).length} 次 · 共 ${samples.length} 次`,
+          `本周期触发 ${counts.get(probe.cycle) ?? 0} 次 · 共 ${samples.length} 次`,
         ].join('\n'),
       );
-      const color = colorFor(key);
+      // 低缩放：按出现频率画成**条带**，频率越高不透明度越高（一条竖线代表很多周期，画三角没有意义）
+      if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
+        const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
+        const perCol = new Array<number>(cols);
+        let maxCount = 0;
+        for (let i = 0; i < cols; i++) {
+          const c0 = plot.scale.invert(win.x0 + ((win.x1 - win.x0) * i) / cols);
+          const c1 = plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 1)) / cols);
+          const n = countInRange(prefix, c0, c1);
+          perCol[i] = n;
+          if (n > maxCount) maxCount = n;
+        }
+        if (maxCount === 0) {
+          g.append(svgEl('text', { x: plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: '该周期范围内没有事件' }));
+          return;
+        }
+        const alphaOf = (n: number): number => clamp(n / maxCount, 0.12, 1);
+        const bandTop = y + 4;
+        const bandH = h - 9;
+        let i = 0;
+        while (i < cols) {
+          if (perCol[i] === 0) {
+            i++;
+            continue;
+          }
+          const alpha = alphaOf(perCol[i]!);
+          let j = i + 1;
+          // 相邻列不透明度接近就并成一条，减少节点
+          while (j < cols && perCol[j]! > 0 && Math.abs(alphaOf(perCol[j]!) - alpha) < 0.04) j++;
+          const xa = win.x0 + ((win.x1 - win.x0) * i) / cols;
+          const xb = win.x0 + ((win.x1 - win.x0) * j) / cols;
+          g.append(
+            svgEl('rect', {
+              x: round2(xa),
+              y: bandTop,
+              width: round2(Math.max(0.5, xb - xa)),
+              height: bandH,
+              fill: color,
+              'fill-opacity': alpha,
+              'pointer-events': 'none',
+            }),
+          );
+          i = j;
+        }
+        return;
+      }
+      // 只取当前窗口内的采样：放大后不再画窗口外的图元
+      const shown = windowSamples(samples, win.c0, win.c1, MAX_MARKS, !ctx.trace.hasAtOverride);
       const base = y + h - 5;
       let count = 0;
       for (const sample of shown) {
         const c = sample.pos.cycle;
-        if (c < plot.from || c > plot.to) continue;
         const cx = plot.scale(c + phaseOffset(sample.pos, sample.async));
         const tri = svgEl('path', {
           d: `M${round2(cx - 3.5)},${base - 7}L${round2(cx + 3.5)},${base - 7}L${round2(cx)},${base}Z`,
@@ -2464,7 +3033,7 @@ function eventLane(
 }
 
 function messageLane(messages: { pos: Position; text: string; async: boolean }[], ctx: ViewContext): LaneRow {
-  const shown = messages.length > MAX_MARKS ? messages.slice(0, MAX_MARKS) : messages;
+  const byCycle = listByCycle(messages, messages);
   return {
     kind: 'lane',
     group: 'event',
@@ -2476,18 +3045,19 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
+      const win = visibleWindow(reg);
       cycleSurface(hit, reg, messages[0]!.pos.domain, ctx, (probe) => {
-        const here = messages.filter((m) => m.pos.cycle === probe.cycle);
+        const here = byCycle.get(probe.cycle) ?? [];
         return [
           `消息（${messages.length} 条）`,
           cycleLabel(probe.cycle),
           here.length > 0 ? here.map((m) => `· ${m.text}`).join('\n') : '本周期没有消息',
         ].join('\n');
       });
+      const shown = windowSamples(messages, win.c0, win.c1, MAX_MARKS, !ctx.trace.hasAtOverride);
       const base = y + h - 6;
       for (const msg of shown) {
         const c = msg.pos.cycle;
-        if (c < plot.from || c > plot.to) continue;
         const dot = svgEl('circle', {
           cx: plot.scale(c + phaseOffset(msg.pos, msg.async)),
           cy: base - 4,
@@ -2514,7 +3084,7 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
 // ------------------------------ 异步事件汇总（spec §6.7）
 
 function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
-  const shown = records.length > MAX_MARKS ? records.slice(0, MAX_MARKS) : records;
+  const byCycle = listByCycle(records, records);
   return {
     kind: 'lane',
     group: 'event',
@@ -2526,8 +3096,9 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
+      const win = visibleWindow(reg);
       cycleSurface(hit, reg, records[0]!.pos.domain, ctx, (probe) => {
-        const here = records.filter((r) => r.pos.cycle === probe.cycle);
+        const here = byCycle.get(probe.cycle) ?? [];
         return [
           `异步记录（${records.length} 条）`,
           cycleLabel(probe.cycle),
@@ -2535,11 +3106,11 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
           '画在周期区间中点（两个时钟沿之间），空心标记 + 虚线连回区间',
         ].join('\n');
       });
+      const shown = windowSamples(records, win.c0, win.c1, MAX_MARKS, !ctx.trace.hasAtOverride);
       const base = y + h - 3;
       const cy = y + h / 2 - 1;
       for (const rec of shown) {
         const c = rec.pos.cycle;
-        if (c < plot.from || c > plot.to) continue;
         const color = colorFor(rec.kind);
         const cx = plot.scale(c + 0.5); // 区间中点：不吸附到任何时钟沿
         const x0 = plot.scale(c);
@@ -2647,135 +3218,120 @@ function placeBox(box: SVGRectElement, sel: Selection, reg: Registry, solid: boo
   box.setAttribute('display', '');
 }
 
-// ------------------------------------------------------------------ 缩放 / 重建
+// ------------------------------------------------------------------ 缩放 / 视图窗口
 
-/**
- * 每周期像素：`fitWidth` = 适应宽度；`options.zoom > 0` = 用户显式选择；`0` = 自动铺满但至少 8px/周期。
- * 缩放本身不设上下限（滚轮/± 按钮可以一直放大缩小），只保留画布总宽的保险。
- */
-function availablePlotWidth(host?: HTMLElement): number {
-  // 重建时旧滚动容器已从文档摘掉（clientWidth = 0），此时用上一次量到的宽度或容器宽度估算
-  const live = scrollEl?.isConnected ? scrollEl.clientWidth : chartAvail > 0 ? chartAvail : (host?.clientWidth ?? 0);
-  return Math.max(200, live - GUTTER - SIDE * 2 - 2);
+/** 绘图区可用宽度（px）：优先量实际绘图容器，退回卡片内容宽度（要减去卡片内边距） */
+function availablePlotWidth(): number {
+  const target = surfaceEl ?? bodyEl ?? hostEl;
+  if (target === null) return 200;
+  const style = getComputedStyle(target);
+  const inner = target.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  return Math.max(200, inner - GUTTER - SIDE * 2);
 }
 
-function pixelScale(ctx: ViewContext, host: HTMLElement, span: number): number {
-  const avail = availablePlotWidth(host);
-  const ceiling = MAX_PLOT_WIDTH / Math.max(1, span);
-  const floor = MIN_PLOT_WIDTH / Math.max(1, span);
-  // 「适应宽度」要正好铺满，所以不受手动缩放的像素上限约束
-  if (fitWidth) return clamp(avail / span, floor, ceiling);
-  const zoom = ctx.options.zoom;
-  const explicit = Number.isFinite(zoom) && zoom > 0;
-  return clamp(explicit ? zoom : Math.max(avail / span, PX_DEFAULT), floor, ceiling);
-}
-
-/** 清空并重画；「适应宽度」下首帧量宽不准时再补一帧，保证正好铺满 */
+/** 清空并重画（结构变化：换文件/选项/行顺序/宽度变化） */
 function paint(host: HTMLElement, ctx: ViewContext): void {
-  const before = chartAvail;
   clear(host);
+  surfaceEl = null; // 旧容器已摘除，宽度改从新建的卡片内容宽度量
   build(host, ctx);
-  if (fitWidth && Math.abs(chartAvail - before) > 1) {
-    clear(host);
-    build(host, ctx);
-  }
 }
 
-/** 视口中心对应的周期（重建后还原，缩放时不「跑偏」） */
-function currentCenterCycle(): number | null {
-  const reg = registry;
-  if (!reg || !scrollEl) return null;
-  const userX = scrollEl.scrollLeft + scrollEl.clientWidth / 2 - GUTTER;
-  return reg.plot.scale.invert(clamp(userX, reg.plot.x0, reg.plot.x1));
-}
-
-function restoreCenter(cycle: number | null): void {
-  const reg = registry;
-  if (!reg || !scrollEl || cycle === null) return;
-  scrollEl.scrollLeft = GUTTER + reg.plot.scale(cycle) - scrollEl.clientWidth / 2;
-  scrollWanted = scrollEl.scrollLeft;
-}
-
-function rebuild(keepScroll: boolean, center: number | null): void {
+function rebuild(): void {
   const host = hostEl;
   const ctx = ctxRef;
   if (!host || !ctx) return;
-  const left = scrollEl?.scrollLeft ?? 0;
-  if (keepScroll) scrollWanted = left;
   paint(host, ctx);
-  if (keepScroll) scrollEl!.scrollLeft = left;
-  restoreCenter(center);
-  // 锚点缩放会重新定位滚动位置，而这一遍是按旧窗口画的 ⇒ 低分级下补画一次（只补一次，补完就一致了）
-  const reg = registry;
-  if (center !== null && reg !== null && lodOf(effectivePxPerCycle(reg)) === 'coarse') {
-    requestAnimationFrame(() => {
-      const r = registry;
-      if (r !== null && lodOf(effectivePxPerCycle(r)) === 'coarse') rebuild(true, null);
-    });
-  }
   applyState();
 }
 
+/** 「适应宽度」：整条轨迹铺满可视宽度 */
+function fitToWidth(): void {
+  const ctx = ctxRef;
+  if (!ctx) return;
+  ctx.options.zoom = 0;
+  viewCenter = (traceFrom + traceTo + 1) / 2;
+  updateView();
+}
+
 /**
- * Ctrl/⌘ + 滚轮：以指针所在周期为锚点缩放；普通滚轮保持浏览器原生滚动，
- * 免得横向拖动轨迹时被缩放打断。
+ * 滚轮：`Ctrl/⌘ + 滚轮` 以指针处为锚点缩放（**不设上限**）；横向滚轮或 `Shift + 滚轮` 平移。
+ * 一帧最多处理一次：触控板一次拨动会连着来十几个事件，逐个重画必然掉帧。
  */
-/**
- * `Ctrl/⌘ + 滚轮` 缩放。**一帧最多重建一次**：触控板一次拨动会连着来十几个 wheel 事件，
- * 每个都重建一遍所有泳道的话，既浪费又会明显掉帧 —— 这里只累乘倍数，等到下一帧再动手。
- */
-function installWheelZoom(scroll: HTMLElement): void {
-  let factor = 1;
-  let anchor = 0;
+function installWheelZoom(surface: HTMLElement): void {
+  let zoomFactor = 1;
+  let panPx = 0;
+  let anchorCycle = 0;
+  let anchorFrac = 0.5;
+  let anchorValid = false;
   let scheduled = false;
   let settleTimer = 0;
 
   const flush = (): void => {
     scheduled = false;
-    const applied = factor;
-    factor = 1;
-    if (applied === 1) return;
-    const plot = registry?.plot;
-    if (!plot) return;
-    fitWidth = false;
-    ctxRef!.options.zoom = Number((plot.pxPerCycle * applied).toFixed(4));
-    // 一次拨动可能跨多帧：重建期间先不显示"画到一半"的内容，画完再揭开（见 paintRowsChunked）
-    rebuild(false, anchor);
+    const reg = registry;
+    const ctx = ctxRef;
+    if (!reg || !ctx) return;
+    const plot = reg.plot;
+    if (panPx !== 0) {
+      viewCenter += panPx / Math.max(1e-9, plot.pxPerCycle);
+      panPx = 0;
+      updateView();
+      return;
+    }
+    if (zoomFactor === 1) return;
+    const factor = zoomFactor;
+    zoomFactor = 1;
+    const avail = plot.x1 - plot.x0;
+    const span = Math.max(1e-9, plot.to - plot.from + 1);
+    const full = Math.max(1, traceTo - traceFrom + 1);
+    const newSpan = clamp(span / factor, 1e-9, full);
+    const frac = anchorValid ? anchorFrac : 0.5;
+    const anchor = anchorValid ? anchorCycle : viewCenter;
+    viewCenter = anchor + (0.5 - frac) * newSpan;
+    ctx.options.zoom = avail / newSpan;
+    updateView();
   };
 
-  scroll.addEventListener(
+  const schedule = (): void => {
+    if (!scheduled) {
+      scheduled = true;
+      requestAnimationFrame(flush);
+    }
+    // 停下来之后补一次：这一帧里可能还有没合并进来的
+    if (settleTimer !== 0) clearTimeout(settleTimer);
+    settleTimer = window.setTimeout(() => {
+      settleTimer = 0;
+      if (zoomFactor !== 1 || panPx !== 0) flush();
+    }, 80);
+  };
+
+  surface.addEventListener(
     'wheel',
     (event) => {
-      const wheel = event as WheelEvent;
-      if (!wheel.ctrlKey && !wheel.metaKey) return;
-      wheel.preventDefault();
+      const wt = event as WheelEvent;
       const reg = registry;
-      const plot = reg?.plot;
-      if (!reg || !plot) return;
-      const step = wheel.deltaY < 0 ? 1.2 : 1 / 1.2;
-      const next = plot.pxPerCycle * factor * step;
-      if (!Number.isFinite(next) || next <= 0 || Math.abs(next - plot.pxPerCycle * factor) < 1e-6) return;
-      const box = reg.svg.getBoundingClientRect();
-      const userX = box.width > 0 ? (wheel.clientX - box.left) * (plot.width / box.width) : plot.x0;
-      anchor = clamp(Math.round(plot.scale.invert(clamp(userX, plot.x0, plot.x1))), plot.from, plot.to);
-      factor *= step;
-      if (!scheduled) {
-        scheduled = true;
-        requestAnimationFrame(flush);
+      if (!reg) return;
+      if (wt.ctrlKey || wt.metaKey) {
+        const box = reg.svg.getBoundingClientRect();
+        const userX = box.width > 0 ? (wt.clientX - box.left) * (reg.plot.width / box.width) : reg.plot.x0;
+        const cycle = reg.plot.scale.invert(clamp(userX, reg.plot.x0, reg.plot.x1));
+        anchorCycle = cycle;
+        anchorFrac = clamp((cycle - reg.plot.from) / Math.max(1e-9, reg.plot.to - reg.plot.from + 1), 0, 1);
+        anchorValid = true;
+        zoomFactor *= wt.deltaY < 0 ? 1.2 : 1 / 1.2;
+        wt.preventDefault();
+        schedule();
+        return;
       }
-      // 停下来之后补一次：这一帧里可能还有没合并进来的
-      if (settleTimer !== 0) clearTimeout(settleTimer);
-      settleTimer = window.setTimeout(() => {
-        settleTimer = 0;
-        if (factor !== 1) flush();
-      }, 80);
+      // 横向滚轮 / Shift+滚轮 → 平移（普通竖向滚轮留给页面滚动）
+      const dx = wt.deltaX !== 0 ? wt.deltaX : wt.shiftKey ? wt.deltaY : 0;
+      if (dx === 0) return;
+      wt.preventDefault();
+      panPx += dx;
+      schedule();
     },
     { passive: false },
   );
-}
-
-function rebuildAnchored(center: number | null): void {
-  rebuild(false, center);
 }
 
 /**
@@ -2788,11 +3344,13 @@ function rebuildAnchored(center: number | null): void {
 function zoomToCycleRange(from: number, to: number): void {
   const ctx = ctxRef;
   const reg = registry;
-  if (!ctx || !reg || !scrollEl) return;
-  const span = Math.max(1, to - from);
-  fitWidth = false;
-  ctx.options.zoom = Number((availablePlotWidth() / span).toFixed(6));
-  rebuildAnchored((from + to) / 2);
+  if (!ctx || !reg) return;
+  const avail = reg.plot.x1 - reg.plot.x0;
+  const full = Math.max(1, traceTo - traceFrom + 1);
+  const span = clamp(Math.max(1, to - from), 1e-9, full);
+  ctx.options.zoom = avail / span;
+  viewCenter = (from + to) / 2;
+  updateView();
 }
 
 /** 在波形上拖拽选一段 ⇒ 缩放过去；没怎么动就交给原来的点击（选中周期） */
@@ -2890,20 +3448,21 @@ function fmtCycleRange(lo: number, hi: number): string {
 
 function stepZoom(factor: number): void {
   const ctx = ctxRef;
-  if (!ctx) return;
-  const current = registry?.plot.pxPerCycle ?? PX_DEFAULT;
-  const next = current * factor;
-  if (!Number.isFinite(next) || next <= 0 || Math.abs(next - current) < 1e-6) return;
-  const center = currentCenterCycle();
-  fitWidth = false;
-  ctx.options.zoom = Number(next.toFixed(4));
-  rebuildAnchored(center);
+  const reg = registry;
+  if (!ctx || !reg) return;
+  const plot = reg.plot;
+  const avail = plot.x1 - plot.x0;
+  const span = Math.max(1e-9, plot.to - plot.from + 1);
+  const full = Math.max(1, traceTo - traceFrom + 1);
+  const newSpan = clamp(span / factor, 1e-9, full);
+  ctx.options.zoom = avail / newSpan;
+  updateView();
 }
 
-/** 视图容器宽度变化：只有「适应宽度」模式需要跟着重画（ResizeObserver 回调，宽度已确定） */
+/** 视图容器宽度变化：绘图区宽度跟着变，重建一次（ResizeObserver 回调，宽度已确定） */
 function handleResize(): void {
-  if (!fitWidth || !hostEl || !ctxRef || hostEl.clientWidth === lastHostW) return;
-  rebuild(false, null);
+  if (!hostEl || !ctxRef || hostEl.clientWidth === lastHostW) return;
+  rebuild();
 }
 
 function observeResize(host: HTMLElement): void {
@@ -2924,13 +3483,13 @@ export const timelineView: View = {
     hostEl = container;
     ctxRef = ctx;
     buildingForLoad = true; // 挂载 = 换文件：这一轮分片画、画完才揭开
-    // 交互重建（滚轮/按钮/选项）走同步一遍过，别把半成品露出来
     hasBuilt = false;
-    scrollEl = null;
+    bodyEl = null;
+    surfaceEl = null;
     registry = null;
     hoverSel = null;
     lastHoverKey = '';
-    chartAvail = 0;
+    viewReady = false; // 换文件：视图窗口重置为整条轨迹
     selectedRows = new Set();
     anchorKey = null;
     paint(container, ctx);
@@ -2952,7 +3511,7 @@ export const timelineView: View = {
       applyState();
       return;
     }
-    rebuild(true, currentCenterCycle());
+    rebuild();
   },
 
   unmount() {
@@ -2965,12 +3524,14 @@ export const timelineView: View = {
     resizeObs?.disconnect();
     resizeObs = null;
     hostEl = null;
-    scrollEl = null;
+    bodyEl = null;
+    surfaceEl = null;
     registry = null;
     ctxRef = null;
     hoverSel = null;
     lastHoverKey = '';
-    chartAvail = 0;
+    repaintMarkers = null;
+    updateReadout = null;
     lastHostW = 0;
   },
 };

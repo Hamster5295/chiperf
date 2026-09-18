@@ -86,7 +86,6 @@ function renderShell(): void {
 
 function buildHeader(): HTMLElement {
   const nameNode = el('span', { class: 'file-name', text: state.trace ? state.source.name || '(未命名)' : '未加载文件' });
-  const progress = state.loading === null ? null : el('span', { class: 'chip', text: `解析中 ${Math.round(state.loading * 100)}%` });
   const loadBtn = el('button', { class: 'btn btn-primary', text: '打开 .chiperf' });
   const input = el('input', {
     type: 'file',
@@ -102,7 +101,6 @@ function buildHeader(): HTMLElement {
   sampleBtn.addEventListener('click', () => void loadSampleInternal());
 
   const chips = el('div', { class: 'header-chips' });
-  if (progress !== null) chips.append(progress);
   if (state.trace) {
     const t = state.trace;
     chips.append(chip(`${countLabel(t.stats.records)} 记录`, 'chip-ok'));
@@ -129,6 +127,14 @@ function buildHeader(): HTMLElement {
     nameNode,
     chips,
     el('div', { class: 'header-actions' }, [loadBtn, sampleBtn, input]),
+  ]);
+}
+
+/** 解析进度条（放在主屏幕中央「加载文件」区域下方） */
+function progressBar(): HTMLElement {
+  return el('div', { class: 'load-progress', style: 'display:none' }, [
+    el('div', { class: 'load-progress-track' }, [el('div', { class: 'load-progress-bar' })]),
+    el('span', { class: 'load-progress-text' }),
   ]);
 }
 
@@ -223,8 +229,10 @@ function renderMain(): void {
     return;
   }
 
-  if (!state.trace) {
+  // 载入中：回到中央「加载文件」区域，进度条就在它下方
+  if (!state.trace || state.loading !== null) {
     main.append(buildDropzone());
+    if (state.loading !== null) setLoadingProgress(state.loading);
     return;
   }
 
@@ -296,6 +304,10 @@ function refreshViews(reason: 'options' | 'selection' | 'hover'): void {
 // ------------------------------------------------------------------ 加载
 
 async function loadFile(file: File): Promise<void> {
+  // 立刻切到中央「加载文件」区域并显示进度条：读文件/解压也可能要等一会儿
+  state.error = null;
+  state.loading = 0;
+  renderMain();
   const buffer = new Uint8Array(await file.arrayBuffer());
   const gzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
   const source = { name: file.name, bytes: buffer.byteLength, gzip };
@@ -319,6 +331,7 @@ async function loadFile(file: File): Promise<void> {
     applyTrace(trace, source);
   } catch (err) {
     if (err instanceof Error && err.message === '__aborted__') return; // 被新一轮载入取代
+    state.loading = null;
     if (err instanceof UnsupportedVersionError) {
       state.retryableText = gzip ? null : new TextDecoder('utf-8').decode(buffer);
       state.error = `${err.message}\n\n若只想看个大概，可以用下面的按钮强制按 1.x 解析。`;
@@ -380,29 +393,32 @@ async function parseChunkedText(text: string, signal: AbortSignal): Promise<Trac
       },
     },
   );
-  setLoadingProgress(null);
   if (!ok) throw new Error('__aborted__');
+  // 停在 100%：`parser.finish()`（派生量收尾）可能还要花一会儿，别在这时候把进度条收掉
+  setLoadingProgress(1);
   return parser.finish();
 }
 
-/** 顶部那枚"解析中 N%"chip（就地更新；换文件时由 renderShell 按 state.loading 重建） */
-let progressChip: HTMLElement | null = null;
+/** 中央「加载文件」区域下方的进度条（就地更新，不重建界面） */
 function setLoadingProgress(frac: number | null): void {
   state.loading = frac;
+  const wrap = document.querySelector<HTMLElement>('.load-progress');
+  if (wrap === null) return;
   if (frac === null) {
-    progressChip?.remove();
-    progressChip = null;
+    wrap.style.display = 'none';
     return;
   }
-  if (progressChip === null || !progressChip.isConnected) {
-    progressChip = chip('解析中 0%', '');
-    document.querySelector('.header-chips')?.prepend(progressChip);
-  }
-  progressChip.textContent = `解析中 ${Math.round(frac * 100)}%`;
+  const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  wrap.style.display = '';
+  const bar = wrap.querySelector<HTMLElement>('.load-progress-bar');
+  const text = wrap.querySelector<HTMLElement>('.load-progress-text');
+  if (bar !== null) bar.style.width = `${pct}%`;
+  if (text !== null) text.textContent = `解析中 ${pct}%`;
 }
 
 function applyTrace(trace: Trace, source: { name: string; bytes: number; gzip: boolean }): void {
   markerBus.clear(); // 周期号只对同一份轨迹有意义，换文件就必须清掉
+  state.loading = null; // 载入完成，收起进度条
   state.trace = trace;
   state.source = source;
   state.error = null;
@@ -433,6 +449,7 @@ function buildDropzone(): HTMLElement {
     el('div', { class: 'dropzone-icon', text: '⌄' }),
     el('h3', { text: '把 .chiperf / .chiperf.gz 拖到这里' }),
     el('div', { style: 'display:flex;gap:8px;justify-content:center;margin:10px 0 4px' }, [openBtn, sampleBtn, input]),
+    progressBar(),
     el('p', { class: 'muted', text: '文件只在本地解析，不会上传；示例是内置生成的，不读磁盘。' }),
   ]);
 }

@@ -94,14 +94,19 @@ export class ChiperfParser {
   feed(chunk: string): void {
     this.chars += chunk.length;
     this.bytes += utf8Length(chunk);
-    this.pending += chunk;
-    let index = this.pending.indexOf('\n');
+    // 把上一片留下的残行并进来，然后**用游标**逐行前进。
+    // 之前是每处理一行就 `pending = pending.slice(...)`：每行都要把剩下的一整片复制一遍，
+    // 一片 1MB 就是 O(片长²)，大文件下光这一步就能吃掉十几秒。
+    const text = this.pending.length === 0 ? chunk : this.pending + chunk;
+    this.pending = '';
+    let start = 0;
+    let index = text.indexOf('\n', start);
     while (index >= 0) {
-      const line = this.pending.slice(0, index);
-      this.pending = this.pending.slice(index + 1);
-      this.processLine(line);
-      index = this.pending.indexOf('\n');
+      this.processLine(text.slice(start, index));
+      start = index + 1;
+      index = text.indexOf('\n', start);
     }
+    this.pending = start === 0 ? text : text.slice(start);
   }
 
   /** 供容器层（gzip 等）上报诊断；不影响解析流程 */

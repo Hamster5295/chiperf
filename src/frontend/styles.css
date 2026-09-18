@@ -1,5 +1,19 @@
 /* chiperf 可视化 —— 简洁现代的浅色界面（跟随系统深色） */
 
+/*
+ * 全局隐藏浏览器滚动条（保留滚动能力：滚轮 / 触控板 / 拖拽仍然可用）。
+ * 原生滚动条在不同平台/主题下样式很难统一，和这套配色也不搭。
+ */
+* {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* 旧 Edge */
+}
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
 :root {
   --bg: #f7f8fa;
   --surface: #ffffff;
@@ -93,6 +107,11 @@ body.is-dragging::after {
 .file-name { color: var(--text-muted); font-family: var(--mono); font-size: 12px; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .header-chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .header-actions { margin-left: auto; display: flex; gap: 8px; }
+.load-progress { display: flex; align-items: center; gap: 8px; width: 240px; max-width: 80%; }
+.dropzone .load-progress { margin: 12px auto 4px; }
+.load-progress-track { flex: 1 1 auto; height: 5px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+.load-progress-bar { height: 100%; width: 0%; background: var(--accent); transition: width 0.12s linear; }
+.load-progress-text { flex: 0 0 auto; font-size: 11px; color: var(--text-muted); font-family: var(--mono); }
 
 .chip {
   display: inline-flex;

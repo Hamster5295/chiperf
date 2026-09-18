@@ -288,33 +288,45 @@ export class Deriver {
       track.arrivals.set(c, (track.arrivals.get(c) ?? 0) + 1);
     }
 
-    // 逐周期占用度：已结束条目占半开区间 [enter, close)（同周期改掉 ⇒ 不占任何周期）；
-    // 未闭合条目从 enter 起一直算在飞，可观测窗口到该轨道的最后周期（spec §9.4）
+    // 逐周期占用度用**差分数组**：先记区间两端的增量，再一遍前缀和还原。
+    // 逐条目把区间里的每一拍都写进 Map 在长驻留/大量条目下是 O(Σ区间长度)，这里降成
+    // O(条目数 + 周期跨度)。已结束条目占半开区间 [enter, close)（同周期改掉 ⇒ 不占任何周期）；
+    // 未闭合条目从 enter 起一直算在飞，可观测窗口到该轨道的最后周期（spec §9.4）。
+    const delta = new Map<number, number>();
+    const addRange = (from: number, to: number): void => {
+      if (to <= from) return;
+      delta.set(from, (delta.get(from) ?? 0) + 1);
+      delta.set(to, (delta.get(to) ?? 0) - 1);
+    };
     for (const item of track.items) {
-      if (item.close === null) {
-        for (let c = item.enter.cycle; c <= track.lastCycle; c++) {
-          track.occupancy.set(c, (track.occupancy.get(c) ?? 0) + 1);
-        }
-        continue;
-      }
-      const end = item.closeAnchorCycle ?? item.enter.cycle;
-      for (let c = item.enter.cycle; c < end; c++) {
-        track.occupancy.set(c, (track.occupancy.get(c) ?? 0) + 1);
-      }
+      if (item.close === null) addRange(item.enter.cycle, track.lastCycle + 1);
+      else addRange(item.enter.cycle, item.closeAnchorCycle ?? item.enter.cycle);
     }
 
-    for (let c = track.firstCycle; c <= track.lastCycle; c++) {
-      if ((track.occupancy.get(c) ?? 0) === 0) track.bubbles.push(c);
-    }
+    // 一遍扫过周期跨度：同时得到占用度、气泡列表与气泡区间。
+    // 曾经在循环里用 `track.bubbles.includes(c)` 判断气泡 —— 那是 O(周期数 × 气泡数)，
+    // 几百万记录的轨迹会在这里卡上十几秒。
+    // 扫描起点要涵盖"跨域条目在绑定域观测窗口之前就进入"的情形，否则前缀和会算漏。
+    let scanFrom = track.firstCycle;
+    for (const key of delta.keys()) if (key < scanFrom) scanFrom = key;
+    let running = 0;
     let start: number | null = null;
-    for (let c = track.firstCycle; c <= track.lastCycle + 1; c++) {
-      const isBubble = c <= track.lastCycle && track.bubbles.includes(c);
-      if (isBubble && start === null) start = c;
-      else if (!isBubble && start !== null) {
-        track.bubbleRanges.push({ start, end: c - 1 });
-        start = null;
+    for (let c = scanFrom; c <= track.lastCycle; c++) {
+      running += delta.get(c) ?? 0;
+      // 观测窗口（firstCycle）之前只维持前缀和，不算气泡、不写占用度
+      if (c < track.firstCycle) continue;
+      if (running > 0) {
+        track.occupancy.set(c, running);
+        if (start !== null) {
+          track.bubbleRanges.push({ start, end: c - 1 });
+          start = null;
+        }
+      } else {
+        track.bubbles.push(c);
+        if (start === null) start = c;
       }
     }
+    if (start !== null) track.bubbleRanges.push({ start, end: track.lastCycle });
   }
 }
 

@@ -305,9 +305,21 @@ export function tableRow(values: (Node | string | number | null)[], tag: 'td' | 
 /** 数值轴：左侧刻度 + 网格线（返回绘图区几何） */
 export function numericAxis(
   svg: SVGSVGElement,
-  opts: { x: number; y: number; width: number; height: number; min: number; max: number; label?: string; ticks?: number[] },
+  opts: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    min: number;
+    max: number;
+    label?: string;
+    ticks?: number[];
+    /** 刻度文本的格式化（默认 `fmtCompact`；位向量轨可传 hex） */
+    format?: (value: number) => string;
+  },
 ): { scale: Scale; ticks: { value: number; y: number }[] } {
   const ticks = opts.ticks ?? axisTicks(opts.min, opts.max, 5);
+  const format = opts.format ?? fmtCompact;
   const scale = linearScale(opts.min, opts.max, opts.y + opts.height, opts.y);
   const out: { value: number; y: number }[] = [];
   for (const value of ticks) {
@@ -315,7 +327,7 @@ export function numericAxis(
     out.push({ value, y });
     svg.append(
       svgEl('line', { x1: opts.x, x2: opts.x + opts.width, y1: y, y2: y, class: 'grid-line' }),
-      svgEl('text', { x: opts.x - 6, y: y + 3.5, class: 'axis-label', 'text-anchor': 'end', text: fmtCompact(value) }),
+      svgEl('text', { x: opts.x - 6, y: y + 3.5, class: 'axis-label', 'text-anchor': 'end', text: format(value) }),
     );
   }
   if (opts.label) {
