@@ -7,10 +7,10 @@ hero:
   actions:
     - theme: brand
       text: 立即体验
-      link: /intro
+      link: https://hamster5295.github.io/chiperf/visualize
     - theme: alt
-      text: Spec V1.0
-      link: /spec/v1.0
+      text: 文档
+      link: /intro
 
 features:
   - title: 🚀 事件驱动

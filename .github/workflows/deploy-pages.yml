@@ -41,15 +41,26 @@ jobs:
         run: bun run build
 
       # 组装站点：
+      #   /chiperf/            -> 跳转到文档首页
       #   /chiperf/docs/       <- 文档站
-      #   /chiperf/visualize/  <- 可视化器
-      #   /chiperf/            <- 入口页
+      #   /chiperf/visualize   <- 可视化器（无末尾斜杠）
       - name: Assemble site
         run: |
-          mkdir -p _site/docs _site/visualize
+          mkdir -p _site/docs
           cp -r docs/.vitepress/dist/. _site/docs/
-          cp dist/index.html _site/visualize/index.html
-          cp .github/pages/index.html _site/index.html
+          cp dist/index.html _site/visualize.html
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=./docs/">
+            <link rel="canonical" href="./docs/">
+            <title>Chiperf</title>
+          </head>
+          <body><a href="./docs/">Chiperf 文档</a></body>
+          </html>
+          HTML
           touch _site/.nojekyll
 
       - name: Setup Pages

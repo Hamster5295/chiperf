@@ -27,11 +27,8 @@ export default defineConfig({
     },
     themeConfig: {
         nav: [
-            { text: '简介', link: '/intro' },
-            { text: '事件', link: '/events/' },
-            { text: '规范', link: '/spec/v1.0' },
-            { text: '示例', link: '/examples' },
-            { text: '工具链', link: '/toolchain' },
+            { text: 'Spec V1.0', link: '/spec/v1.0' },
+            { text: '可视化', link: 'https://hamster5295.github.io/chiperf/visualize' },
         ],
         sidebar: [
             {
@@ -73,5 +70,7 @@ export default defineConfig({
         sidebarMenuLabel: '目录',
         darkModeSwitchLabel: '外观',
         outlineLabel: '本页目录',
+
+        socialLinks: [{ icon: "github", link: "https://github.com/Hamster5295/chiperf" }],
     },
 })
