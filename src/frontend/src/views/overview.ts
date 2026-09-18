@@ -145,16 +145,22 @@ function totals(trace: Trace) {
   let closed = 0;
   let open = 0;
   let bubbles = 0;
+  let maxLatency = 0;
   const latencies: number[] = [];
   for (const track of trace.tracks.values()) {
     items += track.items.length;
     closed += track.closed;
     open += track.open;
     bubbles += track.bubbles.length;
-    latencies.push(...track.latencies);
+    // 不能用 push(...arr) / Math.max(...arr)：大轨迹里这个数组能到几十万项，
+    // 展开成实参会撞上引擎的参数上限（Maximum call stack size exceeded）
+    for (const latency of track.latencies) {
+      latencies.push(latency);
+      if (latency > maxLatency) maxLatency = latency;
+    }
   }
   const avg = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
-  const max = latencies.length > 0 ? Math.max(...latencies) : 0;
+  const max = maxLatency;
   return { items, closed, open, bubbles, avg, max, latencyCount: latencies.length };
 }
 

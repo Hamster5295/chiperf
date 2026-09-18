@@ -1708,9 +1708,17 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
       const top = y + pad;
       const bottom = y + h - pad;
       const numeric = cfg.points;
-      const values = numeric.map((entry) => entry.numeric);
-      const min = values.length > 0 ? Math.min(...values) : 0;
-      const max = values.length > 0 ? Math.max(...values) : 1;
+      // 逐项求极值：`Math.min(...arr)` 在大轨迹（几十万采样）上会因为实参过多直接爆栈
+      let min = Number.POSITIVE_INFINITY;
+      let max = Number.NEGATIVE_INFINITY;
+      for (const entry of numeric) {
+        if (entry.numeric < min) min = entry.numeric;
+        if (entry.numeric > max) max = entry.numeric;
+      }
+      if (numeric.length === 0) {
+        min = 0;
+        max = 1;
+      }
       const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
@@ -1843,7 +1851,16 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       numeric: entry.numeric,
       unknown: entry.sample.value.hasXZ === true,
     }));
-  const range = points.map((point) => point.numeric);
+  // 采样点的取值范围（悬停提示要显示）：**一次算好**。
+  // 以前是每次悬停都 `points.map(...)` 再 `Math.min(...arr)` —— 几十万采样时既慢、又会因为
+  // 实参过多直接 `Maximum call stack size exceeded`。
+  let rangeLo = Number.POSITIVE_INFINITY;
+  let rangeHi = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    if (point.numeric < rangeLo) rangeLo = point.numeric;
+    if (point.numeric > rangeHi) rangeHi = point.numeric;
+  }
+  const hasRange = Number.isFinite(rangeLo) && Number.isFinite(rangeHi);
   return seriesLane(
     {
       key: `val:${track.key}`,
@@ -1864,7 +1881,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
           `数值 ${track.name}（域 ${track.domain}）`,
           cycleLabel(cycle),
           `该周期末取值 ${current === null ? '（尚未采样）' : formatScalarBy(current, format)}`,
-          numericNow === null || range.length === 0 ? '' : `区间 ${fmtCompact(Math.min(...range))} – ${fmtCompact(Math.max(...range))}`,
+          numericNow === null || !hasRange ? '' : `区间 ${fmtCompact(rangeLo)} – ${fmtCompact(rangeHi)}`,
           `${track.samples.length} 次采样 · ${track.changes.length} 次变化`,
           current !== null && current.hasXZ === true ? '含未知位/高阻位（x/z）' : '',
         ]
