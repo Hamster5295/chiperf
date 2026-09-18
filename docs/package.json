@@ -1,0 +1,17 @@
+{
+  "name": "@chiperf/docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "chiperf 文档站点（VitePress）",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "mermaid": "^12.0.0",
+    "vitepress": "^1.6.4",
+    "vitepress-plugin-mermaid": "^2.0.17"
+  }
+}

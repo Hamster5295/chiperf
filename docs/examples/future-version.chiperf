@@ -1,5 +1,0 @@
-chiperf 2.0
-@meta note="未知主版本：默认模式必须拒绝；显式忽略版本模式可尽力解析"
-[clk] p
-[cnt] "Retired"
-@end
