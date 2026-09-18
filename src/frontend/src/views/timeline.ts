@@ -333,11 +333,130 @@ function menuTargets(row: LaneRow): LaneRow[] {
   return allRows.filter((candidate) => selectedRows.has(candidate.key));
 }
 let scrollEl: HTMLElement | null = null;
+/**
+ * 期望的横向滚动位置。`paint()` 会 `clear(host)` 后整棵重建，新的 `.chart-scroll` 从 0 开始；
+ * 聚合窗口若直接读元素，重建后画出来的就是窗口最左端那一屏（而不是用户看的那一屏）。
+ * 所以滚动位置单独记一份，建好新 scroller 立刻回填（泳道是之后才画的）。
+ */
+let scrollWanted = 0;
 let ctxRef: ViewContext | null = null;
 let unsub: (() => void) | null = null;
 let registry: Registry | null = null;
 let hoverSel: Selection = null;
 let lastHoverKey = '';
+/**
+ * 缩放分级（LOD）。
+ *
+ * 每周期像素数小到一定程度时，逐个画条目/采样既没意义（一根竖线代表上百拍）又画不准 ——
+ * 大轨迹在 fit 比例下是 239 周期/像素，画 30 万个六边形其实只覆盖得了开头一小段。
+ * 这一段比例下改用**逐可见像素的聚合**：一列一个颜色 + 一个纵向区间，连续同色的列合并成矩形，
+ * 再按颜色分组 ⇒ 整个泳道只剩几个 `<path>`。
+ *
+ * 低缩放时**同时关掉标签**：那一屏本来就读不了字。
+ */
+type Lod = 'full' | 'coarse';
+/** 每周期像素低于它就把形状降级成聚合；回到细节要大于 1.35 倍（滞回，免得缩放时来回抖） */
+const LOD_AGG_PX = 6;
+let lodLast: Lod = 'full';
+
+/**
+ * **实际**每周期像素：画布宽度有上限（`MAX_PLOT_WIDTH`），所以 `plot.pxPerCycle`（缩放请求值）
+ * 在长轨迹上会被截住 —— 65 MB 那支轨迹请求 66 px/周期、实际只有 0.56 px/周期。
+ * 分级必须看实际值，否则会按"看不存在的细节"去画。
+ */
+function effectivePxPerCycle(reg: Registry): number {
+  const span = Math.max(1, reg.plot.to - reg.plot.from + 1);
+  return reg.plot.width / span;
+}
+
+function lodOf(pxPerCycle: number): Lod {
+  const enter = lodLast === 'coarse' ? LOD_AGG_PX * 1.35 : LOD_AGG_PX;
+  lodLast = pxPerCycle < enter ? 'coarse' : 'full';
+  return lodLast;
+}
+
+/** 聚合用的一列：颜色（null = 这一列没有内容）+ 纵向区间（屏幕 y） */
+interface LodColumn {
+  color: string | null;
+  y0: number;
+  y1: number;
+}
+
+/**
+ * 把逐像素列画成路径：连续同色的列合并成一个矩形，再按颜色分组。
+ * `x0`/`x1` 是这些列覆盖的用户坐标区间（列序号要换算成真实 x，否则聚合会画到窗口左端去）。
+ * 返回画出的矩形数（回归时用来确认聚合确实生效）。
+ */
+function paintLodColumns(g: SVGGElement, columns: LodColumn[], alpha: number, x0: number, x1: number): number {
+  const colX = (i: number): number => x0 + ((x1 - x0) * i) / columns.length;
+  const runs = new Map<string, string[]>();
+  let rects = 0;
+  for (let i = 0; i < columns.length; ) {
+    const color = columns[i]!.color;
+    let j = i + 1;
+    while (j < columns.length && columns[j]!.color === color) j++;
+    if (color !== null) {
+      let y0 = Number.POSITIVE_INFINITY;
+      let y1 = Number.NEGATIVE_INFINITY;
+      for (let k = i; k < j; k++) {
+        if (columns[k]!.y0 < y0) y0 = columns[k]!.y0;
+        if (columns[k]!.y1 > y1) y1 = columns[k]!.y1;
+      }
+      const xa = round2(colX(i));
+      const xb = round2(colX(j));
+      const d = `M${xa},${round2(y1)}H${xb}V${round2(y0)}H${xa}Z`;
+      const list = runs.get(color);
+      if (list === undefined) runs.set(color, [d]);
+      else list.push(d);
+      rects++;
+    }
+    i = j;
+  }
+  for (const [color, paths] of runs) {
+    g.append(svgEl('path', { d: paths.join(''), fill: color, 'fill-opacity': alpha, 'pointer-events': 'none' }));
+  }
+  return rects;
+}
+
+/** 可见窗口（用户坐标 x 与周期）：聚合只算看得见的那一段，顺带把工作量钉在"一屏像素"上 */
+function visibleWindow(reg: Registry): { x0: number; x1: number; c0: number; c1: number } {
+  const live = scrollEl?.isConnected ? scrollEl : null;
+  const left = live === null ? 0 : live.scrollLeft - GUTTER;
+  const width = Math.max(64, live === null ? reg.plot.width : live.clientWidth - GUTTER);
+  // 两侧各留 35% 缓冲：滚动到缓冲以内不必重画（重画由 installScrollLod 按 1/3 屏的步长触发）
+  const pad = width * 0.35;
+  const x0 = clamp(left - pad, 0, reg.plot.width);
+  const x1 = clamp(left + width + pad, 0, reg.plot.width);
+  return { x0, x1, c0: reg.plot.scale.invert(x0), c1: reg.plot.scale.invert(x1) };
+}
+
+/**
+ * 聚合只覆盖"看得见的一段 + 缓冲"，所以**滚动之后必须补画**。
+ * 细节分级下不做这件事：那时所有形状本来就已经在 DOM 里，滚动是纯浏览器行为。
+ * 用 `rebuild(true, …)` 保留滚动位置，不会反过来触发滚动事件。
+ */
+function installScrollLod(scroll: HTMLElement): void {
+  let lastLeft = scroll.scrollLeft;
+  let scheduled = false;
+  scroll.addEventListener(
+    'scroll',
+    () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        const reg = registry;
+        if (reg === null || lodOf(effectivePxPerCycle(reg)) !== 'coarse') return;
+        if (Math.abs(scroll.scrollLeft - lastLeft) < scroll.clientWidth / 3) return;
+        lastLeft = scroll.scrollLeft;
+        scrollWanted = scroll.scrollLeft;
+        rebuild(true, null);
+      });
+    },
+    { passive: true },
+  );
+}
+
 /**
  * 标记层：两条竖线 + 顶部手柄 + 中间区间的浅色底。
  *
@@ -838,6 +957,8 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   installDragZoom(svg);
   installMarkers(svg, reg, ctx);
   scrollEl = scroll;
+  scroll.scrollLeft = scrollWanted;
+  installScrollLod(scroll);
   registry = reg;
   chartAvail = scroll.clientWidth;
   lastHostW = host.clientWidth;
@@ -1391,6 +1512,23 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
         ].join('\n');
       });
       const last = segments[segments.length - 1];
+      // 低缩放：一列一个状态颜色（该列中心周期所在区段），连续同色合并成矩形
+      if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
+        const win = visibleWindow(reg);
+        const domainEndC = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
+        const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
+        const columns: LodColumn[] = [];
+        let si = 0;
+        for (let i = 0; i < cols; i++) {
+          const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
+          while (si < segments.length - 1 && segments[si]!.end < cycle) si++;
+          const seg = segments[si];
+          const covered = seg !== undefined && cycle >= seg.start && cycle <= (seg === last ? domainEndC : seg.end);
+          columns.push({ color: covered ? colorFor(seg.state) : null, y0: y + 4, y1: y + h - 5 });
+        }
+        paintLodColumns(g, columns, BLOCK_FILL, win.x0, win.x1);
+        return;
+      }
       let drawn = 0;
       // 最后一段的状态会一直保持到轨迹结束（`fsm` 与 `val` 同为保持型），所以画到该域末尾；
       // 但它只到"最后一次上报"为止是确定的，之后纯属推断，所以照 §9.5 用开放样式区分。
@@ -1495,6 +1633,31 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         ].join('\n'),
       );
 
+      const barH = h - 9;
+      const barY = y + 4;
+      // 低缩放：一列一个颜色（该列中心周期上"装着什么"，空则留白 ⇒ 直接看出占用分布）
+      if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
+        const win = visibleWindow(reg);
+        const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
+        const columns: LodColumn[] = [];
+        let ii = 0;
+        for (let i = 0; i < cols; i++) {
+          const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
+          // 有没有内容**直接问 occupancy**（悬停提示、统计用的都是它）：
+          // 单周期条目（同一周期先入后出）的区间是空的，只看区间会让整条泳道在低缩放下消失
+          const at = Math.round(clamp(cycle, reg.plot.from, reg.plot.to));
+          // 颜色取"这一列中心那一拍装着的东西"；取不到就退回轨道色，绝不留空
+          while (ii < sorted.length - 1 && sorted[ii]!.enter.cycle < cycle) ii++;
+          const it = sorted[ii];
+          // 有没有内容：优先问 occupancy（悬停提示、统计用的都是它）。
+          // 另外把"这一拍有条目进入"也算上 —— 同拍进出的条目区间是空的，只看 occupancy 会在低缩放下消失
+          const held = (track.occupancy.get(at) ?? 0) > 0 || (it !== undefined && Math.round(it.enter.cycle) === at);
+          const col = held ? (it !== undefined && it.value !== null ? colorOfItem(it) : laneColor) : null;
+          columns.push({ color: col, y0: barY, y1: barY + barH });
+        }
+        paintLodColumns(g, columns, BLOCK_FILL, win.x0, win.x1);
+        return;
+      }
       // 气泡：该级本周期没有内容 —— 用虚线框标出来
       // 与条目同一种形状（六边形），只是空心虚线：一眼能看出这是「占位/无内容」
       const bubble = (start: number, end: number, inferred: boolean): void => {
@@ -1540,16 +1703,18 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       const holdTail = (track.occupancy.get(track.lastCycle) ?? 0) === 0 && tailFrom <= domainEnd;
       const trailing =
         holdTail ? (track.bubbleRanges.filter((range) => range.end === track.lastCycle).pop() ?? null) : null;
+      // 气泡也要受节点预算约束：以前只限制了条目，气泡段多的时候（几万段）照样能把节点数顶上去
+      let bubblesDrawn = 0;
       for (const range of track.bubbleRanges) {
+        if (bubblesDrawn >= MAX_ITEMS) break;
         if (trailing !== null && range.start === trailing.start && range.end === trailing.end) continue;
+        bubblesDrawn++;
         bubble(range.start, range.end, false);
       }
       // 推断的气泡尾巴：末尾已知"无内容"，且该域仍在继续（写到域自己的末周期为止，
       // 再往后这个域根本没有记录，画出去就是编造）
       if (holdTail) bubble(trailing?.start ?? tailFrom, domainEnd, true);
 
-      const barH = h - 9;
-      const barY = y + 4;
       for (const item of shown) {
         const color = colorOfItem(item);
         const open = item.close === null;
@@ -1722,6 +1887,30 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
       const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
+      // 低缩放：一列一个纵向区间（这段周期里的最小–最大）+ 该列中心取值的颜色 ⇒ 既看得见"分布"
+      // 又保留按取值着色的信息；逐点画在几百周期/像素下毫无意义
+      if (numeric.length > 0 && lodOf(effectivePxPerCycle(reg)) === 'coarse') {
+        const win = visibleWindow(reg);
+        const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
+        const columns: LodColumn[] = [];
+        let pi = 0;
+        for (let i = 0; i < cols; i++) {
+          const cycle = reg.plot.scale.invert(win.x0 + ((win.x1 - win.x0) * (i + 0.5)) / cols);
+          while (pi < numeric.length - 2 && numeric[pi + 1]!.pos.cycle <= cycle) pi++;
+          const entry = numeric[pi];
+          if (entry === undefined) break;
+          let lo = entry.numeric;
+          let hi = entry.numeric;
+          for (let k = pi; k < numeric.length && numeric[k]!.pos.cycle <= cycle + Math.max(1, (win.c1 - win.c0) / cols); k++) {
+            if (numeric[k]!.numeric < lo) lo = numeric[k]!.numeric;
+            if (numeric[k]!.numeric > hi) hi = numeric[k]!.numeric;
+          }
+          const mid = mode === 'blocks' ? colorFor(numericKey(entry.value)) : cfg.color;
+          columns.push({ color: mid, y0: Math.min(yOf(hi), yOf(lo)), y1: Math.max(yOf(hi), yOf(lo)) + 1 });
+        }
+        paintLodColumns(g, columns, mode === 'blocks' ? BLOCK_FILL : 0.9, win.x0, win.x1);
+        return;
+      }
       if (numeric.length > 0) {
         const first = numeric[0]!;
         const last = numeric[numeric.length - 1]!;
@@ -2504,6 +2693,7 @@ function restoreCenter(cycle: number | null): void {
   const reg = registry;
   if (!reg || !scrollEl || cycle === null) return;
   scrollEl.scrollLeft = GUTTER + reg.plot.scale(cycle) - scrollEl.clientWidth / 2;
+  scrollWanted = scrollEl.scrollLeft;
 }
 
 function rebuild(keepScroll: boolean, center: number | null): void {
@@ -2511,9 +2701,18 @@ function rebuild(keepScroll: boolean, center: number | null): void {
   const ctx = ctxRef;
   if (!host || !ctx) return;
   const left = scrollEl?.scrollLeft ?? 0;
+  if (keepScroll) scrollWanted = left;
   paint(host, ctx);
   if (keepScroll) scrollEl!.scrollLeft = left;
   restoreCenter(center);
+  // 锚点缩放会重新定位滚动位置，而这一遍是按旧窗口画的 ⇒ 低分级下补画一次（只补一次，补完就一致了）
+  const reg = registry;
+  if (center !== null && reg !== null && lodOf(effectivePxPerCycle(reg)) === 'coarse') {
+    requestAnimationFrame(() => {
+      const r = registry;
+      if (r !== null && lodOf(effectivePxPerCycle(r)) === 'coarse') rebuild(true, null);
+    });
+  }
   applyState();
 }
 
