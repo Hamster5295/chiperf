@@ -96,14 +96,14 @@ describe('注释与字段切分（spec §4.1 / §5.1）', () => {
 });
 
 describe('字段解析（spec §5.1 的两条上下文规则）', () => {
-  test('属性 vs 位置参数消歧', () => {
+  test('属性 vs 参数消歧', () => {
     const args = parseArgs('"core.if", I, 0x10, dom=core');
     expect(args.map((a) => a.kind)).toEqual(['pos', 'pos', 'pos', 'attr']);
     const attr = args[3]!;
     expect(attr.kind === 'attr' && attr.key).toBe('dom');
   });
 
-  test('位置参数出现在属性之后 ⇒ 非法记录', () => {
+  test('参数出现在属性之后 ⇒ 非法记录', () => {
     const args = parseArgs('a, dom=core, b');
     expect(args.some((a) => a.kind === 'error')).toBe(true);
   });

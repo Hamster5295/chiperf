@@ -98,7 +98,7 @@ describe('§10.2 未知内容', () => {
 describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
   const cases: [string, string][] = [
     ['[clk] x', 'clk 的沿取值非法'],
-    ['[clk] p, n', 'clk 位置参数过多'],
+    ['[clk] p, n', 'clk 参数过多'],
     ['[cnt] "x", 1.5', 'cnt 增量不是 int'],
     ['[cnt] "x", 1, abs=2', '增量与 abs= 同时出现'],
     ['[cnt] "x", 1ns', '缩放量用在了非 @domain 位置'],
@@ -107,12 +107,12 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
     ['[val] "PC", "unterminated', '字符串未闭合'],
     ['[pip] "IF"', 'pip 缺新值'],
     ['[pip] "IF", I', 'pip 值位置写了早期草案的方向字（这个词被保留）'],
-    ['[pip] "IF", 1, 2', 'pip 位置参数过多'],
+    ['[pip] "IF", 1, 2', 'pip 参数过多'],
     ['[fsm] "ctrl"', 'fsm 缺状态'],
     ['[val] "PC", 1, dom=123', 'dom 不是域名'],
     ['[val] "PC", 1, async=yes', 'async 不是 0/1'],
     ['[val] "PC", 1, at=1.5p', 'at 值非法'],
-    ['[val] "PC", 1, dom=core, 2', '位置参数出现在属性之后'],
+    ['[val] "PC", 1, dom=core, 2', '参数出现在属性之后'],
     ['chiperf 1.0', '版本行出现在中间'],
     ['garbage line', '行首非法'],
   ];

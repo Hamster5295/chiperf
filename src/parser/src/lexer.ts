@@ -56,7 +56,7 @@ export function splitTopLevel(s: string): string[] {
 
 /**
  * 指令字段的顶层切分（spec §8）：逗号**或空白**都算分隔符。
- * 指令的语法写作 `@ <名> [位置参数...] [属性...]`，§8.1 的例子就是空白分隔的
+ * 指令的语法写作 `@ <名字> [参数...] [属性...]`，§8.1 的例子就是空白分隔的
  * （`@meta design="x" tool="y"`），而 `@domain core, period=1.0ns` 又是逗号分隔，
  * 两种写法都在用，所以两种都收 —— 未加引号的记号本来就不含空白，切分无歧义。
  */
@@ -79,7 +79,7 @@ const RE_AT_VALUE = /^-?\d+[pn]?$/;
 
 /**
  * 解析一条记录的字段列表。
- * 消歧规则（spec §5.1）：字段首记号后紧跟 `=` ⇒ 属性；否则位置参数。
+ * 消歧规则（spec §5.1）：字段首记号后紧跟 `=` ⇒ 属性；否则参数。
  */
 export function parseArgs(fieldText: string, opts: { allowAttrs?: boolean; spaceSeparated?: boolean } = {}): Arg[] {
   const trimmed = fieldText.trim();
@@ -106,15 +106,15 @@ export function parseArgs(fieldText: string, opts: { allowAttrs?: boolean; space
     if (eq < 0) {
       const scanned = scanValue(field);
       if (!scanned || scanned.rest.trim().length > 0) {
-        args.push({ kind: 'error', reason: '位置参数不是单个合法值的记号', text: field });
+        args.push({ kind: 'error', reason: '参数不是单个合法值的记号', text: field });
         continue;
       }
       if (scanned.value.kind === 'sym' && scanned.value.text === '') {
-        args.push({ kind: 'error', reason: '空位置参数', text: field });
+        args.push({ kind: 'error', reason: '空参数', text: field });
         continue;
       }
       if (sawAttr) {
-        args.push({ kind: 'error', reason: '位置参数出现在属性之后', text: field });
+        args.push({ kind: 'error', reason: '参数出现在属性之后', text: field });
         continue;
       }
       args.push({ kind: 'pos', value: scanned.value });

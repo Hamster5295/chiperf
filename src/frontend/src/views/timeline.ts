@@ -520,7 +520,7 @@ function repaintLanes(reg: Registry): void {
  * 标记层：两条竖线 + 顶部手柄 + 中间区间的浅色底。
  *
  * 画在**最上层**（追加在行与选中覆盖层之后），整块绘图区高度，方便抓住。
- * 拖拽期间只动视觉（改 x 与文字），**松手时才提交**给 `ctx.markers` ——
+ * 拖拽期间只动视觉（改 x 与文字），**松手时才提交**给 `ctx.markers`
  * 提交会触发流水线/状态机重算统计，每移动一像素都提交的话必然卡。
  */
 function installMarkers(svg: SVGSVGElement, reg: Registry, ctx: ViewContext): void {

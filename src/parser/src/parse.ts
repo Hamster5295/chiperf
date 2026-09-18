@@ -228,7 +228,7 @@ export class ChiperfParser {
       const attrs = this.collectAttrs(args);
       if (attrs === null) return;
       if (positional.length !== 1 || (positional[0]!.value.kind !== 'sym' && positional[0]!.value.kind !== 'str')) {
-        this.skip('invalid_record', this.lineNo, body, '@domain 需要恰好一个域名位置参数');
+        this.skip('invalid_record', this.lineNo, body, '@domain 需要恰好一个域名参数');
         return;
       }
       const domainName = positional[0]!.value.text;
@@ -327,7 +327,7 @@ export class ChiperfParser {
 
     if (kind === 'clk') {
       if (positional.length !== 1) {
-        this.skip('invalid_record', this.lineNo, line, 'clk 需要恰好一个位置参数（p 或 n）');
+        this.skip('invalid_record', this.lineNo, line, 'clk 需要恰好一个参数（p 或 n）');
         return;
       }
       const edge = positional[0]!.value;
@@ -355,7 +355,7 @@ export class ChiperfParser {
 
     if (kind === 'cnt') {
       if (positional.length < 1 || positional.length > 2) {
-        this.skip('invalid_record', this.lineNo, line, 'cnt 需要 1~2 个位置参数（名字[, 增量]）');
+        this.skip('invalid_record', this.lineNo, line, 'cnt 需要 1~2 个参数（名字[, 增量]）');
         return;
       }
       const nameValue = positional[0]!.value;
@@ -368,7 +368,7 @@ export class ChiperfParser {
       let abs: number | null = null;
       if (absValue !== undefined) {
         if (positional.length !== 1 || absValue === null || absValue.kind !== 'int') {
-          this.skip('invalid_record', this.lineNo, line, 'abs= 必须与位置参数互斥，且值为 int');
+          this.skip('invalid_record', this.lineNo, line, 'abs= 必须与参数互斥，且值为 int');
           return;
         }
         abs = Number(absValue.big ?? 0n);
@@ -397,7 +397,7 @@ export class ChiperfParser {
 
     if (kind === 'val') {
       if (positional.length !== 2) {
-        this.skip('invalid_record', this.lineNo, line, 'val 需要恰好 2 个位置参数（名字, 值）');
+        this.skip('invalid_record', this.lineNo, line, 'val 需要恰好 2 个参数（名字, 值）');
         return;
       }
       const name = nameOf(positional[0]!.value);
@@ -420,7 +420,7 @@ export class ChiperfParser {
       // `I`/`O`/`X` 是 v1.x 的方向，留在这个位置当"值"读会静默改变含义 —— 直接判非法并给迁移提示。
       const second = positional[1]?.value;
       if (second !== undefined && second.kind === 'sym' && (second.text === 'I' || second.text === 'O' || second.text === 'X')) {
-        this.skip('invalid_record', this.lineNo, line, `pip 不再有方向：第 2 个位置参数是该级的新值，空写 bubble（收到方向 ${second.text}）`);
+        this.skip('invalid_record', this.lineNo, line, `pip 不再有方向：第 2 个参数是该级的新值，空写 bubble（收到方向 ${second.text}）`);
         this.diag('pip_legacy_direction', this.lineNo, `[pip] 的 I/O/X 方向是早期草案的写法、v1.0 已移除：直接写该级的新值，空写 bubble`);
         return;
       }
@@ -429,7 +429,7 @@ export class ChiperfParser {
           'invalid_record',
           this.lineNo,
           line,
-          positional.length < 2 ? 'pip 需要 2 个位置参数（轨道, 值|bubble）：缺少新值' : 'pip 只接受 2 个位置参数（轨道, 值|bubble）',
+          positional.length < 2 ? 'pip 需要 2 个参数（轨道, 值|bubble）：缺少新值' : 'pip 只接受 2 个参数（轨道, 值|bubble）',
         );
         return;
       }
@@ -455,7 +455,7 @@ export class ChiperfParser {
 
     if (kind === 'fsm') {
       if (positional.length !== 2) {
-        this.skip('invalid_record', this.lineNo, line, 'fsm 需要恰好 2 个位置参数（名字, 状态）');
+        this.skip('invalid_record', this.lineNo, line, 'fsm 需要恰好 2 个参数（名字, 状态）');
         return;
       }
       const name = nameOf(positional[0]!.value);
@@ -475,7 +475,7 @@ export class ChiperfParser {
 
     // evt
     if (positional.length < 1 || positional.length > 2) {
-      this.skip('invalid_record', this.lineNo, line, 'evt 需要 1~2 个位置参数（名字[, 载荷]）');
+      this.skip('invalid_record', this.lineNo, line, 'evt 需要 1~2 个参数（名字[, 载荷]）');
       return;
     }
     const name = nameOf(positional[0]!.value);
