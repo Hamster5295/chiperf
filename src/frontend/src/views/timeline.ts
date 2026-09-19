@@ -1363,6 +1363,8 @@ function gutterCell(row: LaneRow, h: number, ctx: ViewContext): HTMLElement {
         style: 'flex:0 1 auto;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
         text: row.label,
       }),
+      // 行头靠右的记录类型：浅色文字，长名字省略后类型仍然看得见
+      el('span', { class: 'tl-row-type', text: GROUP_NAME[row.group] }),
     ],
   );
   node.addEventListener('mousedown', (event) => {
