@@ -380,6 +380,15 @@ let registry: Registry | null = null;
 let hoverSel: Selection = null;
 let lastHoverKey = '';
 /**
+ * 最近一次悬停的位置（指针 clientX + 所在行）。
+ *
+ * 悬停列高亮是按 `plot.scale` 算出来的：缩放/平移会换掉比例尺，而滚轮缩放时
+ * 指针通常不再移动（不会再触发 mousemove）—— 只记住"周期号"不够，缩放后指针
+ * 底下已经是另一个周期了。所以记下 clientX，在 `updateView()` 里用新比例尺重算，
+ * 高亮既跟着缩放、又吸附到指针当前真正所在的周期。
+ */
+let hoverPoint: { domain: string; clientX: number; row: { key: string; y: number; h: number; color: string } | null } | null = null;
+/**
  * 缩放分级（LOD）。
  *
  * 每周期像素数小到一定程度时，逐个画条目/采样既没意义（一根竖线代表上百拍）又画不准 ——
@@ -837,6 +846,8 @@ function cycleSurface(
     const raw = plot.scale.invert(clamp(userX, plot.x0, plot.x1));
     probe.cycle = clamp(Math.floor(raw), plot.from, plot.to);
     probe.half = raw - probe.cycle < 0.5 ? 0 : 1;
+    // 记住指针位置与所在行：缩放/平移后据此重算高亮列（见 hoverPoint）
+    hoverPoint = { domain, clientX: event.clientX, row: currentRow() };
     broadcastHover(ctx, { kind: 'cycle', cycle: probe.cycle });
     showHoverCycle(domain, probe.cycle, currentRow(), ctx);
   };
@@ -846,7 +857,10 @@ function cycleSurface(
   // 用捕获阶段：本行内的元素（条目、标记）可能自带 mousemove 提示，
   // 捕获先于目标阶段执行，保证提示读到的是本拍刚算出的周期，而不是上一拍的残留
   host.addEventListener('mousemove', onMove as EventListener, true);
-  host.addEventListener('mouseleave', () => hideHoverCycle());
+  host.addEventListener('mouseleave', () => {
+    hoverPoint = null;
+    hideHoverCycle();
+  });
   node.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', cycle: probe.cycle }));
   return hoverTarget(node, () => render(probe));
 }
@@ -896,6 +910,30 @@ function hideHoverCycle(): void {
   registry?.hoverCol.setAttribute('display', 'none');
   registry?.hoverCell.setAttribute('display', 'none');
   registry?.hoverTag.setAttribute('display', 'none');
+}
+
+/**
+ * 用当前比例尺重新定位悬停列高亮。
+ *
+ * 缩放/平移只换 `reg.plot.scale`，指针通常不再移动（不会再有 mousemove）：
+ * 之前按旧比例尺算出的 x/宽度就此过期。这里用记住的 `clientX` 反算指针当前
+ * 真正所在的周期，既跟着缩放、又吸附到正确的周期。
+ */
+function refreshHoverCycle(): void {
+  const reg = registry;
+  const ctx = ctxRef;
+  if (reg === null || ctx === null) return;
+  if (hoverPoint === null) {
+    hideHoverCycle();
+    return;
+  }
+  const { plot, svg } = reg;
+  const box = svg.getBoundingClientRect();
+  if (box.width <= 0) return;
+  const userX = (hoverPoint.clientX - box.left) * (plot.width / box.width);
+  const raw = plot.scale.invert(clamp(userX, plot.x0, plot.x1));
+  const cycle = clamp(Math.floor(raw), plot.from, plot.to);
+  showHoverCycle(hoverPoint.domain, cycle, hoverPoint.row, ctx);
 }
 
 /** 泳道底：透明命中矩形 + 底部分隔线 */
@@ -3178,7 +3216,7 @@ function applyState(): void {
   for (const lane of reg.lanes) lane.node.style.opacity = String(opacity.get(lane.key) ?? 1);
 
   placeCycleMark(reg.selLine, reg.selLabel, sel, ctx);
-  if (hoverSel === null) hideHoverCycle();
+  refreshHoverCycle();
   placeBox(reg.selBox, sel, reg, true);
   placeBox(reg.hoverBox, hoverSel, reg, false);
 }
@@ -3491,6 +3529,7 @@ export const timelineView: View = {
     surfaceEl = null;
     registry = null;
     hoverSel = null;
+    hoverPoint = null;
     lastHoverKey = '';
     viewReady = false; // 换文件：视图窗口重置为整条轨迹
     selectedRows = new Set();
