@@ -221,7 +221,7 @@ C++ / DPI testbench 同理：用一个 `chiperfWriter` 类，方法对应上面�
 ## 6. 人类易读建议（评审会看）
 
 - 首行版本 + `@meta`（`design` / `tool` / `date`），让文件自描述。
-- 名字用 **层级路径**：`core.if.pc`、`core.mem.lsq`、`core.ctrl`；不要用 `sig1` 这类临时名。
+- 名字用 **人类可读的命名**：`PC`、`Mem Queue`、`Ctrl`；不要用 `sig1` 这类临时名 或 "core.if.xxx" 等路径名。
 - 文件开头用 `[msg]` 写一句本次仿真的目的；关键阶段（开始取指、进入 turbo、退出）也写 `[msg]`。
 - 可以对周期做注释（注释对解析器透明，但方便人读）：
 
