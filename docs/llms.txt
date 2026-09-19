@@ -95,7 +95,7 @@ rst = "rst" ;                                       (* 无参数 *)
 - **`rst` 丢弃此前的全部事件记录**，用于去掉热身阶段；复位释放时写一条即可。
 - **`async=1`** 用于不在时钟沿采样的事件，否则可视化会把它错误吸附到沿上。
 
-## 5. 插桩模式（SystemVerilog 推荐模板）
+## 5. 插桩模式
 
 关键约定：
 
@@ -104,7 +104,25 @@ rst = "rst" ;                                       (* 无参数 *)
 2. **边沿模式二选一**：要么只插 `[clk] p`（推荐，周期编号完整），要么 `p`/`n` 都插；
    **不要**在同一份轨迹里混用。
 3. 每条记录写完立刻 `$fflush`（鲁棒性：仿真被杀也能保留已写内容）。
-4. 结束用 `final` / `$finish` 钩子写 `@end`。
+4. 结束用 `final` / `$finish` 钩子写 `@end`。对于 `Chisel` 等隐藏了该功能的 DSL, 可以不写 `@end`
+
+### Chisel
+
+Chisel 已有 Maven Package 包可用：
+
+```scala
+// mill 1.x 语法，其他构建工具需要具体调整
+override def mvnDeps = Seq(
+    mvn"io.github:hamster5295::chiperf-chisel:0.1.0",
+)
+```
+
+仓库见[此处](https://codeberg.org/hamster5295/chiperf-chisel)
+
+
+### SystemVerilog
+
+SystemVerilog 可按照如下推荐模板编写：
 
 ```systemverilog
 // ---------------- chiperf_logger.sv ----------------

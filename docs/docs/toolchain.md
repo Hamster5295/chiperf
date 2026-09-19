@@ -5,7 +5,7 @@ Chiperf 项目不仅规定 Chiperf 文件格式，同时也提供 (或计划提�
 
 ## RTL 插桩
 
-- Chisel 支持库: TODO
+- Chisel 支持库: **Chiperf-Chisel**, 位于 [Github](https://github.com/Hamster5295/chiperf-chisel) 或 [Codeberg](https://codeberg.org/Hamster5295/chiperf-chisel)
 - SystemVerilog 支持库: TODO
 
 
