@@ -1,6 +1,6 @@
 /** 数据总览：周期、事件、追踪对象、条目、延迟、气泡、警告（规范里叫诊断） */
 import type { Trace } from '../../../parser/src/index.ts';
-import { latencyStats } from '../../../parser/src/index.ts';
+import { CLOCK_NAME, latencyStats } from '../../../parser/src/index.ts';
 import {
   barRect,
   card,
@@ -19,7 +19,7 @@ import {
   svgRoot,
   tableRow,
 } from '../charts.ts';
-import { fmtBytes, fmtCompact, fmtInt, fmtNs, type View, type ViewContext } from '../view.ts';
+import { fmtBytes, fmtCompact, fmtInt, type View, type ViewContext } from '../view.ts';
 
 const KINDS = ['clk', 'cnt', 'val', 'pip', 'fsm', 'evt', 'msg'] as const;
 
@@ -82,15 +82,14 @@ function donut(items: { label: string; value: number; color: string }[], size = 
  */
 const MAX_BARS = 400;
 
-function recordsPerCycleChart(trace: Trace, domain: string, height = 120): SVGSVGElement {
-  const info = trace.domains.get(domain)!;
+function recordsPerCycleChart(trace: Trace, height = 120): SVGSVGElement {
+  const info = trace.clock;
   const to = Math.max(1, info.lastCycle);
   const width = Math.max(320, Math.min(1600, to * 10 + 60));
   const svg = svgRoot(width, height + 22);
   const counts = new Map<number, number>();
   let maxPerCycle = 0;
   for (const record of trace.records) {
-    if (record.pos.domain !== domain) continue;
     const next = (counts.get(record.pos.cycle) ?? 0) + 1;
     counts.set(record.pos.cycle, next);
     if (next > maxPerCycle) maxPerCycle = next;
@@ -166,25 +165,21 @@ function totals(trace: Trace) {
 
 function overviewBody(root: HTMLElement, ctx: ViewContext): void {
   const trace = ctx.trace;
-  const domains = [...trace.domains.values()].filter((d) => ctx.options.domains.length === 0 || ctx.options.domains.includes(d.name));
-  const primary = domains[0];
+  const clock = trace.clock;
   const totalsInfo = totals(trace);
-  const periodKnown = domains.find((d) => d.periodNs !== undefined);
-  const maxCycle = Math.max(0, ...domains.map((d) => d.cycles));
-  const spanNs = periodKnown?.periodNs !== undefined ? maxCycle * periodKnown.periodNs : null;
+  const maxCycle = clock.cycles;
 
   const stats = el('div', { class: 'stat-row' }, [
-    statTile('周期数', countLabel(maxCycle), domains.length > 1 ? `${domains.length} 个时钟域` : primary ? `域 ${primary.name}` : ''),
-    spanNs !== null ? statTile('时间跨度', fmtNs(spanNs), `${periodKnown!.periodNs} ns/周期`) : null,
+    statTile('周期数', countLabel(maxCycle), `时钟 ${CLOCK_NAME}`),
     statTile('事件记录', countLabel(trace.stats.records), `${trace.stats.bytesPerRecord.toFixed(1)} B/记录`),
-    statTile('文件大小', fmtBytes(trace.stats.bytes), trace.domains.size > 0 ? `${trace.stats.lines} 行` : ''),
+    statTile('文件大小', fmtBytes(trace.stats.bytes), `${trace.stats.lines} 行`),
     statTile('追踪对象', countLabel(trace.counters.size + trace.values.size + trace.fsms.size + trace.events.size + trace.tracks.size), `${trace.tracks.size} 轨道 · ${trace.counters.size} 计数器 · ${trace.fsms.size} 状态机`),
     statTile('在飞条目', countLabel(totalsInfo.items), `${totalsInfo.closed} 已结束 · ${totalsInfo.open} 未闭合`),
-    statTile('平均延迟', totalsInfo.latencyCount > 0 ? `${totalsInfo.avg.toFixed(2)} 周期` : '—', totalsInfo.latencyCount > 0 ? `最大 ${totalsInfo.max} 周期（${totalsInfo.latencyCount} 条）` : '没有完成的同域条目'),
+    statTile('平均延迟', totalsInfo.latencyCount > 0 ? `${totalsInfo.avg.toFixed(2)} 周期` : '—', totalsInfo.latencyCount > 0 ? `最大 ${totalsInfo.max} 周期（${totalsInfo.latencyCount} 条）` : '没有完成的条目'),
     statTile('气泡', countLabel(totalsInfo.bubbles), '占用度为 0 的活跃周期'),
     statTile('警告', countLabel(trace.diagnostics.length), trace.diagnostics.length === 0 ? '无异常' : [...trace.diagnosticCounts.keys()].slice(0, 2).join(' · ')),
-  ].filter((n): n is HTMLElement => n !== null));
-  const summary = card('总览', '文件级统计（按当前时钟域筛选）');
+  ]);
+  const summary = card('总览', '文件级统计');
   summary.body.append(stats);
   root.append(summary.root);
 
@@ -194,38 +189,30 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
   kinds.body.append(donut(items));
 
   const perCycle = card('每周期事件数', '事件驱动的轨迹：柱高 = 该周期写了多少条记录');
-  if (primary) {
-    const scroll = el('div', { class: 'chart-scroll' });
-    scroll.append(recordsPerCycleChart(trace, primary.name));
-    perCycle.body.append(scroll);
-  } else {
-    perCycle.body.append(emptyState('没有可显示的时钟域'));
-  }
+  const scroll = el('div', { class: 'chart-scroll' });
+  scroll.append(recordsPerCycleChart(trace));
+  perCycle.body.append(scroll);
 
   const grid = el('div', { class: 'grid grid-2' }, [kinds.root, perCycle.root]);
   root.append(grid);
 
-  // 时钟域表
-  const domainCard = card('时钟域', '周期只由上升沿推进；`@domain` 的 period/freq 只用于时间换算');
-  const rows = [...trace.domains.values()].map((d) => [
-    el('code', { text: d.name }),
-    String(d.cycles),
-    String(d.posEdges),
-    String(d.negEdges),
-    d.periodNs !== undefined ? `${d.periodNs} ns` : '—',
-    d.freqHz !== undefined ? `${fmtCompact(d.freqHz)}Hz` : '—',
-    d.declared ? '@domain 已声明' : '隐式建立',
-    `${d.firstCycle} – ${d.lastCycle}`,
-  ]);
-  domainCard.body.append(
-    rows.length > 0
-      ? el('div', { class: 'table-wrap' }, [
-          el('table', { class: 'table' }, [
-            el('thead', {}, [tableRow(['域', '周期', '上升沿', '下降沿', '周期(ns)', '频率', '声明', '记录范围'], 'th')]),
-            el('tbody', {}, rows.map((cells) => tableRow(cells))),
+  // 时钟表
+  const clockCard = card('时钟', '周期只由上升沿推进');
+  clockCard.body.append(
+    el('div', { class: 'table-wrap' }, [
+      el('table', { class: 'table' }, [
+        el('thead', {}, [tableRow(['时钟', '周期', '上升沿', '下降沿', '记录范围'], 'th')]),
+        el('tbody', {}, [
+          tableRow([
+            el('code', { text: CLOCK_NAME }),
+            String(clock.cycles),
+            String(clock.posEdges),
+            String(clock.negEdges),
+            `${clock.firstCycle} – ${clock.lastCycle}`,
           ]),
-        ])
-      : emptyState('没有时钟域'),
+        ]),
+      ]),
+    ]),
   );
 
   // 元数据 + 目录
@@ -237,15 +224,14 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
       : emptyState('没有 @meta'),
   );
 
-  root.append(el('div', { class: 'grid grid-2' }, [domainCard.root, metaCard.root]));
+  root.append(el('div', { class: 'grid grid-2' }, [clockCard.root, metaCard.root]));
 
   // 延迟概览（各轨道）
-  const latencyCard = card('各轨道延迟', '同域完成条目的周期差；跨域条目不给周期延迟');
+  const latencyCard = card('各轨道延迟', '完成条目的周期差');
   const trackRows = [...trace.tracks.values()].map((track) => {
     const stats2 = latencyStats(track);
     return [
       el('code', { text: track.name }),
-      track.domain,
       String(track.items.length),
       String(track.closed),
       String(track.open),
@@ -257,7 +243,7 @@ function overviewBody(root: HTMLElement, ctx: ViewContext): void {
     trackRows.length > 0
       ? el('div', { class: 'table-wrap' }, [
           el('table', { class: 'table' }, [
-            el('thead', {}, [tableRow(['轨道', '域', '条目', '已结束', '未闭合', '延迟 最小/平均/最大', '气泡周期'], 'th')]),
+            el('thead', {}, [tableRow(['轨道', '条目', '已结束', '未闭合', '延迟 最小/平均/最大', '气泡周期'], 'th')]),
             el('tbody', {}, trackRows.map((cells) => tableRow(cells))),
           ]),
         ])

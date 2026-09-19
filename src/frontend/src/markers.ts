@@ -6,18 +6,15 @@
  *
  * 约定：
  * - 最多两个；再打一个不会覆盖已有的（调用方据此提示用户先删）；
- * - 两个标记必须落在**同一个域**才算区间（跨域的周期数不可比，spec §6.5）；
  * - 位置用周期号表示，闭区间 `[from, to]`；
  * - 拖拽过程中**不**通知订阅者（`move` 只在松手时调用），否则每移动一像素都要重算统计。
  */
 
 export interface Marker {
-  domain: string;
   cycle: number;
 }
 
 export interface MarkerRange {
-  domain: string;
   from: number;
   to: number;
 }
@@ -32,7 +29,7 @@ export interface MarkerBus {
   /** 右键删除某一个 */
   remove(index: number): void;
   clear(): void;
-  /** 两个同域标记齐全时给出闭区间；否则 null（统计视图据此决定是否筛选） */
+  /** 两个标记齐全时给出闭区间；否则 null（统计视图据此决定是否筛选） */
   range(): MarkerRange | null;
   subscribe(listener: (markers: Marker[]) => void): () => void;
 }
@@ -55,7 +52,7 @@ export function createMarkerBus(): MarkerBus {
 
     add(marker) {
       if (markers.length >= MAX_MARKERS) return false;
-      markers = [...markers, { domain: marker.domain, cycle: marker.cycle }];
+      markers = [...markers, { cycle: marker.cycle }];
       sort();
       emit();
       return true;
@@ -64,7 +61,7 @@ export function createMarkerBus(): MarkerBus {
     move(index, cycle) {
       const current = markers[index];
       if (current === undefined || current.cycle === cycle) return;
-      markers = markers.map((marker, i) => (i === index ? { domain: marker.domain, cycle } : marker));
+      markers = markers.map((marker, i) => (i === index ? { cycle } : marker));
       sort();
       emit();
     },
@@ -84,9 +81,7 @@ export function createMarkerBus(): MarkerBus {
     range() {
       if (markers.length !== MAX_MARKERS) return null;
       const [first, second] = markers as [Marker, Marker];
-      // 跨域没有可比性：宁可返回 null（统计退回全量），也不要拿两条时间轴相减
-      if (first.domain !== second.domain) return null;
-      return { domain: first.domain, from: first.cycle, to: second.cycle };
+      return { from: first.cycle, to: second.cycle };
     },
 
     subscribe(listener) {

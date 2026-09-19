@@ -5,7 +5,6 @@
  */
 import type {
   CounterTrack,
-  DomainInfo,
   FsmTrack,
   Phase,
   PipelineItem,
@@ -15,7 +14,7 @@ import type {
   TrackInfo,
   ValueTrack,
 } from './types.ts';
-import { trackKey } from './types.ts';
+import { CLOCK_NAME } from './types.ts';
 import { formatValue, valueKey } from './value.ts';
 
 const PHASE_RANK: Record<Phase, number> = { '-': -1, p: 0, n: 1 };
@@ -28,19 +27,9 @@ export function comparePosition(a: Position, b: Position): number {
 }
 
 export function formatPosition(pos: Position): string {
-  return `${pos.domain}#${pos.cycle}.${pos.phase}`;
+  return `${CLOCK_NAME}#${pos.cycle}.${pos.phase}`;
 }
 
-/**
- * 周期 → 时间（纳秒）。域必须声明了 period/freq，否则 null（spec §8.2）。
- * 第 1 个上升沿位于 0 ns，因此 cycle 1 = 0、cycle k = (k-1)×period；
- * **cycle ≤ 0（时钟之前）没有时间基准，返回 null**，而不是算出负时间。
- */
-export function timeNs(domain: DomainInfo | undefined, cycle: number): number | null {
-  if (!domain || domain.periodNs === undefined) return null;
-  if (cycle <= 0) return null;
-  return (cycle - 1) * domain.periodNs;
-}
 
 /** 采样是否按位置升序（`at=` 允许乱序，故需一次性判定并缓存） */
 const sortedCache = new WeakMap<object, boolean>();
@@ -82,13 +71,13 @@ function lastAtOrBefore<T extends { pos: Position }>(samples: readonly T[], prob
   return found;
 }
 
-function probeAt(domain: string, cycle: number, phase: Phase): Position {
-  return { domain, cycle, phase, seq: Number.MAX_SAFE_INTEGER };
+function probeAt(cycle: number, phase: Phase): Position {
+  return { cycle, phase, seq: Number.MAX_SAFE_INTEGER };
 }
 
 /** 计数器在某周期的累计值（最后一个 cycle ≤ c 的采样；无则 null） */
 export function counterTotalAt(track: CounterTrack, cycle: number): number | null {
-  const index = lastAtOrBefore(track.samples, probeAt(track.domain, cycle, 'n'));
+  const index = lastAtOrBefore(track.samples, probeAt(cycle, 'n'));
   return index < 0 ? null : track.samples[index]!.total;
 }
 
@@ -102,13 +91,13 @@ export function counterDeltaBetween(track: CounterTrack, c1: number, c2: number)
 
 /** 数值轨在某周期末的状态（保持型；spec §9.3） */
 export function valueAt(track: ValueTrack, cycle: number, phase: Phase = 'n'): ScalarValue | null {
-  const index = lastAtOrBefore(track.samples, probeAt(track.domain, cycle, phase));
+  const index = lastAtOrBefore(track.samples, probeAt(cycle, phase));
   return index < 0 ? null : track.samples[index]!.value;
 }
 
 /** 状态机在某周期末的状态（spec §9.5） */
 export function stateAt(track: FsmTrack, cycle: number, phase: Phase = 'n'): string | null {
-  const index = lastAtOrBefore(track.samples, probeAt(track.domain, cycle, phase));
+  const index = lastAtOrBefore(track.samples, probeAt(cycle, phase));
   return index < 0 ? null : formatValue(track.samples[index]!.value);
 }
 
@@ -206,7 +195,7 @@ export function describeSamples(xs: readonly number[]): Distribution {
  */
 export function itemsWithin(track: TrackInfo, from: number, to: number): PipelineItem[] {
   return track.items.filter((item) => {
-    const end = item.closeAnchorCycle ?? track.lastCycle;
+    const end = item.close?.cycle ?? track.lastCycle;
     return item.enter.cycle <= to && end >= from;
   });
 }
@@ -256,8 +245,8 @@ export function ratioBetween(num: CounterTrack, den: CounterTrack, c1: number, c
  * 一条记录 = 一次 +1，累计值 = 到该条为止的事件条数，
  * 每周期增量 = 该周期里的事件条数（同周期多条会累加）。
  *
- * 键带 `evt:` 前缀：同一个域里 `[cnt] foo` 与 `[evt] foo` 可以并存
- * （解析器只对 (域, 名字) 报 `name_reused` 提示），而视图用键做选中与高亮，
+ * 键带 `evt:` 前缀：`[cnt] foo` 与 `[evt] foo` 可以并存
+ * （解析器只对同名不同类型报 `name_reused` 提示），而视图用键做选中与高亮，
  * 不区分就会一起亮。折算结果与原计数器**同构**，因此可以直接当 `CounterTrack` 用。
  */
 export function eventCounters(trace: Trace): CounterTrack[] {
@@ -277,8 +266,7 @@ export function eventCounters(trace: Trace): CounterTrack[] {
     }
     out.push({
       name: track.name,
-      domain: track.domain,
-      key: trackKey(track.domain, `evt:${track.name}`),
+      key: `evt:${track.name}`,
       source: 'evt',
       total,
       samples,

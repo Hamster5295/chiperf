@@ -57,8 +57,8 @@ export function splitTopLevel(s: string): string[] {
 /**
  * 指令字段的顶层切分（spec §8）：逗号**或空白**都算分隔符。
  * 指令的语法写作 `@ <名字> [参数...] [属性...]`，§8.1 的例子就是空白分隔的
- * （`@meta design="x" tool="y"`），而 `@domain core, period=1.0ns` 又是逗号分隔，
- * 两种写法都在用，所以两种都收 —— 未加引号的记号本来就不含空白，切分无歧义。
+ * （`@meta design="x" tool="y"`），两种写法都在用，所以两种都收 ——
+ * 未加引号的记号本来就不含空白，切分无歧义。
  */
 export function splitDirectiveFields(s: string): string[] {
   return splitOn(s, (c) => c === ',' || c === ' ' || c === '\t');

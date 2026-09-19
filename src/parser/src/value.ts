@@ -15,7 +15,6 @@ const RE_HEX = /^-?0[xX][0-9a-fA-F_xXzZ]+/;
 const RE_BIN = /^-?0[bB][01_xXzZ]+/;
 const RE_OCT = /^-?0[oO][0-7_xXzZ]+/;
 const RE_DEC = /^-?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?/;
-const RE_UNIT = /^(?:ms|us|ns|ps|s|kHz|MHz|GHz|Hz)/;
 
 export interface ScanResult {
   value: ScalarValue;
@@ -121,7 +120,7 @@ function numericKind(literal: string): ScalarValue {
   return { kind: 'int', text: norm, raw, big: BigInt(norm) };
 }
 
-/** 扫描一个完整的值记号（字符串 / 数值 / 裸词 / 缩放量） */
+/** 扫描一个完整的值记号（字符串 / 数值 / 裸词） */
 export function scanValue(src: string): ScanResult | null {
   const s = src.replace(/^[ \t]+/, '');
   if (s.length === 0) return null;
@@ -132,30 +131,12 @@ export function scanValue(src: string): ScanResult | null {
     return { value: r.value, rest: r.rest, warnings: r.warnings };
   }
 
-  // 数值（含 Verilog 字面量与缩放量）
+  // 数值（含 Verilog 字面量）
   for (const re of [RE_VERILOG, RE_VERILOG_NOSIZE, RE_HEX, RE_BIN, RE_OCT, RE_DEC]) {
     const m = re.exec(s);
     if (!m) continue;
     const lit = m[0];
-    let rest = s.slice(lit.length);
-    // 缩放量：数值后紧跟单位，且单位之后不再是裸词字符
-    const um = RE_UNIT.exec(rest);
-    if (um) {
-      const after = rest.slice(um[0].length);
-      if (after.length === 0 || !WORD_CHAR.test(after[0]!)) {
-        const numeric = numericKind(lit);
-        return {
-          value: {
-            kind: 'scaled',
-            text: `${numeric.text}${um[0]}`,
-            raw: lit + um[0],
-            scale: numeric.num ?? Number(numeric.big ?? 0n),
-            unit: um[0],
-          },
-          rest: after,
-        };
-      }
-    }
+    const rest = s.slice(lit.length);
     return { value: numericKind(lit), rest };
   }
 
@@ -187,8 +168,6 @@ export function valueKey(v: ScalarValue | null): string {
       return `s:${v.text}`;
     case 'sym':
       return `y:${v.text}`;
-    case 'scaled':
-      return `c:${v.scale ?? v.text}:${v.unit ?? ''}`;
   }
 }
 
@@ -206,8 +185,6 @@ export function formatValue(v: ScalarValue | null): string {
     case 'bits':
       return v.text;
     case 'real':
-      return v.text;
-    case 'scaled':
       return v.text;
     default:
       return v.text;

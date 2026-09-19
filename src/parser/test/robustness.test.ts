@@ -7,11 +7,10 @@ import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { ChiperfParser, parseChiperf, parseChiperfBytes, isGzip, UnsupportedVersionError } from '../src/index.ts';
 
-const EXAMPLES = join(import.meta.dir, '../../../docs/examples');
+const EXAMPLES = join(import.meta.dir, '../../../docs/public/docs/examples');
 const FIXTURES = [
   'minimal',
   'rv32i-pipeline',
-  'multiclk',
   'postprocess',
   'async-events',
   'faults',
@@ -70,8 +69,8 @@ describe('§10.1 前缀封闭性', () => {
     expect(trace.records.length).toBe(0);
     expect(trace.stats.records).toBe(0);
     expect(trace.tracks.get('core.if')!.items.length).toBe(6);
-    expect(trace.counters.get('default\u0000core.retired')!.total).toBe(4);
-    expect(trace.domains.get('default')!.cycles).toBe(12);
+    expect(trace.counters.get('core.retired')!.total).toBe(4);
+    expect(trace.clock.cycles).toBe(12);
   });
 });
 
@@ -90,7 +89,7 @@ describe('§10.2 未知内容', () => {
     expect(trace.records.length).toBe(2);
     expect(trace.skipped.filter((s) => s.reason === 'unknown_kind').length).toBe(2);
     expect(trace.skipped.filter((s) => s.reason === 'unknown_directive').length).toBe(1);
-    expect(trace.values.get('default\u0000PC')!.samples.length).toBe(1);
+    expect(trace.values.get('PC')!.samples.length).toBe(1);
     expect(trace.endSeen).toBe(true);
   });
 });
@@ -101,7 +100,7 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
     ['[clk] p, n', 'clk 参数过多'],
     ['[cnt] "x", 1.5', 'cnt 增量不是 int'],
     ['[cnt] "x", 1, abs=2', '增量与 abs= 同时出现'],
-    ['[cnt] "x", 1ns', '缩放量用在了非 @domain 位置'],
+    ['[cnt] "x", 1ns', '数值后带单位（v1.0 已删除时间换算）'],
     ['[cnt] "", 1', '名字为空'],
     ['[val] "PC"', 'val 缺值'],
     ['[val] "PC", "unterminated', '字符串未闭合'],
@@ -109,7 +108,6 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
     ['[pip] "IF", I', 'pip 值位置写了早期草案的方向字（这个词被保留）'],
     ['[pip] "IF", 1, 2', 'pip 参数过多'],
     ['[fsm] "ctrl"', 'fsm 缺状态'],
-    ['[val] "PC", 1, dom=123', 'dom 不是域名'],
     ['[val] "PC", 1, async=yes', 'async 不是 0/1'],
     ['[val] "PC", 1, at=1.5p', 'at 值非法'],
     ['[val] "PC", 1, dom=core, 2', '参数出现在属性之后'],
@@ -122,7 +120,7 @@ describe('§10.3 非法记录逐行跳过，不影响其它记录', () => {
       const trace = parseChiperf(`[clk] p\n${bad}\n[cnt] "ok"\n@end\n`);
       expect(`${why}: records=${trace.records.length}`).toBe(`${why}: records=2`);
       expect(trace.skipped.length).toBe(1);
-      expect(trace.counters.get('default\u0000ok')!.total).toBe(1);
+      expect(trace.counters.get('ok')!.total).toBe(1);
     });
   }
 });
@@ -165,12 +163,10 @@ describe('§3.2 编码与行终止', () => {
   });
 
   // 注释对**所有**行生效（spec §4.1）：版本行与 @ 指令也不例外
-  // （曾经只对事件记录生效，结果 `@domain core, period=1.0ns  # 主时钟` 整行被跳过、域声明静默丢失）
   test('版本行与 @ 指令上的行尾注释不被当成内容', () => {
-    const trace = parseChiperf('chiperf 1.0   # 版本行\n@meta design="x" # 元数据\n@domain core, period=1.0ns # 主时钟\n[clk] p, dom=core\n@end # 完\n');
+    const trace = parseChiperf('chiperf 1.0   # 版本行\n@meta design="x" # 元数据\n[clk] p\n@end # 完\n');
     expect(trace.version).toMatchObject({ major: 1, minor: 0, explicit: true, raw: 'chiperf 1.0' });
     expect(trace.meta).toEqual({ design: 'x' });
-    expect(trace.domains.get('core')!.periodNs).toBe(1);
     expect(trace.skipped).toEqual([]);
     expect(trace.diagnosticCounts.get('eof_without_end_marker') ?? 0).toBe(0);
   });
@@ -178,12 +174,12 @@ describe('§3.2 编码与行终止', () => {
   test('但字符串里的 # 不是注释（版本行/指令/记录一致）', () => {
     const trace = parseChiperf('@meta note="a # b"\n[val] "x", "c # d"\n@end\n');
     expect(trace.meta).toEqual({ note: 'a # b' });
-    expect(trace.values.get('default\u0000x')!.samples[0]!.value.text).toBe('c # d');
+    expect(trace.values.get('x')!.samples[0]!.value.text).toBe('c # d');
   });
 
   test('UTF-8 名字与中文注释', () => {
     const trace = parseChiperf('[clk] p\n[cnt] "分支预测失败"   # 中文注释\n@end\n');
-    expect(trace.counters.get('default\u0000分支预测失败')!.total).toBe(1);
+    expect(trace.counters.get('分支预测失败')!.total).toBe(1);
     expect(trace.stats.bytes).toBeGreaterThan(trace.records.length * 3);
   });
 });

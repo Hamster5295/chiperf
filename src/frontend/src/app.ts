@@ -3,7 +3,7 @@
  *
  * 数据流：文件/示例 → parser（@chiperf/parser）→ Trace → ViewContext → 各视图
  */
-import { ChiperfParser, gunzip, isGzip, parseChiperf, UnsupportedVersionError, type Trace } from '../../parser/src/index.ts';
+import { ChiperfParser, CLOCK_NAME, gunzip, isGzip, parseChiperf, UnsupportedVersionError, type Trace } from '../../parser/src/index.ts';
 import { abortable, runChunked } from './chunk.ts';
 import { createMarkerBus, type MarkerBus } from './markers.ts';
 import { el, clear, card, statTile, countLabel } from './charts.ts';
@@ -29,7 +29,7 @@ const state: AppState = {
   currentId: '',
   trace: null,
   source: { name: '', bytes: 0, gzip: false },
-  options: { domains: [], useTimeAxis: true, zoom: 0 },
+  options: { zoom: 0 },
   error: null,
   retryableText: null,
   loading: null,
@@ -106,7 +106,7 @@ function buildHeader(): HTMLElement {
     chips.append(chip(`${countLabel(t.stats.records)} 记录`, 'chip-ok'));
     chips.append(chip(`${fmtBytes(t.stats.bytes)} · ${t.stats.bytesPerRecord.toFixed(1)} B/记录`, ''));
     chips.append(chip(`chiperf ${t.version.major}.${t.version.minor}${t.version.explicit ? '' : '（隐含）'}`, ''));
-    chips.append(chip(`${t.domains.size} 时钟域`, ''));
+    chips.append(chip(`${CLOCK_NAME} · ${countLabel(t.clock.cycles)} 周期`, ''));
     const diagCount = t.diagnostics.length;
     // 界面上叫「警告」；规范里这套东西仍叫诊断（§10.4），对应关系见 README
     const diagChip = chip(`警告 ${diagCount}`, diagCount === 0 ? 'chip-ok' : 'chip-warn');
@@ -252,30 +252,13 @@ function buildToolbar(): HTMLElement {
   const trace = state.trace!;
   const bar = el('div', { class: 'toolbar' });
 
-  const domainChips = el('div', { class: 'toolbar-group' }, [el('span', { class: 'toolbar-label', text: '时钟域' })]);
-  for (const [name, info] of trace.domains) {
-    const active = state.options.domains.length === 0 || state.options.domains.includes(name);
-    const node = el('button', {
-      class: `chip chip-toggle${active ? ' is-on' : ''}`,
-      text: `${name} · ${countLabel(info.cycles)} 周期`,
-      title: info.periodNs !== undefined ? `周期 ${info.periodNs} ns` : '未声明 period/freq',
-    });
-    node.addEventListener('click', () => {
-      const all = [...trace.domains.keys()];
-      const current = state.options.domains.length === 0 ? all : state.options.domains;
-      const next = current.includes(name) ? current.filter((d) => d !== name) : [...current, name];
-      state.options.domains = next.length === all.length ? [] : next;
-      renderMain();
-    });
-    domainChips.append(node);
-  }
-  bar.append(domainChips, el('div', { class: 'toolbar-spacer' }));
-
-  // 多域时周期号各自独立计数：这里必须说清楚，否则读者会以为 default#6 与 mem#6 是同一时刻
-  const shown = [...trace.domains.keys()].filter((d) => state.options.domains.length === 0 || state.options.domains.includes(d));
-  if (shown.length > 1) {
-    bar.append(el('span', { class: 'muted nowrap', text: '各域周期号独立计数（≠ 同一时刻）' }));
-  }
+  bar.append(
+    el('div', { class: 'toolbar-group' }, [
+      el('span', { class: 'toolbar-label', text: '时钟' }),
+      el('span', { class: 'chip', text: `${CLOCK_NAME} · ${countLabel(trace.clock.cycles)} 周期` }),
+    ]),
+    el('div', { class: 'toolbar-spacer' }),
+  );
 
   const diagBtn = el('button', { class: 'btn btn-ghost', text: `警告 (${trace.diagnostics.length})` });
   diagBtn.addEventListener('click', () => openDiagnostics());
@@ -422,8 +405,6 @@ function applyTrace(trace: Trace, source: { name: string; bytes: number; gzip: b
   state.trace = trace;
   state.source = source;
   state.error = null;
-  const names = [...trace.domains.keys()];
-  state.options.domains = state.options.domains.filter((d) => names.includes(d));
   renderShell();
   renderMain();
 }

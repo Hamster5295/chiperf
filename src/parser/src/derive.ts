@@ -3,11 +3,12 @@
  *
  * 增量消费事件记录（单遍、内存只与"在飞条目数 + 追踪对象数"相关）。
  * 派生层从不修改数据：所有异常都只产生诊断（spec §10.4）。
+ *
+ * v1.0 只有一条时间轴：追踪键就是名字本身，不再有 `(域, 名字)`。
  */
 import type {
   CounterTrack,
   DiagnosticCode,
-  DomainInfo,
   EventRecord,
   EventTrack,
   FsmTrack,
@@ -18,14 +19,9 @@ import type {
   TrackInfo,
   ValueTrack,
 } from './types.ts';
-import { trackKey } from './types.ts';
 import { formatValue, valueKey } from './value.ts';
 
 export interface DeriveContext {
-  /** 某域当前的周期计数（跨域条目的占用度锚定用，spec §9.4） */
-  cyclesOf(domain: string): number;
-  /** 某域的 @domain 元数据（period 换算用，spec §8.2） */
-  domainInfo(domain: string): DomainInfo;
   diag(code: DiagnosticCode, line: number, message: string): void;
 }
 
@@ -38,12 +34,7 @@ export class Deriver {
   readonly tracks = new Map<string, TrackInfo>();
   readonly events = new Map<string, EventTrack>();
   readonly messages: EventRecord[] = [];
-  /** 出现过的域名（含 default） */
-  readonly usedDomains = new Set<string>();
-  /** 使用过 clk / at= 的域（用于 at_clk_conflict） */
-  readonly clkDomains = new Set<string>();
-  readonly atDomains = new Set<string>();
-  /** (域, 名字) → 用过的语义类型，用于 name_reused */
+  /** 名字 → 用过的语义类型，用于 name_reused */
   private readonly nameKinds = new Map<string, Set<string>>();
   /** 轨道名 → 该级**当前**持有的设置（值或气泡），用于判断"值变了没有" */
   private readonly pipHeld = new Map<string, { key: string; item: PipelineItem | null }>();
@@ -51,11 +42,9 @@ export class Deriver {
   constructor(private readonly ctx: DeriveContext) {}
 
   onRecord(rec: EventRecord): void {
-    this.usedDomains.add(rec.pos.domain);
     this.noteNameKind(rec);
     switch (rec.kind) {
       case 'clk':
-        this.clkDomains.add(rec.pos.domain);
         break;
       case 'cnt':
         this.applyCounter(rec);
@@ -78,7 +67,7 @@ export class Deriver {
     }
   }
 
-  /** 收尾：完成占用度/气泡/跨域诊断等需要全局视角的派生量 */
+  /** 收尾：完成占用度/气泡等需要全局视角的派生量 */
   finish(): void {
     for (const track of this.tracks.values()) this.finalizeTrack(track);
   }
@@ -87,23 +76,20 @@ export class Deriver {
     if (rec.kind === 'msg' || rec.kind === 'clk' || rec.kind === 'pip') return;
     const name = 'name' in rec ? rec.name : '';
     if (!name) return;
-    const key = trackKey(rec.pos.domain, name);
-    const kinds = this.nameKinds.get(key) ?? new Set<string>();
+    const kinds = this.nameKinds.get(name) ?? new Set<string>();
     if (kinds.size > 0 && !kinds.has(rec.kind)) {
-      this.ctx.diag('name_reused', rec.line, `名字 "${name}" 在域 "${rec.pos.domain}" 中同时被 ${[...kinds].join('/')} 与 ${rec.kind} 使用`);
+      this.ctx.diag('name_reused', rec.line, `名字 "${name}" 同时被 ${[...kinds].join('/')} 与 ${rec.kind} 使用`);
     }
     kinds.add(rec.kind);
-    this.nameKinds.set(key, kinds);
+    this.nameKinds.set(name, kinds);
   }
 
   private applyCounter(rec: Extract<EventRecord, { kind: 'cnt' }>): void {
-    const key = trackKey(rec.pos.domain, rec.name);
-    let track = this.counters.get(key);
+    let track = this.counters.get(rec.name);
     if (!track) {
       track = {
         name: rec.name,
-        domain: rec.pos.domain,
-        key,
+        key: rec.name,
         source: 'cnt',
         total: 0,
         samples: [],
@@ -111,7 +97,7 @@ export class Deriver {
         totalByCycle: new Map(),
         changeCycles: [],
       };
-      this.counters.set(key, track);
+      this.counters.set(rec.name, track);
     }
     let delta: number | null = null;
     if (rec.abs !== null) {
@@ -130,11 +116,10 @@ export class Deriver {
   }
 
   private applyValue(rec: Extract<EventRecord, { kind: 'val' }>): void {
-    const key = trackKey(rec.pos.domain, rec.name);
-    let track = this.values.get(key);
+    let track = this.values.get(rec.name);
     if (!track) {
-      track = { name: rec.name, domain: rec.pos.domain, key, samples: [], changes: [] };
-      this.values.set(key, track);
+      track = { name: rec.name, key: rec.name, samples: [], changes: [] };
+      this.values.set(rec.name, track);
     }
     const prev = track.samples[track.samples.length - 1];
     const timed: Timed<ScalarValue> = { value: rec.value, pos: rec.pos, async: rec.async, line: rec.line };
@@ -144,19 +129,15 @@ export class Deriver {
   }
 
   private applyFsm(rec: Extract<EventRecord, { kind: 'fsm' }>): void {
-    const key = trackKey(rec.pos.domain, rec.name);
-    let track = this.fsms.get(key);
+    let track = this.fsms.get(rec.name);
     if (!track) {
-      track = { name: rec.name, domain: rec.pos.domain, key, samples: [], transitions: [], dwellCycles: new Map(), stateSet: [] };
-      this.fsms.set(key, track);
+      track = { name: rec.name, key: rec.name, samples: [], transitions: [], dwellCycles: new Map(), stateSet: [] };
+      this.fsms.set(rec.name, track);
     }
     const prev = track.samples[track.samples.length - 1];
     const to = stateText(rec.state);
     const from = prev ? stateText(prev.value) : null;
     const selfLoop = prev !== undefined && from === to;
-    if (selfLoop) {
-      this.ctx.diag('self_transition', rec.line, `状态机 "${rec.name}" 在周期 ${rec.pos.cycle} 自环于状态 ${to}`);
-    }
     track.transitions.push({ from, to, pos: rec.pos, selfLoop });
     track.samples.push({ value: rec.state, pos: rec.pos, async: rec.async, line: rec.line });
     if (!track.stateSet.includes(to)) track.stateSet.push(to);
@@ -167,11 +148,10 @@ export class Deriver {
   }
 
   private applyEvent(rec: Extract<EventRecord, { kind: 'evt' }>): void {
-    const key = trackKey(rec.pos.domain, rec.name);
-    let track = this.events.get(key);
+    let track = this.events.get(rec.name);
     if (!track) {
-      track = { name: rec.name, domain: rec.pos.domain, key, samples: [] };
-      this.events.set(key, track);
+      track = { name: rec.name, key: rec.name, samples: [] };
+      this.events.set(rec.name, track);
     }
     track.samples.push({ value: rec.payload, pos: rec.pos, async: rec.async, line: rec.line });
   }
@@ -184,11 +164,10 @@ export class Deriver {
    * 占用度与气泡由"条目区间 + 活跃区间"的差推出（与 §9.4 的旧口径逐格一致）。
    */
   private applyPip(rec: Extract<EventRecord, { kind: 'pip' }>): void {
-    const track = this.trackFor(rec.track, rec.pos.domain);
-    // 活跃区间按**记录**算（spec §9.4 的 track_first/last_cycle）；跨域记录锚到轨道绑定域的当前周期
-    const anchor = rec.pos.domain === track.domain ? rec.pos.cycle : this.ctx.cyclesOf(track.domain);
-    track.firstCycle = Math.min(track.firstCycle, anchor);
-    track.lastCycle = Math.max(track.lastCycle, anchor);
+    const track = this.trackFor(rec.track);
+    // 活跃区间按**记录**算（spec §9.4 的 track_first/last_cycle）
+    track.firstCycle = Math.min(track.firstCycle, rec.pos.cycle);
+    track.lastCycle = Math.max(track.lastCycle, rec.pos.cycle);
 
     const key = valueKey(rec.value); // null ⇒ '∅'（气泡）
     const held = this.pipHeld.get(rec.track);
@@ -200,21 +179,7 @@ export class Deriver {
       item.closeSeq = rec.seq;
       item.closeAsync = rec.async;
       item.closeLine = rec.line;
-      item.crossDomain = rec.pos.domain !== item.enter.domain;
-      if (!item.crossDomain) {
-        item.latencyCycles = rec.pos.cycle - item.enter.cycle;
-        item.closeAnchorCycle = rec.pos.cycle;
-      } else {
-        // 跨域条目：不给周期延迟（spec §6.5），改用时间延迟或两端位置
-        const a = this.ctx.domainInfo(item.enter.domain);
-        const b = this.ctx.domainInfo(rec.pos.domain);
-        if (a.periodNs !== undefined && b.periodNs !== undefined) {
-          item.latencyNs = (rec.pos.cycle - 1) * b.periodNs - (item.enter.cycle - 1) * a.periodNs;
-        }
-        // 占用度按 enter 域统计：结束时刻锚定到 enter 域当前的周期（spec §9.4）
-        item.closeAnchorCycle = this.ctx.cyclesOf(item.enter.domain);
-        this.ctx.diag('cross_domain', rec.line, `轨道 "${rec.track}" 的条目跨域：起在 "${item.enter.domain}" 周期 ${item.enter.cycle}，止在 "${rec.pos.domain}" 周期 ${rec.pos.cycle}`);
-      }
+      item.latencyCycles = rec.pos.cycle - item.enter.cycle;
       track.items[track.items.length - 1] = item;
     }
 
@@ -224,14 +189,10 @@ export class Deriver {
     }
     const item: PipelineItem = {
       track: rec.track,
-      domain: rec.pos.domain,
       value: rec.value,
       enter: rec.pos,
       close: null,
-      crossDomain: false,
       latencyCycles: null,
-      latencyNs: null,
-      closeAnchorCycle: null,
       enterSeq: rec.seq,
       closeSeq: null,
       async: rec.async,
@@ -243,12 +204,11 @@ export class Deriver {
     this.pipHeld.set(rec.track, { key, item });
   }
 
-  private trackFor(name: string, domain: string): TrackInfo {
+  private trackFor(name: string): TrackInfo {
     let track = this.tracks.get(name);
     if (!track) {
       track = {
         name,
-        domain,
         items: [],
         firstCycle: Number.POSITIVE_INFINITY,
         lastCycle: 0,
@@ -281,8 +241,7 @@ export class Deriver {
       } else {
         track.closed++;
         if (item.latencyCycles !== null) track.latencies.push(item.latencyCycles);
-        const anchor = item.closeAnchorCycle;
-        if (anchor !== null) track.departures.set(anchor, (track.departures.get(anchor) ?? 0) + 1);
+        track.departures.set(item.close.cycle, (track.departures.get(item.close.cycle) ?? 0) + 1);
       }
       const c = item.enter.cycle;
       track.arrivals.set(c, (track.arrivals.get(c) ?? 0) + 1);
@@ -300,21 +259,16 @@ export class Deriver {
     };
     for (const item of track.items) {
       if (item.close === null) addRange(item.enter.cycle, track.lastCycle + 1);
-      else addRange(item.enter.cycle, item.closeAnchorCycle ?? item.enter.cycle);
+      else addRange(item.enter.cycle, item.close.cycle);
     }
 
     // 一遍扫过周期跨度：同时得到占用度、气泡列表与气泡区间。
     // 曾经在循环里用 `track.bubbles.includes(c)` 判断气泡 —— 那是 O(周期数 × 气泡数)，
     // 几百万记录的轨迹会在这里卡上十几秒。
-    // 扫描起点要涵盖"跨域条目在绑定域观测窗口之前就进入"的情形，否则前缀和会算漏。
-    let scanFrom = track.firstCycle;
-    for (const key of delta.keys()) if (key < scanFrom) scanFrom = key;
     let running = 0;
     let start: number | null = null;
-    for (let c = scanFrom; c <= track.lastCycle; c++) {
+    for (let c = track.firstCycle; c <= track.lastCycle; c++) {
       running += delta.get(c) ?? 0;
-      // 观测窗口（firstCycle）之前只维持前缀和，不算气泡、不写占用度
-      if (c < track.firstCycle) continue;
       if (running > 0) {
         track.occupancy.set(c, running);
         if (start !== null) {

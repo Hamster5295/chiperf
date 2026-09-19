@@ -43,12 +43,14 @@ async function bundleServer(htmlBase64: string): Promise<string> {
 }
 
 export async function build(): Promise<{ html: number; server: number; page: number; script: number; style: number }> {
-  const [template, css, js] = await Promise.all([
+  const [template, css, js, favicon] = await Promise.all([
     Bun.file(join(HERE, 'index.html')).text(),
     Bun.file(join(HERE, 'styles.css')).text(),
     bundleBrowserApp(),
+    Bun.file(join(HERE, 'favicon.svg')).text(),
   ]);
-  const html = inlineIntoSingleFile(template, { jsBundle: js, css, template });
+  const faviconUri = `data:image/svg+xml;base64,${Buffer.from(favicon, 'utf8').toString('base64')}`;
+  const html = inlineIntoSingleFile(template, { jsBundle: js, css, template, favicon: faviconUri });
   const serverCode = await bundleServer(Buffer.from(html, 'utf8').toString('base64'));
   const appJs = `#!/usr/bin/env bun\n${serverCode}`;
 

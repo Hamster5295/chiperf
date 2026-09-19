@@ -61,9 +61,7 @@ let active: FsmState | null = null;
 const MAX_SEGMENTS = 3000;
 
 function visibleFsms(ctx: ViewContext): FsmTrack[] {
-  const fsms = [...ctx.trace.fsms.values()];
-  const domains = ctx.options.domains;
-  return domains.length === 0 ? fsms : fsms.filter((fsm) => domains.includes(fsm.domain));
+  return [...ctx.trace.fsms.values()];
 }
 
 /**
@@ -148,8 +146,7 @@ async function buildScopes(
   onProgress: (done: number, total: number) => void,
 ): Promise<FsmScope[] | null> {
   const scopes: FsmScope[] = fsms.map((fsm) => {
-    // 标记只对**它所在的那个域**有意义：跨域周期数不可比（spec §6.5）
-    const filtered = range !== null && fsm.domain === range.domain;
+    const filtered = range !== null;
     if (!filtered) {
       return {
         fsm,
@@ -258,36 +255,26 @@ async function buildScopes(
   return scopes;
 }
 
-/** 统计范围说明：「有区间」与「未打标记」两种文案；域不匹配的状态机额外提一句 */
+/** 统计范围说明：「有区间」与「未打标记」两种文案 */
 function scopeChips(range: MarkerRange | null, fsms: FsmTrack[]): HTMLElement[] {
+  void fsms;
   if (range === null) {
     return [
       el('span', {
         class: 'chip',
         text: '未打标记：统计全量',
-        title: '在时间轴上打两个同域标记，这里的统计就只算两个标记之间的那一段',
+        title: '在时间轴上打两个标记，这里的统计就只算两个标记之间的那一段',
       }),
     ];
   }
-  const chips = [
+  return [
     el('span', {
       class: 'chip',
-      text: `标记区间：${range.domain} 周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}（只统计这一段）`,
+      text: `标记区间：周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}（只统计这一段）`,
       title:
         '只有与闭区间相交的状态段才算数：跨边界的段只算落在区间里的那部分；跳转只看发生在区间里的',
     }),
   ];
-  const outside = fsms.filter((fsm) => fsm.domain !== range.domain).length;
-  if (outside > 0) {
-    chips.push(
-      el('span', {
-        class: 'chip chip-warn',
-        text: `${outside} 台状态机不在标记所在域，未按标记筛选`,
-        title: `这些状态机的周期数来自别的时钟域，与标记区间不可比，因此仍按全量统计`,
-      }),
-    );
-  }
-  return chips;
 }
 
 /** 最后一条记录的状态：它的驻留还没定型（spec §9.5） */
@@ -308,29 +295,25 @@ function formatState(value: FsmTrack['samples'][number]['value']): string {
  *
  * 数字一律取自 `scope`：区间筛选时它是"区间内的驻留"，未筛选时它原样就是 `dwellCycles`。
  */
-function fsmCard(scope: FsmScope, marked: MarkerRange | null, ctx: ViewContext, state: FsmState): HTMLElement {
+function fsmCard(scope: FsmScope, ctx: ViewContext, state: FsmState): HTMLElement {
   const { fsm } = scope;
   const total = scope.dwellTotal;
   const peak = scope.peak;
-  // 末状态的驻留还没定型（spec §9.5）：这张卡片按全量统计时（没打标记 / 域不匹配）就照旧提它
+  // 末状态的驻留还没定型（spec §9.5）：这张卡片按全量统计时就照旧提它
   const tail = tailState(fsm);
   const tailCycle = fsm.samples[fsm.samples.length - 1]?.pos.cycle ?? null;
   const tailVisible =
     tail !== null &&
     (scope.range === null || (tailCycle !== null && tailCycle >= scope.range.from && tailCycle <= scope.range.to));
-  // 区间筛选只对标记所在域生效；这张卡片按全量统计时必须写明，免得把全量数字当成区间数字
-  const domainNote =
-    scope.range !== null || marked === null ? '' : ` · 不在标记所在域（${marked.domain}），未按标记筛选`;
   // 同一个口径在卡片里出现好几次（小标题 / tooltip / 详情抽屉），措辞保持一致
   const filtered = scope.range !== null;
   const dwellLabel = filtered ? '区间内驻留' : '总驻留';
   const recordLabel = filtered ? '区间内状态记录' : '状态记录';
   const cards = card(
     `状态机 · ${fsm.name}`,
-    `域 ${fsm.domain} · ${fsm.stateSet.length} 个状态 · ${dwellLabel} ${fmtInt(total)} 周期` +
+    `${fsm.stateSet.length} 个状态 · ${dwellLabel} ${fmtInt(total)} 周期` +
       (peak ? ` · 峰值 ${peak.state} ${fmtInt(peak.dwell)} 周期` : '') +
-      (tailVisible ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : '') +
-      domainNote,
+      (tailVisible ? ` · 末状态 ${tail} 仍在上报（驻留未定型）` : ''),
   );
 
   const cells = el('div', {
@@ -375,7 +358,7 @@ function fsmCard(scope: FsmScope, marked: MarkerRange | null, ctx: ViewContext, 
       cell,
       () =>
         [
-          `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+          `状态机 ${fsm.name}`,
           `状态 ${name}`,
           `${dwellLabel} ${fmtInt(dwell)} 周期`,
           `占该状态机 ${share.toFixed(2)}%（${dwellLabel} ${fmtInt(total)} 周期）`,
@@ -386,7 +369,6 @@ function fsmCard(scope: FsmScope, marked: MarkerRange | null, ctx: ViewContext, 
       () =>
         selectFsm(ctx, fsm, `状态占用 · ${name}`, [
           ['状态机', fsm.name],
-          ['时钟域', fsm.domain],
           ['状态', name],
           ['驻留周期', fmtInt(dwell)],
           ['占比', `${share.toFixed(2)}%`],
@@ -619,7 +601,6 @@ function transitionGraph(scope: FsmScope, ctx: ViewContext): HTMLElement {
       () =>
         selectFsm(ctx, fsm, `${edge.from} → ${edge.to}`, [
           ['状态机', fsm.name],
-          ['时钟域', fsm.domain],
           ['转移', `${edge.from} → ${edge.to}`],
           ['次数', fmtInt(edge.count)],
           ['占比', `${share.toFixed(2)}%`],
@@ -686,7 +667,6 @@ function transitionGraph(scope: FsmScope, ctx: ViewContext): HTMLElement {
           ? selectFsm(ctx, fsm, '起始状态', [['状态机', fsm.name], ['说明', '第一条 fsm 记录，没有前驱']])
           : selectFsm(ctx, fsm, `状态 · ${name}`, [
               ['状态机', fsm.name],
-              ['时钟域', fsm.domain],
               ['驻留周期', fmtInt(dwell ?? 0)],
               ['占比', `${(((dwell ?? 0) / Math.max(1, scope.dwellTotal)) * 100).toFixed(2)}%`],
             ]),
@@ -780,7 +760,6 @@ function stateBands(scopes: FsmScope[], ctx: ViewContext, state: FsmState): HTML
         () =>
           selectFsm(ctx, fsm, `色带 · ${segment.state}`, [
             ['状态机', fsm.name],
-            ['时钟域', fsm.domain],
             ['状态', segment.state],
             ['区间', `[${segment.start}, ${segment.end})`],
             ['长度', `${fmtInt(cycles)} 周期`],
@@ -847,7 +826,7 @@ function selectFsm(ctx: ViewContext, fsm: FsmTrack, title: string, rows: [string
 function buildContent(scopes: FsmScope[], range: MarkerRange | null, ctx: ViewContext, state: FsmState): Node[] {
   if (scopes.length === 0) {
     const empty = card('状态机', '没有可显示的状态机');
-    empty.body.append(emptyState(ctx.trace.fsms.size === 0 ? '这份轨迹没有 fsm 记录' : '当前时钟域筛选下没有状态机'));
+    empty.body.append(emptyState('这份轨迹没有 fsm 记录'));
     return [empty.root];
   }
 
@@ -871,11 +850,11 @@ function buildContent(scopes: FsmScope[], range: MarkerRange | null, ctx: ViewCo
   // ---------------------------------------------------------------- 概览
   // 数字全部取自 `scopes`：区间口径是"这一段里的"，没有标记时就是改动前的全量数字
   const rangeNote =
-    range === null ? '' : ` · 已按标记区间裁剪：${range.domain} 周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}`;
+    range === null ? '' : ` · 已按标记区间裁剪：周期 ${fmtInt(range.from)} – ${fmtInt(range.to)}`;
   const overview = card('状态机概览', `状态是保持型的：驻留周期 = 相邻两条记录的周期差之和（spec §9.5）${rangeNote}`);
   overview.body.append(
     el('div', { class: 'stat-row' }, [
-      statTile('状态机', countLabel(scopes.length), [...new Set(scopes.map((scope) => scope.fsm.domain))].join(' · ')),
+      statTile('状态机', countLabel(scopes.length), `${countLabel(records)} 条状态记录`),
       statTile(
         '状态数',
         countLabel(allStates.size),
@@ -898,7 +877,7 @@ function buildContent(scopes: FsmScope[], range: MarkerRange | null, ctx: ViewCo
   // ---------------------------------------------------------------- 每台状态机各自的占用
   // 不把不同状态机塞进同一张表：每台状态机的状态集合、驻留口径与峰值都不同，
   // 合并后大多数格子会是空的，也看不出"某个模块各状态占了多少周期"。
-  return [overview.root, ...scopes.map((scope) => fsmCard(scope, range, ctx, state))];
+  return [overview.root, ...scopes.map((scope) => fsmCard(scope, ctx, state))];
 }
 
 /**

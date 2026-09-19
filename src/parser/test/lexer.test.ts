@@ -34,12 +34,12 @@ describe('数值字面量（spec §4.3）', () => {
     expect(scan("32'hz").value.hasXZ).toBe(true);
   });
 
-  test('实数与缩放量', () => {
+  test('实数：单位不再被识别为缩放量（v1.0 已删除时间换算）', () => {
     expect(scan('1.5').value).toMatchObject({ kind: 'real', num: 1.5 });
     expect(scan('1.5e-9').value.num).toBeCloseTo(1.5e-9, 20);
-    expect(scan('1.0ns').value).toMatchObject({ kind: 'scaled', unit: 'ns', scale: 1 });
-    expect(scan('800MHz').value).toMatchObject({ kind: 'scaled', unit: 'MHz', scale: 800 });
-    expect(scan('400ps').value.scale).toBe(400);
+    // `1.0ns` 只扫出数值部分，`ns` 留给调用方判为"不是一个合法记号"
+    expect(scan('1.0ns').value).toMatchObject({ kind: 'real', text: '1.0' });
+    expect(scan('1.0ns').rest).toBe('ns');
   });
 
   test('裸词：x/z 是 4 态标量，X/Z 是符号（spec §4.5 的冲突消解）', () => {

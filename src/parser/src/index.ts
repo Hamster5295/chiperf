@@ -24,7 +24,6 @@ export { parseArgs, stripComment, splitTopLevel, decodeAt, type Arg } from './le
 export {
   comparePosition,
   formatPosition,
-  timeNs,
   counterTotalAt,
   counterDeltaBetween,
   valueAt,

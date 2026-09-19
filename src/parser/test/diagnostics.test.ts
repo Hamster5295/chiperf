@@ -1,32 +1,19 @@
 /**
- * 诊断与边界语义测试（spec §9.4 跨域锚定 / §10.4 语义异常 / §10.5 未闭合）
+ * 诊断与边界语义测试（spec §9.4 占用度 / §10.4 语义异常 / §10.5 未闭合）
  *
  * `[pip]` 是"直接指定该级的新值或 bubble"，没有 I/O/X 方向，
- * 所以这里的 fixture 全部改成新语法。
+ * 所以这里的 fixture 全部改成新语法。v1.0 只有一条全局时钟，不再有跨域。
  */
 import { describe, expect, test } from 'bun:test';
-import { join } from 'node:path';
-import { parseChiperf, occupancyAt, timeNs } from '../src/index.ts';
+import { parseChiperf, occupancyAt } from '../src/index.ts';
 
-const EXAMPLES = join(import.meta.dir, '../../../docs/examples');
 const countOf = (text: string, code: string, opts = {}) => parseChiperf(text, opts).diagnosticCounts.get(code) ?? 0;
 
-describe('§9.4 跨域条目的占用度锚定在 enter 域', () => {
-  test('multiclk：core.l2 的关闭发生在 mem 域，占用度按 core 域当时的周期锚定', async () => {
-    const trace = parseChiperf(await Bun.file(join(EXAMPLES, 'multiclk.chiperf')).text());
-    const item = trace.tracks.get('core.l2')!.items[0]!;
-    expect(item.crossDomain).toBe(true);
-    // 出队记录被解析时，core 域已经推进到周期 1（core 周期 2 的那条 clk 还没出现）
-    expect(item.closeAnchorCycle).toBe(1);
-    // 半开区间 [1,1) ⇒ 不占任何周期
-    expect(occupancyAt(trace.tracks.get('core.l2')!, 1)).toBe(0);
-    expect(occupancyAt(trace.tracks.get('core.l2')!, 2)).toBe(0);
-  });
-
-  test('同域条目的锚定就是"被改掉"那一拍本身', () => {
+describe('§9.4 条目占用度', () => {
+  test('条目的锚定就是"被改掉"那一拍本身', () => {
     const trace = parseChiperf('[clk] p\n[pip] "t", 1\n[clk] p\n[clk] p\n[pip] "t", bubble\n@end\n');
     const item = trace.tracks.get('t')!.items[0]!;
-    expect(item.closeAnchorCycle).toBe(3);
+    expect(item.close!.cycle).toBe(3);
     expect(item.latencyCycles).toBe(2);
     expect(occupancyAt(trace.tracks.get('t')!, 1)).toBe(1);
     expect(occupancyAt(trace.tracks.get('t')!, 2)).toBe(1);
@@ -68,7 +55,7 @@ describe('§10.4 语义异常', () => {
     expect(legacy.tracks.size).toBe(0);
   });
 
-  test('name_reused：同一 (域,名字) 被不同类型使用', () => {
+  test('name_reused：同一名字被不同类型使用', () => {
     const trace = parseChiperf('[clk] p\n[cnt] "x"\n[val] "x", 1\n[@]\n'.replace('[@]', '[evt] "x"') + '@end\n');
     expect(trace.diagnosticCounts.get('name_reused')).toBe(2); // cnt→val、val→evt
     expect(trace.counters.size).toBe(1);
@@ -76,29 +63,27 @@ describe('§10.4 语义异常', () => {
     expect(trace.events.size).toBe(1);
   });
 
-  test('at_clk_conflict：同域既写 clk 又用 at=', () => {
+  test('at_clk_conflict：同时写 clk 又用 at=', () => {
     expect(countOf('[clk] p\n[val] "a", 1, at=5\n@end\n', 'at_clk_conflict')).toBe(1);
     expect(countOf('[val] "a", 1, at=5\n[val] "b", 2, at=6\n@end\n', 'at_clk_conflict')).toBe(0);
   });
 
-  test('undeclared_domain：只在存在 @domain 声明时报告，且 default 豁免', () => {
-    expect(countOf('@domain core\n[cnt] "a", dom=cor\n@end\n', 'undeclared_domain')).toBe(1);
-    expect(countOf('@domain core\n[cnt] "a", dom=core\n[cnt] "b"\n@end\n', 'undeclared_domain')).toBe(0);
-    expect(countOf('[cnt] "a", dom=cor\n@end\n', 'undeclared_domain')).toBe(0);
-  });
-
-  test('duplicate_domain / duplicate_attribute / records_after_end / redundant_edge', () => {
-    expect(countOf('@domain a\n@domain a\n@end\n', 'duplicate_domain')).toBe(1);
+  test('duplicate_attribute / records_after_end / redundant_edge', () => {
     expect(countOf('[clk] p\n[val] "x", 1, note=a, note=b\n@end\n', 'duplicate_attribute')).toBe(1);
     expect(countOf('[clk] p\n@end\n[cnt] "x"\n', 'records_after_end')).toBe(1);
     expect(countOf('[clk] n\n[clk] n\n@end\n', 'redundant_edge')).toBe(1);
   });
 
   test('诊断不改变数据：语义异常时记录与派生量都保留', () => {
-    const trace = parseChiperf('[clk] p\n[cnt] "c", -5\n[fsm] "f", A\n[fsm] "f", A\n@end\n');
-    expect(trace.counters.get('default\u0000c')!.total).toBe(-5);
-    expect(trace.fsms.get('default\u0000f')!.transitions.length).toBe(2);
-    expect(trace.diagnostics.length).toBeGreaterThanOrEqual(2);
+    const trace = parseChiperf('[clk] p\n[cnt] "c", -5\n[fsm] "f", A\n[fsm] "f", A\n[clk] n\n[clk] n\n@end\n');
+    expect(trace.counters.get('c')!.total).toBe(-5);
+    const fsm = trace.fsms.get('f')!;
+    expect(fsm.transitions.length).toBe(2);
+    expect(fsm.transitions[1]!.selfLoop).toBe(true);
+    expect(trace.diagnosticCounts.get('negative_total')).toBe(1);
+    expect(trace.diagnosticCounts.get('redundant_edge')).toBe(1);
+    // 自环不再是语义异常，不产生诊断（spec §7.5 / §9.5）
+    expect(trace.diagnosticCounts.has('self_transition')).toBe(false);
   });
 });
 
@@ -107,7 +92,7 @@ describe('§6.7 异步事件不影响位置与派生量', () => {
     const trace = parseChiperf('[clk] p\n[cnt] "c", async=1\n[pip] "t", 1, async=1\n[clk] n\n[pip] "t", bubble, async=1\n@end\n');
     const records = trace.records.filter((r) => r.kind === 'cnt' || r.kind === 'pip');
     expect(records.every((r) => r.async)).toBe(true);
-    expect(trace.counters.get('default\u0000c')!.total).toBe(1);
+    expect(trace.counters.get('c')!.total).toBe(1);
     const item = trace.tracks.get('t')!.items[0]!;
     expect(item.enter.cycle).toBe(1);
     expect(item.closeAsync).toBe(true);
@@ -117,25 +102,8 @@ describe('§6.7 异步事件不影响位置与派生量', () => {
   test('clk 上的 async=1 被忽略并上报（沿照常生效）', () => {
     const trace = parseChiperf('[clk] p, async=1\n[clk] p\n@end\n');
     expect(trace.diagnosticCounts.get('async_on_clk')).toBe(1);
-    expect(trace.domains.get('default')!.cycles).toBe(2);
+    expect(trace.clock.cycles).toBe(2);
     expect(trace.records.every((r) => r.async === false)).toBe(true);
-  });
-});
-
-describe('§8.2 时间换算', () => {
-  test('第一个上升沿位于 0 ns；时钟之前没有时间基准', () => {
-    const trace = parseChiperf('@domain core, period=1.0ns\n[clk] p\n[clk] p\n[clk] n\n@end\n');
-    const core = trace.domains.get('core');
-    expect(timeNs(core, 1)).toBe(0);
-    expect(timeNs(core, 3)).toBe(2);
-    expect(timeNs(core, 0)).toBeNull(); // 时钟之前不给负时间
-    expect(timeNs(trace.domains.get('default'), 5)).toBeNull(); // 未声明 period
-  });
-
-  test('freq= 换算成 period（spec §8.2）', () => {
-    const trace = parseChiperf('@domain mem, freq=800MHz\n[clk] p, dom=mem\n@end\n');
-    expect(trace.domains.get('mem')!.periodNs).toBeCloseTo(1.25, 10);
-    expect(trace.domains.get('mem')!.freqHz).toBe(800e6);
   });
 });
 
@@ -149,14 +117,8 @@ describe('指令字段的分隔符（spec §8）', () => {
     expect(spaces.skipped.length).toBe(0);
   });
 
-  test('空白分隔的 @domain 也能解析出 period', () => {
-    const trace = parseChiperf(['chiperf 1.1', '@domain core, period=2.5ns note="主时钟"', '@end', ''].join('\n'));
-    expect(trace.domains.get('core')!.periodNs).toBe(2.5);
-    expect(trace.domains.get('core')!.note).toBe('主时钟');
-  });
-
   test('记录仍然只认逗号：空白分隔的属性是非法记录', () => {
-    const trace = parseChiperf(['chiperf 1.1', '[clk] p, dom=core note="x"', '@end', ''].join('\n'));
+    const trace = parseChiperf(['chiperf 1.1', '[clk] p, note="x" extra=1', '@end', ''].join('\n'));
     expect(trace.records.length).toBe(0);
     expect(trace.skipped.map((s) => s.reason)).toEqual(['invalid_record']);
   });

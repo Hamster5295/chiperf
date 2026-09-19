@@ -6,15 +6,14 @@
  *  - **占用 vs 空泡（饼图）**：该级活跃周期里"有内容"与"空泡"的比例。
  *    占用度是半开区间 `[enter, close)`（spec §9.4），所以活跃区间内每个周期
  *    非"有内容"即"空泡"，两者相加就是活跃周期数。
- *  - **延迟分布（横向柱状图）**：只统计**同域已结束**条目（跨域条目不给周期延迟，
- *    spec §6.5），按出现次数取前 10 个延迟，并给出中位 / 平均 / 方差等数值。
+ *  - **延迟分布（横向柱状图）**：统计已结束条目，按出现次数取前 10 个延迟，
+ *    并给出中位 / 平均 / 方差等数值。
  *
- * 其余内容（气泡区间列表、逐周期占用度曲线、跨域表、条目明细）已按要求移除；
+ * 其余内容（气泡区间列表、逐周期占用度曲线、条目明细）已按要求移除；
  * 逐周期与逐条目的细节在时间轴视图里看。
  *
- * **统计范围**：波形上打了两个同域标记时（`ctx.markers.range()`），本视图的统计只算
+ * **统计范围**：波形上打了两个标记时（`ctx.markers.range()`），本视图的统计只算
  * 两个标记之间（闭区间）的数据；标记只在**松手提交**时通知，所以拖拽期间不会反复重算。
- * 不在标记所在域的流水级保持全量统计 —— 周期号跨域不可比 —— 并在卡片上明确写出来。
  */
 import type { TrackInfo } from '../../../parser/src/index.ts';
 import { bubbleStats, itemsWithin, latencyStats, type Distribution } from '../../../parser/src/index.ts';
@@ -45,10 +44,8 @@ let active: PipelineState | null = null;
 
 function visibleTracks(ctx: ViewContext): TrackInfo[] {
   const tracks = [...ctx.trace.tracks.values()];
-  const domains = ctx.options.domains;
-  const shown = domains.length === 0 ? tracks : tracks.filter((track) => domains.includes(track.domain));
   // 按首次出现的周期排：流水级顺序（IF → ID → EX …）就是数据里出现的顺序
-  return [...shown].sort((a, b) => a.firstCycle - b.firstCycle || a.name.localeCompare(b.name));
+  return [...tracks].sort((a, b) => a.firstCycle - b.firstCycle || a.name.localeCompare(b.name));
 }
 
 // ------------------------------------------------------------------ 统计范围（标记区间）
@@ -60,14 +57,10 @@ interface TrackRange {
 }
 
 /**
- * 这一级该按哪个区间统计。
- *
- * 只有**标记所在域**的流水级才受区间约束：别的域的周期号和它不可比（spec §6.5），
- * 拿区间硬套只会得到"这段里一个周期都没有"这种没意义的数字 —— 所以那些级保持全量，
- * 卡片上会明确写出"不在标记所在域，未按标记筛选"。
+ * 这一级该按哪个区间统计。没有标记时返回 null（全量）。
  */
 function effectiveRange(track: TrackInfo, range: MarkerRange | null): TrackRange | null {
-  if (range === null || range.domain !== track.domain) return null;
+  if (range === null) return null;
   return { from: range.from, to: range.to };
 }
 
@@ -93,7 +86,6 @@ interface StageNumbers {
   items: number;
   closed: number;
   open: number;
-  crossDomain: number;
   /** 最长气泡段（区间生效时是**落在区间里的那一段**） */
   widest: { start: number; end: number; length: number } | null;
   latency: Distribution;
@@ -105,8 +97,6 @@ function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers 
 
   if (range === null) {
     // 全量：与改动前逐字一致
-    let crossDomain = 0;
-    for (const item of track.items) if (item.crossDomain) crossDomain += 1;
     for (const bubble of track.bubbleRanges) {
       const length = bubble.end - bubble.start + 1;
       if (widest === null || length > widest.length) widest = { start: bubble.start, end: bubble.end, length };
@@ -119,7 +109,6 @@ function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers 
       items: track.items.length,
       closed: track.closed,
       open: track.open,
-      crossDomain,
       widest,
       latency: latencyStats(track),
       bubbleDist: bubbleStats(track),
@@ -149,11 +138,9 @@ function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers 
   const within = itemsWithin(track, range.from, range.to);
   let closed = 0;
   let open = 0;
-  let crossDomain = 0;
   for (const item of within) {
     if (item.close === null) open += 1;
     else closed += 1;
-    if (item.crossDomain) crossDomain += 1;
   }
 
   return {
@@ -164,7 +151,6 @@ function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers 
     items: within.length,
     closed,
     open,
-    crossDomain,
     widest,
     latency: latencyStats(track, range),
     bubbleDist: bubbleStats(track, range),
@@ -173,26 +159,19 @@ function stageNumbers(track: TrackInfo, range: TrackRange | null): StageNumbers 
 
 /**
  * 顶部的范围说明 —— 任何时刻页面上都要写清楚"这批数字统计的是哪一段"。
- * 只打了一个标记、或两个标记落在不同域时都算没有区间（`range()` 返回 null），
- * 这时顺带说清楚原因，免得用户以为筛选坏了。
+ * 只打了一个标记时算没有区间（`range()` 返回 null），这时顺带说清楚原因。
  */
 function scopeChip(markers: Marker[], range: MarkerRange | null): HTMLElement {
   if (range !== null) {
-    return el('span', { class: 'chip chip-ok', text: `标记区间：${range.domain} 周期 ${range.from} – ${range.to}（只统计这一段）` });
+    return el('span', { class: 'chip chip-ok', text: `标记区间：周期 ${range.from} – ${range.to}（只统计这一段）` });
   }
   if (markers.length === 0) return el('span', { class: 'chip', text: '未打标记：统计全量' });
-  if (markers.length === 1) {
-    const only = markers[0]!;
-    return el('span', { class: 'chip', text: `只有 1 个标记（${only.domain} 周期 ${only.cycle}）：再打一个才有区间，当前统计全量` });
-  }
-  return el('span', { class: 'chip chip-warn', text: '两个标记不在同一时钟域：周期不可比，统计全量' });
+  const only = markers[0]!;
+  return el('span', { class: 'chip', text: `只有 1 个标记（周期 ${only.cycle}）：再打一个才有区间，当前统计全量` });
 }
 
 /** 卡片上的范围说明：让用户一眼看出这一级被筛了没有 */
 function stageScopeChip(stats: StageNumbers, range: MarkerRange): HTMLElement {
-  if (!stats.filtered) {
-    return el('span', { class: 'chip chip-warn', text: `不在标记所在域（${range.domain}）：该级未按标记筛选` });
-  }
   return el('span', {
     class: 'chip chip-ok',
     text: `标记区间：周期 ${range.from} – ${range.to}（本级只统计这一段：${countLabel(stats.cycles)} 周期 · ${countLabel(stats.items)} 条目）`,
@@ -336,7 +315,7 @@ function occupancyMetric(track: TrackInfo, stats: StageNumbers, ctx: ViewContext
     if (bubbleItem) {
       bubbleItem.style.cursor = 'pointer';
       bubbleItem.title = `跳到该级第一个气泡周期（周期 ${firstBubble}）`;
-      bubbleItem.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: firstBubble }));
+      bubbleItem.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', cycle: firstBubble }));
     }
   }
   wrap.append(legend);
@@ -431,7 +410,7 @@ function stageCard(
   const node = card(
     track.name,
     // 副标题说的是**这条轨道本身**（覆盖范围与条目总数），与统计范围无关，所以不随标记改变
-    `域 ${track.domain} · 周期 ${track.firstCycle}–${track.lastCycle}（${countLabel(cycles)} 周期）· ${countLabel(track.items.length)} 条目`,
+    `周期 ${track.firstCycle}–${track.lastCycle}（${countLabel(cycles)} 周期）· ${countLabel(track.items.length)} 条目`,
   );
   const latency = stats.latency;
   const bubbleDist = stats.bubbleDist;
@@ -496,7 +475,6 @@ interface PipelineTotals {
   items: number;
   closed: number;
   open: number;
-  crossDomain: number;
   /** 气泡周期数 */
   bubbles: number;
   cycles: number;
@@ -509,7 +487,6 @@ function addTotals(totals: PipelineTotals, track: TrackInfo, stats: StageNumbers
   totals.items += stats.items;
   totals.closed += stats.closed;
   totals.open += stats.open;
-  totals.crossDomain += stats.crossDomain;
   totals.bubbles += stats.bubbleCycles;
   totals.cycles += stats.cycles;
   if (stats.filtered) totals.filteredStages += 1;
@@ -529,11 +506,11 @@ function buildOverview(tracks: TrackInfo[], totals: PipelineTotals, range: Marke
   const subtitle =
     range === null
       ? note
-      : `${note}；标记区间 ${range.domain} 周期 ${range.from}–${range.to} ⇒ ${totals.filteredStages}/${tracks.length} 级按区间统计，其余级不在该域（全量）`;
+      : `${note}；标记区间 周期 ${range.from}–${range.to} ⇒ ${totals.filteredStages}/${tracks.length} 级按区间统计`;
   const overview = card('流水线概览', subtitle);
   overview.body.append(
     el('div', { class: 'stat-row' }, [
-      statTile('流水级', countLabel(tracks.length), `域 ${[...new Set(tracks.map((t) => t.domain))].join(' · ')}`),
+      statTile('流水级', countLabel(tracks.length), `${countLabel(totals.items)} 条目`),
       statTile('在飞条目', countLabel(totals.items), `${totals.closed} 已结束 · ${totals.open} 未闭合`),
       statTile(
         '占用率',
@@ -547,7 +524,6 @@ function buildOverview(tracks: TrackInfo[], totals: PipelineTotals, range: Marke
             `${totals.widest.track} · ${totals.widest.start}–${totals.widest.end}${totals.widest.clipped ? '（区间内片段）' : ''}`,
           )
         : statTile('最长气泡', '—', '没有气泡'),
-      statTile('跨域条目', countLabel(totals.crossDomain), '不计入周期延迟分布（§6.5）'),
     ]),
   );
   return overview.root;
@@ -582,7 +558,7 @@ async function renderPipeline(state: PipelineState): Promise<void> {
 
   if (tracks.length === 0) {
     const empty = card('流水线', '没有可显示的 pip 轨道');
-    empty.body.append(emptyState(ctx.trace.tracks.size === 0 ? '这份轨迹没有 pip 轨道' : '当前时钟域筛选下没有轨道'));
+    empty.body.append(emptyState(ctx.trace.tracks.size === 0 ? '这份轨迹没有 pip 轨道' : '没有可显示的轨道'));
     progress.remove();
     state.highlights = [];
     state.compute = null;
@@ -592,7 +568,7 @@ async function renderPipeline(state: PipelineState): Promise<void> {
 
   const fragment = document.createDocumentFragment();
   const highlights: StageHighlight[] = [];
-  const totals: PipelineTotals = { items: 0, closed: 0, open: 0, crossDomain: 0, bubbles: 0, cycles: 0, filteredStages: 0, widest: null };
+  const totals: PipelineTotals = { items: 0, closed: 0, open: 0, bubbles: 0, cycles: 0, filteredStages: 0, widest: null };
 
   const done = await runChunked(
     tracks.length,

@@ -8,9 +8,9 @@
  *  - 语义异常只产生诊断，不修改数据、不中断解析（§10.4）
  */
 import type {
+  ClockInfo,
   Diagnostic,
   DiagnosticCode,
-  DomainInfo,
   EventRecord,
   MsgRecord,
   Phase,
@@ -20,7 +20,7 @@ import type {
   Trace,
   ResetMark,
 } from './types.ts';
-import { trackKey } from './types.ts';
+import { CLOCK_NAME } from './types.ts';
 import { parseArgs, decodeAt, stripComment, type Arg } from './lexer.ts';
 import { Deriver, type DeriveContext } from './derive.ts';
 import { formatValue, scanValue } from './value.ts';
@@ -46,21 +46,21 @@ const EVENT_KINDS = new Set(['clk', 'cnt', 'val', 'pip', 'fsm', 'evt', 'msg']);
 /** 控制记录（spec §7.7）：不占位置、不占 seq、不进可视化 */
 const CONTROL_KINDS = new Set(['rst']);
 
-interface DomainRuntime {
-  info: DomainInfo;
-  phase: Phase;
-}
-
-const TIME_UNIT_NS: Record<string, number> = { s: 1e9, ms: 1e6, us: 1e3, ns: 1, ps: 1e-3 };
-const FREQ_UNIT_HZ: Record<string, number> = { Hz: 1, kHz: 1e3, MHz: 1e6, GHz: 1e9 };
+const emptyClock = (): ClockInfo => ({
+  cycles: 0,
+  posEdges: 0,
+  negEdges: 0,
+  firstCycle: Number.POSITIVE_INFINITY,
+  lastCycle: 0,
+});
 
 export class ChiperfParser {
-  private readonly domains = new Map<string, DomainRuntime>();
+  private clock: ClockInfo = emptyClock();
+  private clockPhase: Phase = '-';
   private readonly diagnostics: Diagnostic[] = [];
   private readonly diagnosticCounts = new Map<string, number>();
   private readonly skipped: SkippedLine[] = [];
   private readonly meta: Record<string, string> = {};
-  private readonly declared = new Set<string>();
   private readonly records: EventRecord[] = [];
   private readonly resets: ResetMark[] = [];
   /** 复位时要整个换掉（此前的派生状态一律作废），所以不是 readonly */
@@ -75,7 +75,9 @@ export class ChiperfParser {
   private version = { major: 1, minor: 0, explicit: false, raw: undefined as string | undefined };
   private endSeen = false;
   private hasAtOverride = false;
-  private readonly atDomains = new Set<string>();
+  /** 是否出现过 clk / at=，用于 at_clk_conflict */
+  private usedClk = false;
+  private usedAt = false;
   private readonly collectRecords: boolean;
   private readonly ignoreVersion: boolean;
 
@@ -83,8 +85,6 @@ export class ChiperfParser {
     this.collectRecords = opts.collectRecords ?? true;
     this.ignoreVersion = opts.ignoreVersion ?? false;
     this.deriveCtx = {
-      cyclesOf: (domain) => this.domains.get(domain)?.info.cycles ?? 0,
-      domainInfo: (domain) => this.domainRuntime(domain).info,
       diag: (code, line, message) => this.diag(code, line, message),
     };
     this.deriver = new Deriver(this.deriveCtx);
@@ -122,7 +122,7 @@ export class ChiperfParser {
       this.truncatedTail = null;
     }
     this.deriver.finish();
-    this.finalizeDomainDiagnostics();
+    this.finalizeDiagnostics();
     if (!this.endSeen && this.records.length > 0) {
       this.diag('eof_without_end_marker', 0, '文件没有以 @end 结束：内容可能被截断');
     }
@@ -137,7 +137,7 @@ export class ChiperfParser {
         skipped: this.skipped.length,
         bytesPerRecord: this.records.length > 0 ? this.bytes / this.records.length : 0,
       },
-      domains: new Map([...this.domains].map(([name, rt]) => [name, rt.info])),
+      clock: this.clock,
       records: this.records,
       resets: this.resets,
       counters: this.deriver.counters,
@@ -175,7 +175,7 @@ export class ChiperfParser {
       }
     }
     if (bare.length === 0) return;
-    // spec §8.3：@end 之后的记录仍要被解析，但要产生诊断（注释不算）
+    // spec §8.2：@end 之后的记录仍要被解析，但要产生诊断（注释不算）
     if (this.endSeen) {
       this.diag('records_after_end', this.lineNo, '@end 之后仍然出现了记录');
     }
@@ -214,52 +214,8 @@ export class ChiperfParser {
       }
       const attrs = this.collectAttrs(args);
       if (attrs === null) return;
-      // 字符串值取解码后的正文（与 @domain 的 note 一致）；其它类型保留格式化后的形式
+      // 字符串值取解码后的正文；其它类型保留格式化后的形式
       for (const [key, value] of attrs) this.meta[key] = value === null ? '' : value.kind === 'str' ? value.text : formatValue(value);
-      return;
-    }
-    if (name === 'domain') {
-      const args = parseArgs(rest, { spaceSeparated: true });
-      if (args.some((a) => a.kind === 'error')) {
-        this.skip('invalid_record', this.lineNo, body, args.find((a) => a.kind === 'error')!.reason);
-        return;
-      }
-      const positional = args.filter((a): a is Extract<Arg, { kind: 'pos' }> => a.kind === 'pos');
-      const attrs = this.collectAttrs(args);
-      if (attrs === null) return;
-      if (positional.length !== 1 || (positional[0]!.value.kind !== 'sym' && positional[0]!.value.kind !== 'str')) {
-        this.skip('invalid_record', this.lineNo, body, '@domain 需要恰好一个域名参数');
-        return;
-      }
-      const domainName = positional[0]!.value.text;
-      const rt = this.domainRuntime(domainName);
-      if (rt.info.declared) {
-        this.diag('duplicate_domain', this.lineNo, `域 "${domainName}" 被重复声明（属性逐项合并）`);
-      }
-      rt.info.declared = true;
-      this.declared.add(domainName);
-
-      const period = attrs.get('period');
-      const freq = attrs.get('freq');
-      const note = attrs.get('note');
-      if (period !== undefined) {
-        const ns = scaledToNs(period);
-        if (ns === null) {
-          this.skip('invalid_record', this.lineNo, body, '@domain 的 period= 必须是时间缩放量（如 1.0ns）');
-          return;
-        }
-        rt.info.periodNs = ns;
-      }
-      if (freq !== undefined) {
-        const hz = scaledToHz(freq);
-        if (hz === null) {
-          this.skip('invalid_record', this.lineNo, body, '@domain 的 freq= 必须是频率缩放量（如 800MHz）');
-          return;
-        }
-        rt.info.freqHz = hz;
-        if (period === undefined) rt.info.periodNs = 1e9 / hz;
-      }
-      if (note !== undefined && note !== null) rt.info.note = note.kind === 'str' ? note.text : formatValue(note);
       return;
     }
     this.skip('unknown_directive', this.lineNo, body, `未知指令 @${name}`);
@@ -288,7 +244,7 @@ export class ChiperfParser {
 
     if (kind === 'msg') {
       const text = decodeMsgPayload(rest);
-      const pos = this.place(new Map(), null, false)!;
+      const pos = this.place(null, false)!;
       this.push({ kind: 'msg', line: this.lineNo, seq: pos.seq, pos, async: false, raw: line, text });
       return;
     }
@@ -311,20 +267,6 @@ export class ChiperfParser {
     }
     const isAsync = asyncAttr !== undefined && asyncAttr !== null && asyncAttr.big === 1n;
 
-    const domValue = attrs.get('dom');
-    let domain = 'default';
-    if (domValue !== undefined) {
-      if (domValue === null || (domValue.kind !== 'sym' && domValue.kind !== 'str')) {
-        this.skip('invalid_record', this.lineNo, line, 'dom 的值必须是域名（裸词或字符串）');
-        return;
-      }
-      domain = domValue.text;
-      if (domain.length === 0) {
-        this.skip('invalid_record', this.lineNo, line, '域名不得为空');
-        return;
-      }
-    }
-
     if (kind === 'clk') {
       if (positional.length !== 1) {
         this.skip('invalid_record', this.lineNo, line, 'clk 需要恰好一个参数（p 或 n）');
@@ -336,19 +278,19 @@ export class ChiperfParser {
         return;
       }
       if (isAsync) this.diag('async_on_clk', this.lineNo, 'clk 记录上的 async=1 被忽略：时钟沿本身不可能异步');
-      const rt = this.domainRuntime(domain);
+      this.usedClk = true;
       if (edge.text === 'p') {
-        rt.info.cycles++;
-        rt.info.posEdges++;
-        rt.phase = 'p';
+        this.clock.cycles++;
+        this.clock.posEdges++;
+        this.clockPhase = 'p';
       } else {
-        if (rt.phase === 'n') this.diag('redundant_edge', this.lineNo, `域 "${domain}" 的相位已经是 n，重复的下降沿`);
-        rt.info.negEdges++;
-        rt.phase = 'n';
+        if (this.clockPhase === 'n') this.diag('redundant_edge', this.lineNo, '相位已经是 n，重复的下降沿');
+        this.clock.negEdges++;
+        this.clockPhase = 'n';
       }
-      const pos: Position = { domain, cycle: rt.info.cycles, phase: rt.phase, seq: ++this.seq };
-      rt.info.firstCycle = Math.min(rt.info.firstCycle, pos.cycle);
-      rt.info.lastCycle = Math.max(rt.info.lastCycle, pos.cycle);
+      const pos: Position = { cycle: this.clock.cycles, phase: this.clockPhase, seq: ++this.seq };
+      this.clock.firstCycle = Math.min(this.clock.firstCycle, pos.cycle);
+      this.clock.lastCycle = Math.max(this.clock.lastCycle, pos.cycle);
       this.push({ kind: 'clk', line: this.lineNo, seq: pos.seq, pos, async: false, raw: line, edge: edge.text });
       return;
     }
@@ -386,7 +328,7 @@ export class ChiperfParser {
         }
         delta = Number(dv.big ?? 0n);
       }
-      const pos = this.place(attrs, atText, isAsync);
+      const pos = this.place(atText, isAsync);
       if (pos === null) {
         this.skip('invalid_record', this.lineNo, line, 'at 的值不符合 int[p|n]');
         return;
@@ -402,11 +344,11 @@ export class ChiperfParser {
       }
       const name = nameOf(positional[0]!.value);
       const value = positional[1]!.value;
-      if (name === null || value.kind === 'scaled') {
-        this.skip('invalid_record', this.lineNo, line, name === null ? 'val 的名字必须非空' : '缩放量只能出现在 @domain 的 period=/freq=');
+      if (name === null) {
+        this.skip('invalid_record', this.lineNo, line, 'val 的名字必须非空');
         return;
       }
-      const pos = this.place(attrs, atText, isAsync);
+      const pos = this.place(atText, isAsync);
       if (pos === null) {
         this.skip('invalid_record', this.lineNo, line, 'at 的值不符合 int[p|n]');
         return;
@@ -439,12 +381,8 @@ export class ChiperfParser {
         return;
       }
       const written = positional[1]!.value;
-      if (written.kind === 'scaled') {
-        this.skip('invalid_record', this.lineNo, line, '缩放量只能出现在 @domain 的 period=/freq=');
-        return;
-      }
       const value = written.kind === 'sym' && written.text === 'bubble' ? null : written;
-      const pos = this.place(attrs, atText, isAsync);
+      const pos = this.place(atText, isAsync);
       if (pos === null) {
         this.skip('invalid_record', this.lineNo, line, 'at 的值不符合 int[p|n]');
         return;
@@ -460,11 +398,11 @@ export class ChiperfParser {
       }
       const name = nameOf(positional[0]!.value);
       const state = positional[1]!.value;
-      if (name === null || state.kind === 'scaled') {
-        this.skip('invalid_record', this.lineNo, line, name === null ? 'fsm 的名字必须非空' : '缩放量只能出现在 @domain 的 period=/freq=');
+      if (name === null) {
+        this.skip('invalid_record', this.lineNo, line, 'fsm 的名字必须非空');
         return;
       }
-      const pos = this.place(attrs, atText, isAsync);
+      const pos = this.place(atText, isAsync);
       if (pos === null) {
         this.skip('invalid_record', this.lineNo, line, 'at 的值不符合 int[p|n]');
         return;
@@ -480,11 +418,11 @@ export class ChiperfParser {
     }
     const name = nameOf(positional[0]!.value);
     const payload = positional.length === 2 ? positional[1]!.value : null;
-    if (name === null || (payload !== null && payload.kind === 'scaled')) {
-      this.skip('invalid_record', this.lineNo, line, name === null ? 'evt 的名字必须非空' : '缩放量只能出现在 @domain 的 period=/freq=');
+    if (name === null) {
+      this.skip('invalid_record', this.lineNo, line, 'evt 的名字必须非空');
       return;
     }
-    const pos = this.place(attrs, atText, isAsync);
+    const pos = this.place(atText, isAsync);
     if (pos === null) {
       this.skip('invalid_record', this.lineNo, line, 'at 的值不符合 int[p|n]');
       return;
@@ -505,46 +443,23 @@ export class ChiperfParser {
     return map;
   }
 
-  /** 解析记录位置（spec §6.3）：`at=` 覆盖优先，否则取域当前周期/相位；命中后立即占用 seq */
-  private place(attrs: Map<string, ScalarValue | null>, atText: string | null, async: boolean): Position | null {
-    const domValue = attrs.get('dom');
-    const domain = domValue && domValue !== null ? domValue.text : 'default';
-    const rt = this.domainRuntime(domain);
-    let cycle = rt.info.cycles;
-    let phase = rt.phase;
+  /** 解析记录位置（spec §6.2）：`at=` 覆盖优先，否则取全局时钟当前周期/相位；命中后立即占用 seq */
+  private place(atText: string | null, async: boolean): Position | null {
+    let cycle = this.clock.cycles;
+    let phase = this.clockPhase;
     if (atText !== null) {
       const at = decodeAt(atText);
       if (!at) return null;
       cycle = at.cycle;
       phase = at.phase;
       this.hasAtOverride = true;
-      this.atDomains.add(domain);
+      this.usedAt = true;
     }
-    const pos: Position = { domain, cycle, phase, seq: ++this.seq };
-    rt.info.firstCycle = Math.min(rt.info.firstCycle, cycle);
-    rt.info.lastCycle = Math.max(rt.info.lastCycle, cycle);
+    const pos: Position = { cycle, phase, seq: ++this.seq };
+    this.clock.firstCycle = Math.min(this.clock.firstCycle, cycle);
+    this.clock.lastCycle = Math.max(this.clock.lastCycle, cycle);
     void async;
     return pos;
-  }
-
-  private domainRuntime(name: string): DomainRuntime {
-    let rt = this.domains.get(name);
-    if (!rt) {
-      rt = {
-        phase: '-',
-        info: {
-          name,
-          cycles: 0,
-          posEdges: 0,
-          negEdges: 0,
-          declared: false,
-          firstCycle: Number.POSITIVE_INFINITY,
-          lastCycle: 0,
-        },
-      };
-      this.domains.set(name, rt);
-    }
-    return rt;
   }
 
   private push(rec: EventRecord): void {
@@ -557,9 +472,9 @@ export class ChiperfParser {
    *
    * 丢弃是"当作没发生过"，不是"画在图上"：
    *  - 记录、派生状态（在飞条目/计数器/数值/状态机）、诊断、跳过行全部作废
-   *  - 版本行与 `@` 指令（`@meta` / `@domain` 的 period/freq…）是**声明**不是行，保留
+   *  - 版本行与 `@` 指令（`@meta`…）是**声明**不是行，保留
    *  - 周期号不重编：`cycles` 继续往前走，所以复位后的记录接着原来的周期号
-   *  - 域上的"记录范围 / 沿数"按新窗口重算（它们描述的是窗口内可观察到的东西）
+   *  - 时钟上的"记录范围 / 沿数"按新窗口重算（它们描述的是窗口内可观察到的东西）
    */
   private applyReset(rest: string, line: string): void {
     if (stripComment(rest).trim() !== '') {
@@ -578,12 +493,10 @@ export class ChiperfParser {
     this.diagnosticCounts.clear();
     this.skipped.length = 0;
 
-    for (const rt of this.domains.values()) {
-      rt.info.posEdges = 0;
-      rt.info.negEdges = 0;
-      rt.info.firstCycle = Number.POSITIVE_INFINITY;
-      rt.info.lastCycle = 0;
-    }
+    this.clock.posEdges = 0;
+    this.clock.negEdges = 0;
+    this.clock.firstCycle = Number.POSITIVE_INFINITY;
+    this.clock.lastCycle = 0;
     this.diag('rst_boundary', this.lineNo, `系统复位：丢弃此前 ${dropped} 条事件记录（版本行与 @ 指令保留）`);
   }
 
@@ -599,22 +512,11 @@ export class ChiperfParser {
     if (count) this.diagnosticCounts.set(code, (this.diagnosticCounts.get(code) ?? 0) + 1);
   }
 
-  private finalizeDomainDiagnostics(): void {
-    const { usedDomains, clkDomains } = this.deriver;
-    if (this.declared.size > 0) {
-      for (const domain of usedDomains) {
-        if (domain === 'default' || this.declared.has(domain)) continue;
-        this.diag('undeclared_domain', 0, `域 "${domain}" 被记录使用但没有 @domain 声明（可能是拼写错误）`);
-      }
+  private finalizeDiagnostics(): void {
+    if (this.usedClk && this.usedAt) {
+      this.diag('at_clk_conflict', 0, '文件同时使用了 clk 记录与 at= 定位：位置与周期计数会脱节');
     }
-    for (const domain of clkDomains) {
-      if (this.atDomains.has(domain)) {
-        this.diag('at_clk_conflict', 0, `域 "${domain}" 同时使用了 clk 记录与 at= 定位：位置与周期计数会脱节`);
-      }
-    }
-    for (const rt of this.domains.values()) {
-      if (!Number.isFinite(rt.info.firstCycle)) rt.info.firstCycle = 0;
-    }
+    if (!Number.isFinite(this.clock.firstCycle)) this.clock.firstCycle = 0;
   }
 }
 
@@ -623,20 +525,6 @@ export class ChiperfParser {
 function nameOf(v: ScalarValue): string | null {
   if (v.kind === 'sym' || v.kind === 'str') return v.text.length > 0 ? v.text : null;
   return null;
-}
-
-function scaledToNs(v: ScalarValue | null): number | null {
-  if (!v || v.kind !== 'scaled' || v.unit === undefined) return null;
-  const factor = TIME_UNIT_NS[v.unit];
-  if (factor === undefined) return null;
-  return (v.scale ?? 0) * factor;
-}
-
-function scaledToHz(v: ScalarValue | null): number | null {
-  if (!v || v.kind !== 'scaled' || v.unit === undefined) return null;
-  const factor = FREQ_UNIT_HZ[v.unit];
-  if (factor === undefined) return null;
-  return (v.scale ?? 0) * factor;
 }
 
 function decodeMsgPayload(rest: string): string {
@@ -668,5 +556,3 @@ export function parseChiperf(text: string, opts: ParseOptions = {}): Trace {
   parser.feed(text);
   return parser.finish();
 }
-
-export { trackKey };

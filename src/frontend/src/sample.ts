@@ -5,7 +5,7 @@
  *   - 每条指令依次经过 if / id / ex / mem / wb，任一时刻每级最多一条，MEM 先到先得
  *     （load 的 3 周期 MEM 会挡住后面的指令，自然产生气泡）
  *   - 分支在 EX 解析出预测错误：当周期杀掉 ID/IF 里的年轻指令（X），并重定向取指
- *   - 覆盖：双时钟域、跨域条目、异步中断、计数器（含 abs= 回读）、保持型数值
+ *   - 覆盖：单时钟、异步中断、计数器（含 abs= 回读）、保持型数值
  *     （十六进制/字符串/4 态）、事件、注解、状态机（含一次自环）
  */
 interface Instr {
@@ -117,9 +117,7 @@ export function sampleTrace(): string {
   };
 
   push('chiperf 1.0');
-  push('@meta design="rv32i-demo" tool="chiperf frontend sample" date="2026-09-15" note="内置示例：双时钟域 + 5 级流水 + 异步中断"');
-  push('@domain default, period=1.0ns, note="主时钟 1GHz（隐式默认域）"');
-  push('@domain mem, freq=800MHz, note="内存时钟 800MHz"');
+  push('@meta design="rv32i-demo" tool="chiperf frontend sample" date="2026-09-15" note="内置示例：单时钟 + 5 级流水 + 异步中断"');
   push('');
   push('# ---- 时钟之前：复位阶段 ----');
   push('[msg] reset released');
@@ -212,29 +210,20 @@ export function sampleTrace(): string {
   at(17, '[fsm] "core.ctrl", TRAP');
   at(18, '[msg] irq serviced (vector 7)');
 
-  // 跨时钟域请求：在默认域发起，稍后在 mem 域完成
+  // 跨周期请求：发起后在第 8 个周期完成（同一时钟）
   const crossTag = 0x9000;
   at(slots[1]!.ifIn, `[pip] "l2.req", ${hex(crossTag)}`);
+  at(8, `[pip] "l2.req", bubble`);
+  at(8, `[cnt] "l2.access"`);
 
-  // 按周期输出；mem 域更快（每 4 个默认域周期多跑一拍）
+  // 按周期输出
   for (let cycle = 1; cycle <= lastCycle; cycle++) {
-    push(`# ---- 默认域周期 ${cycle} ----`);
+    push(`# ---- 周期 ${cycle} ----`);
     push('[clk] p');
     for (const line of perCycle.get(cycle) ?? []) push(line);
     push('[clk] n');
-    if (cycle % 4 === 0) {
-      push('[clk] p, dom=mem');
-      push(`[cnt] "mem.access", dom="mem"`);
-      push(`[clk] n, dom=mem`);
-    }
   }
 
-  push('');
-  push('# ---- 跨时钟域请求在 mem 域完成（不给周期延迟，spec §6.5）----');
-  push('[clk] p, dom=mem');
-  push(`[pip] "l2.req", bubble, dom="mem"`);
-  push('[cnt] "mem.access", dom="mem"');
-  push('[clk] n, dom=mem');
   push('');
   push('[msg] trace complete');
   push('@end');

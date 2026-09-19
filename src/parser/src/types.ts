@@ -3,7 +3,13 @@
  *
  * 这些类型是解析器的公开契约（spec §7 / §9）。前端与工具只依赖这里导出的名字，
  * 不依赖解析器内部实现。
+ *
+ * v1.0 只有**一个全局时钟**，其名字固定为 `clock`（`CLOCK_NAME`）：位置不再带时钟域，
+ * 所有记录都在同一条时间轴上。
  */
+
+/** 全局时钟的标识/展示名（v1.0 取消时钟域，只剩这一条时间轴） */
+export const CLOCK_NAME = 'clock';
 
 /** 相位：`p` = 上升沿之后，`n` = 下降沿之后，`-` = 尚无时钟（时钟之前，cycle 0） */
 export type Phase = 'p' | 'n' | '-';
@@ -11,17 +17,16 @@ export type Phase = 'p' | 'n' | '-';
 /** 时钟沿（spec §7.1） */
 export type Edge = 'p' | 'n';
 
-/** 事件位置（spec §6.3） */
+/** 事件位置（spec §6.2）：单时钟，无需时钟域 */
 export interface Position {
-  domain: string;
   cycle: number;
   phase: Phase;
-  /** 全局自增序号，从 1 开始；只对**被接受**的事件记录递增（spec §6.3） */
+  /** 全局自增序号，从 1 开始；只对**被接受**的事件记录递增（spec §6.2） */
   seq: number;
 }
 
-/** 值的语义类型（spec §4.5）；`scaled` 是缩放量，仅在 `@domain` 的 `period=`/`freq=` 中合法 */
-export type ValueKind = 'int' | 'bits' | 'real' | 'str' | 'sym' | 'scaled';
+/** 值的语义类型（spec §4.5） */
+export type ValueKind = 'int' | 'bits' | 'real' | 'str' | 'sym';
 
 /** 一个类型化的标量值 */
 export interface ScalarValue {
@@ -38,9 +43,6 @@ export interface ScalarValue {
   hasXZ?: boolean;
   /** Verilog 字面量的声明宽度（`32'h...` ⇒ 32），未声明则 undefined */
   width?: number;
-  /** `scaled` 的数值与单位 */
-  scale?: number;
-  unit?: string;
 }
 
 interface RecordBase {
@@ -49,7 +51,7 @@ interface RecordBase {
   /** 位置里的全局序号 */
   seq: number;
   pos: Position;
-  /** 是否带 `async=1`（spec §6.7）：事件不是时钟沿采样得到的 */
+  /** 是否带 `async=1`（spec §6.5）：事件不是时钟沿采样得到的 */
   async: boolean;
   /** 原始行（不含行终止符），用于表格视图与诊断 */
   raw: string;
@@ -117,17 +119,13 @@ export type EventKind = EventRecord['kind'];
 /** 语义诊断码（spec §10.4）。解析器只报告，不修改数据。 */
 export type DiagnosticCode =
   | 'pip_legacy_direction'
-  | 'undeclared_domain'
   | 'at_clk_conflict'
   | 'async_on_clk'
   | 'negative_total'
-  | 'self_transition'
   | 'redundant_edge'
   | 'duplicate_attribute'
-  | 'duplicate_domain'
   | 'name_reused'
   | 'records_after_end'
-  | 'cross_domain'
   | 'eof_without_end_marker'
   | 'invalid_escape'
   | 'gzip_truncated'
@@ -156,20 +154,13 @@ export interface SkippedLine {
   detail?: string;
 }
 
-/** 时钟域（spec §6.1 / §8.2） */
-export interface DomainInfo {
-  name: string;
+/** 全局时钟状态（spec §6.2）：v1.0 只有这一条时间轴，名字固定为 `clock` */
+export interface ClockInfo {
   /** 上升沿数 = 周期数（spec §6.2） */
   cycles: number;
   posEdges: number;
   negEdges: number;
-  /** 是否有 `@domain` 声明 */
-  declared: boolean;
-  /** `@domain` 的 period= 换算出的周期（纳秒）；缺失则 undefined */
-  periodNs?: number;
-  freqHz?: number;
-  note?: string;
-  /** 该域记录（含其它类型的记录）出现的周期范围 */
+  /** 记录出现的周期范围 */
   firstCycle: number;
   lastCycle: number;
 }
@@ -183,10 +174,10 @@ export interface Timed<T> {
   line: number;
 }
 
-/** 计数器（spec §9.2）。追踪键 = (域, 名字) */
+/** 计数器（spec §9.2） */
 export interface CounterTrack {
   name: string;
-  domain: string;
+  /** 稳定的选择/高亮键（= 名字；事件折算轨带 `evt:` 前缀） */
   key: string;
   /** 终值 */
   total: number;
@@ -215,7 +206,6 @@ export interface CounterTrack {
 /** 数值轨（spec §9.3）。保持型 */
 export interface ValueTrack {
   name: string;
-  domain: string;
   key: string;
   samples: Timed<ScalarValue>[];
   /** 发生过变化的采样（相邻取值不同，含 未知↔已知） */
@@ -225,7 +215,6 @@ export interface ValueTrack {
 /** 状态机轨（spec §9.5）。保持型 */
 export interface FsmTrack {
   name: string;
-  domain: string;
   key: string;
   samples: Timed<ScalarValue>[];
   transitions: { from: string | null; to: string; pos: Position; selfLoop: boolean }[];
@@ -253,25 +242,18 @@ export interface ResetMark {
  */
 export interface PipelineItem {
   track: string;
-  domain: string;
   /** 该条目持有的值 */
   value: ScalarValue | null;
   /** 起始记录位置（把该级设成此值的那条） */
   enter: Position;
-  /** 结束记录位置 = 把它改成别的值的那条记录（原样保留，可能是另一个域）；`null` = 文件结束时仍未变过 */
+  /** 结束记录位置 = 把它改成别的值的那条记录；`null` = 文件结束时仍未变过 */
   close: Position | null;
-  /** 是否跨域条目（enter 与 close 的域不同） */
-  crossDomain: boolean;
-  /** 同域驻留周期数（周期差）；跨域或未闭合时为 null */
+  /** 驻留周期数（周期差）；未闭合时为 null */
   latencyCycles: number | null;
-  /** 跨域且两端域都声明了 period 时的时间延迟（纳秒）；否则 null */
-  latencyNs: number | null;
-  /** 结束时刻在 enter 域上锚定的周期（占用度按 enter 域统计，spec §9.4） */
-  closeAnchorCycle: number | null;
   /** 起、止记录的全局序号，便于表格排序与定位 */
   enterSeq: number;
   closeSeq: number | null;
-  /** 起始记录是否异步（spec §6.7） */
+  /** 起始记录是否异步（spec §6.5） */
   async: boolean;
   /** 结束记录是否异步 */
   closeAsync: boolean;
@@ -279,13 +261,11 @@ export interface PipelineItem {
   closeLine: number | null;
 }
 
-/** 轨道（spec §7.4 的追踪键 = 轨道名，不含域） */
+/** 轨道（spec §7.4 的追踪键 = 轨道名） */
 export interface TrackInfo {
   name: string;
-  /** 绑定域：该轨道第一条记录所在的域 */
-  domain: string;
   items: PipelineItem[];
-  /** 该轨道记录覆盖的周期范围（按绑定域） */
+  /** 该轨道记录覆盖的周期范围 */
   firstCycle: number;
   lastCycle: number;
   /** 逐周期占用度（下标 = 周期号，稀疏区段为 0）；半开区间 [enter, close) */
@@ -302,14 +282,13 @@ export interface TrackInfo {
   closed: number;
   /** 文件结束时仍持有至今的条目数（spec §10.5 的 `open`） */
   open: number;
-  /** 已结束条目的驻留周期数（同域） */
+  /** 已结束条目的驻留周期数 */
   latencies: number[];
 }
 
-/** 瞬时事件（spec §7.6）。追踪键 = (域, 名字) */
+/** 瞬时事件（spec §7.6） */
 export interface EventTrack {
   name: string;
-  domain: string;
   key: string;
   samples: Timed<ScalarValue | null>[];
 }
@@ -327,7 +306,8 @@ export interface Trace {
     /** 每条记录的平均字节数 */
     bytesPerRecord: number;
   };
-  domains: Map<string, DomainInfo>;
+  /** 全局时钟状态（v1.0 单时钟，spec §6.2） */
+  clock: ClockInfo;
   records: EventRecord[];
   /** `[rst]` 复位标记（spec §7.7）：复位前的事件记录已被丢弃，这里只留下"丢了什么" */
   resets: ResetMark[];
@@ -343,13 +323,8 @@ export interface Trace {
   skipped: SkippedLine[];
   /** 末尾未以换行结束、被丢弃的残行原文（spec §10.1） */
   truncatedTail: string | null;
-  /** 是否出现过 `at=`（出现过的文件不保证位置单调，spec §6.3） */
+  /** 是否出现过 `at=`（出现过的文件不保证位置单调，spec §6.2） */
   hasAtOverride: boolean;
   /** 是否见到 `@end` */
   endSeen: boolean;
-}
-
-/** 追踪键：(域, 名字) ⇒ 稳定的字符串 key */
-export function trackKey(domain: string, name: string): string {
-  return `${domain}\u0000${name}`;
 }

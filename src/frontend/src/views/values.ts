@@ -4,10 +4,10 @@
  * 三条必须守住的口径：
  *  - 数值轨是**保持型**：一次采样后保持到下一次采样，画成阶梯（`stepPath`）
  *  - 含 `x`/`z` 的采样（`hasXZ`，如 `4'b10xz`、裸词 `x`）不是数字：空心/斜纹标记 + 原始字面量
- *  - `async=1` 的采样不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.7）
+ *  - `async=1` 的采样不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.5）
  *  - 字符串/符号（`str`/`sym`）不做强行坐标化：改成事件条 + 历史列表
  */
-import type { DomainInfo, ScalarValue, Timed, Trace, ValueTrack } from '../../../parser/src/index.ts';
+import type { ScalarValue, Timed, Trace, ValueTrack } from '../../../parser/src/index.ts';
 import { comparePosition } from '../../../parser/src/index.ts';
 import {
   card,
@@ -28,7 +28,7 @@ import {
   svgRoot,
 } from '../charts.ts';
 import { abortable, runChunked } from '../chunk.ts';
-import { cycleTime, fmtCompact, fmtInt, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
+import { cycleTime, fmtCompact, fmtInt, fmtPosition, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
 import { clampWindow, installChartViewport, type CycleWindow } from './viewport.ts';
 
 /** 保持型信号的一个采样点 */
@@ -62,11 +62,10 @@ const HISTORY_ROWS = 200;
 
 // ------------------------------------------------------------------ 取值
 
-/** 采样值的数值表示：`int`/`real`/`bits`（无 x/z）/`scaled` 可坐标化，含 x/z 或字符串则不可 */
+/** 采样值的数值表示：`int`/`real`/`bits`（无 x/z）可坐标化，含 x/z 或字符串则不可 */
 function numericOf(value: ScalarValue): number | null {
   if (value.num !== undefined) return value.num;
   if (value.big !== undefined) return Number(value.big);
-  if (value.scale !== undefined) return value.scale;
   return null;
 }
 
@@ -75,7 +74,7 @@ function kindLabel(value: ScalarValue): string {
   return value.kind;
 }
 
-/** `Timed` 不带行号：按记录序号建一次索引（seq 全局唯一，spec §6.3） */
+/** `Timed` 不带行号：按记录序号建一次索引（seq 全局唯一，spec §6.2） */
 let lineIndex: { trace: Trace; lines: Map<number, number> } | null = null;
 
 function lineOf(trace: Trace, seq: number): number {
@@ -102,7 +101,6 @@ interface XGeom {
   height: number;
   from: number;
   to: number;
-  domain: DomainInfo | undefined;
 }
 
 interface XAxis {
@@ -111,7 +109,7 @@ interface XAxis {
 }
 
 /**
- * 横轴一律是**周期数**，不是时刻：每条数值轨跟的是它自己时钟域的周期，
+ * 横轴一律是**周期数**，不是时刻：每条数值轨都在同一条时间轴上，
  * 多域并排时标 ns 会被误读成同一条时间轴。时刻仍在悬停标签里给（`sampleLines`）。
  */
 function drawXAxis(svg: SVGSVGElement, g: XGeom): XAxis {
@@ -260,21 +258,21 @@ function decimateItems(items: Item[], max: number): Item[] {
 }
 
 /** 采样点的统一提示文本（未知点、变化点、事件条共用同一口径） */
-function sampleLines(track: ValueTrack, item: Item, prev: Timed<ScalarValue> | null, ctx: ViewContext, useTime: boolean, note?: string): string {
-  const lines = [cycleTime(ctx.trace.domains.get(track.domain), item.cycle, useTime)];
+function sampleLines(track: ValueTrack, item: Item, prev: Timed<ScalarValue> | null, ctx: ViewContext, note?: string): string {
+  const lines = [cycleTime(item.cycle)];
   if (prev) lines.push(`${fmtValue(prev.value)} → ${fmtValue(item.sample.value)}`);
   else lines.push(`值 ${fmtValue(item.sample.value)}（${kindLabel(item.sample.value)}）`);
   if (item.sample.value.hasXZ) lines.push(`含未知位 x/z，不是数字：原始字面量 ${item.sample.value.raw}`);
   if (item.changed) lines.push('取值发生变化（与上一次采样不同）');
   if (note) lines.push(note);
-  lines.push(item.async ? '异步记录：不在时钟沿上，画在周期区间内部（spec §6.7）' : '时钟沿采样');
+  lines.push(item.async ? '异步记录：不在时钟沿上，画在周期区间内部（spec §6.5）' : '时钟沿采样');
   lines.push(`源文件第 ${lineOf(ctx.trace, item.sample.pos.seq)} 行`);
   return lines.join('\n');
 }
 
 // ------------------------------------------------------------------ 阶梯波形
 
-function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, available: number): HTMLElement {
+function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): HTMLElement {
   const color = colorFor(track.key);
   const sorted = [...track.samples].sort((a, b) => comparePosition(a.pos, b.pos));
   // derive.ts 为 changes 另建了对象，不能按引用比较：用位置序号匹配
@@ -292,7 +290,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
 
   const node = card(
     track.name,
-    `${track.domain} · ${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化 · ${kinds.join(' / ')}`,
+    `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化 · ${kinds.join(' / ')}`,
     [
       (() => {
         const btn = el('button', { class: 'btn btn-ghost', text: '详情' });
@@ -314,7 +312,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
     const holder = el('div', { class: 'chart-frame', 'data-key': key });
     const draw = (): void => {
       clear(holder);
-      holder.append(buildEventBarSvg(track, items, full, windowFor(key, full), ctx, useTime, available, color));
+      holder.append(buildEventBarSvg(track, items, full, windowFor(key, full), ctx, available, color));
     };
     draw();
     installChartViewport(holder, {
@@ -353,7 +351,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
   const holder = el('div', { class: 'chart-frame', 'data-key': key });
   const draw = (): void => {
     clear(holder);
-    holder.append(buildWaveSvg(track, items, full, windowFor(key, full), prevOf, ctx, useTime, available, color, min, max, hexAxis));
+    holder.append(buildWaveSvg(track, items, full, windowFor(key, full), prevOf, ctx, available, color, min, max, hexAxis));
   };
   draw();
   installChartViewport(holder, {
@@ -369,7 +367,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, useTime: boolean, ava
       el('span', { text: '实线阶梯 = 保持型取值；缩得很小时退化为折线' }),
       unknown.length > 0 ? el('span', { text: `◇ 空心斜纹标记 + 斜纹底 = 含未知位 x/z（${fmtInt(unknown.length)} 次）` }) : null,
       el('span', { text: '● 橙点 = 取值发生变化' }),
-      items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.7）' }) : null,
+      items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.5）' }) : null,
       el('span', { text: '横向滚轮平移 · Ctrl/⌘ + 滚轮缩放' }),
     ]),
   );
@@ -387,7 +385,6 @@ function buildWaveSvg(
   view: CycleWindow,
   prevOf: Map<Timed<ScalarValue>, Timed<ScalarValue> | null>,
   ctx: ViewContext,
-  useTime: boolean,
   available: number,
   color: string,
   min: number,
@@ -400,7 +397,7 @@ function buildWaveSvg(
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
   const span = Math.max(1e-9, view.to - view.from);
-  const x = drawXAxis(svg, { ...plot, from: view.from, to: view.to, domain: ctx.trace.domains.get(track.domain) });
+  const x = drawXAxis(svg, { ...plot, from: view.from, to: view.to });
   numericAxis(svg, { ...plot, min, max, label: '值', ...(hexAxis ? { format: hexTick } : {}) });
   const ys = linearScale(min, max, plot.y + plot.height, plot.y);
   const at = (item: Item): number => clamp(x.px(item.cycle) + (item.async ? 0.5 * x.unit(item.cycle) : 0), plot.x - 24, plot.x + plot.width + 24);
@@ -495,7 +492,7 @@ function buildWaveSvg(
       const y = g.prev ? ys(g.prev.num!) : plot.y + plot.height / 2;
       const marker = unknownMarker(at(item), y);
       const note = g.next ? `未知保持到周期 ${g.next.cycle}` : '未知保持到轨迹末尾';
-      bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, g.prev?.sample ?? null, ctx, useTime, note));
+      bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, g.prev?.sample ?? null, ctx, note));
       clickable(marker, () => {
         ctx.selection.set({ kind: 'value', key: track.key });
         inspectSample(track, item, g.prev?.sample ?? null, ctx);
@@ -522,7 +519,7 @@ function buildWaveSvg(
           'stroke-dasharray': '2 1.6',
         })
       : svgEl('circle', { cx: at(item), cy: ys(item.num), r: 3, fill: 'var(--warn)', stroke: 'var(--surface)', 'stroke-width': 1 });
-    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx, useTime));
+    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx));
     clickable(marker, () => {
       ctx.selection.set({ kind: 'value', key: track.key });
       inspectSample(track, item, from, ctx);
@@ -562,7 +559,6 @@ function buildEventBarSvg(
   full: CycleWindow,
   view: CycleWindow,
   ctx: ViewContext,
-  useTime: boolean,
   available: number,
   color: string,
 ): SVGSVGElement {
@@ -572,7 +568,7 @@ function buildEventBarSvg(
   const svg = svgRoot(width, height);
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
   const span = Math.max(1e-9, view.to - view.from);
-  const x = drawXAxis(svg, { ...plot, from: view.from, to: view.to, domain: ctx.trace.domains.get(track.domain) });
+  const x = drawXAxis(svg, { ...plot, from: view.from, to: view.to });
   const base = plot.y + plot.height / 2;
   const at = (item: Item): number => clamp(x.px(item.cycle) + (item.async ? 0.5 * x.unit(item.cycle) : 0), plot.x - 24, plot.x + plot.width + 24);
   void full;
@@ -646,7 +642,7 @@ function buildEventBarSvg(
             stroke: 'var(--surface)',
             'stroke-width': 1,
           });
-    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx, useTime));
+    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx));
     clickable(marker, () => {
       ctx.selection.set({ kind: 'value', key: track.key });
       inspectSample(track, item, from, ctx);
@@ -700,7 +696,6 @@ function inspectTrack(track: ValueTrack, ctx: ViewContext): void {
   ctx.inspect(
     `数值轨 · ${track.name}`,
     [
-      ['域', track.domain],
       ['追踪键', track.key],
       ['采样条数', fmtInt(sorted.length)],
       ['变化次数', fmtInt(track.changes.length)],
@@ -718,13 +713,13 @@ function inspectSample(track: ValueTrack, item: Item, prev: Timed<ScalarValue> |
   ctx.inspect(
     `采样 · ${track.name}`,
     [
-      ['位置', `${item.sample.pos.domain} #${item.sample.pos.cycle}.${item.sample.pos.phase}（seq ${item.sample.pos.seq}）`],
+      ['位置', fmtPosition(item.sample.pos)],
       ['值', fmtValue(item.sample.value)],
       ['语义类型', kindLabel(item.sample.value)],
       ['原始字面量', item.sample.value.raw],
       ['数值表示', item.num === null ? '不可坐标化' : String(item.num)],
       ['前一次取值', prev ? fmtValue(prev.value) : '（无更早采样）'],
-      ['采样来源', item.async ? '异步（不在时钟沿上，画在周期区间内部，spec §6.7）' : '时钟沿采样'],
+      ['采样来源', item.async ? '异步（不在时钟沿上，画在周期区间内部，spec §6.5）' : '时钟沿采样'],
       ['源文件行', String(lineOf(ctx.trace, item.sample.pos.seq))],
     ],
   );
@@ -754,7 +749,7 @@ function statsRow(tracks: ValueTrack[]): HTMLElement {
     statTile('采样条数', countLabel(samples), '保持型：采样后保持到下一次采样'),
     statTile('变化次数', countLabel(changes), '相邻取值不同（含 未知↔已知）'),
     statTile('含未知位', countLabel(unknown), 'x/z 采样（spec §4.5）'),
-    statTile('异步采样', countLabel(asyncCount), '不在时钟沿上（spec §6.7）'),
+    statTile('异步采样', countLabel(asyncCount), '不在时钟沿上（spec §6.5）'),
   ]);
 }
 
@@ -776,7 +771,7 @@ function changesCard(tracks: ValueTrack[], ctx: ViewContext): HTMLElement {
     });
     const rate = track.samples.length > 0 ? `${((track.changes.length / track.samples.length) * 100).toFixed(1)}%` : '—';
     const last = track.samples[track.samples.length - 1];
-    return [name, track.domain, fmtInt(track.changes.length), fmtInt(track.samples.length), rate, last ? fmtValue(last.value) : '—'];
+    return [name, fmtInt(track.changes.length), fmtInt(track.samples.length), rate, last ? fmtValue(last.value) : '—'];
   });
   node.body.append(dataTable(['数值轨', '域', '变化次数', '采样数', '变化率', '末值'], rows));
   return node.root;
@@ -809,18 +804,16 @@ function render(ctx: ViewContext): void {
     windowByChart.clear();
   }
   const all = [...ctx.trace.values.values()];
-  const shown = all
-    .filter((t) => ctx.options.domains.length === 0 || ctx.options.domains.includes(t.domain))
-    .sort((a, b) => (a.domain === b.domain ? a.name.localeCompare(b.name) : a.domain.localeCompare(b.domain)));
+  const shown = all.sort((a, b) => a.name.localeCompare(b.name));
 
   if (shown.length === 0) {
     const node = card('数值');
-    node.body.append(emptyState(all.length === 0 ? '这份轨迹没有 val 记录' : '当前时钟域筛选下没有数值轨'));
+    node.body.append(emptyState('这份轨迹没有 val 记录'));
     containerRef.append(node.root);
     return;
   }
 
-  const summary = card('总览', '按当前时钟域筛选');
+  const summary = card('总览', '全部数值轨');
   containerRef.append(summary.root);
 
   const charts = el('div', { class: 'grid grid-2' });
@@ -829,7 +822,7 @@ function render(ctx: ViewContext): void {
   // 逐条轨分片建卡：卡片多/采样多时不会一次性堵住主线程
   const jobs: (() => void)[] = [() => summary.body.append(statsRow(shown))];
   for (const track of shown) jobs.push(() => {
-    const node = waveformCard(track, ctx, ctx.options.useTimeAxis, available);
+    const node = waveformCard(track, ctx, available);
     const list = highlights.get(track.key) ?? [];
     list.push(node);
     highlights.set(track.key, list);

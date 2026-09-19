@@ -8,7 +8,6 @@ import { describe, expect, test } from 'bun:test';
 import { bubbleStats, equalRuns, eventCounters, itemsWithin, latencyStats, parseChiperf, scanValue } from '../src/index.ts';
 
 const SOURCE = `chiperf 1.0
-@domain default, period=1.0ns
 [clk] p
 [evt] "retire", 0x1
 [cnt] "retire"
@@ -65,9 +64,9 @@ describe('eventCounters', () => {
 
   test('同名 [cnt] 与 [evt] 是两条轨，键不撞车', () => {
     const keys = eventCounters(trace).map((t) => t.key);
-    expect(keys).toContain('default\u0000evt:retire');
-    expect(keys).not.toContain('default\u0000retire');
-    expect(trace.counters.get('default\u0000retire')!.source).toBe('cnt');
+    expect(keys).toContain('evt:retire');
+    expect(keys).not.toContain('retire');
+    expect(trace.counters.get('retire')!.source).toBe('cnt');
     expect(byName('retire').source).toBe('evt');
   });
 
@@ -114,7 +113,6 @@ describe('equalRuns', () => {
  * 周期编排：c1 起持有 → c3 变空 → c5 起持有 → c7 变空，域记录到 c9。
  */
 const RANGE_SOURCE = `chiperf 1.0
-@domain default, period=1.0ns
 [clk] p
 [pip] "t", 1
 [clk] n

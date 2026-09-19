@@ -5,7 +5,7 @@
  *  - 横轴是周期：周期 c 占据 `[scale(c), scale(c+1))`。
  *  - 所有泳道共用同一个周期映射；画布就是**可见窗口**（宽度 = 可视宽度），缩放改的是窗口覆盖多少周期，
  *    平移用滚轮；因此放大没有上限，缩小下限是整条轨迹铺满宽度。
- *  - `async=1` 的记录（`record.async`，spec §6.7）不吸附到时钟沿：一律画在**周期区间中点**
+ *  - `async=1` 的记录（`record.async`，spec §6.5）不吸附到时钟沿：一律画在**周期区间中点**
  *    （两个时钟沿之间），空心标记 + 虚线连回所在区间；另有一条「异步事件」泳道汇总。
  *  - 半开区间：流水线条目、占用度、状态带都按 `[enter, close)` 画；
  *    未闭合条目（`closed === null`）只画到 `track.lastCycle`，**不伪造**退出周期。
@@ -16,7 +16,6 @@
  *  - 绘制一律按行分片、片间让出主线程，可被新一轮重建取消；文字标签有全局预算
  */
 import type {
-  DomainInfo,
   EventRecord,
   Phase,
   PipelineItem,
@@ -27,6 +26,7 @@ import type {
   ValueTrack,
 } from '../../../parser/src/index.ts';
 import {
+  CLOCK_NAME,
   counterTotalAt,
   equalRuns,
   formatPosition,
@@ -59,7 +59,6 @@ import {
 import {
   fmtCompact,
   fmtInt,
-  fmtNs,
   fmtValue,
   type Selection,
   type View,
@@ -130,9 +129,25 @@ const BAR_MIN_PX = 2;
  */
 const BLOCK_FILL = 0.6;
 
-/** 时钟泳道的颜色：默认域用绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
+/** 时钟泳道的颜色：全局时钟画成绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
-const clockColor = (domain: string): string => (domain === 'default' ? CLOCK_COLOR : colorFor(domain));
+const CLOCK = CLOCK_NAME;
+
+/** v1.0 只有一条时间轴：把全局时钟包成与旧 `DomainInfo` 同形的视图对象，供泳道复用 */
+interface ClockMeta {
+  name: string;
+  cycles: number;
+  posEdges: number;
+  negEdges: number;
+  firstCycle: number;
+  lastCycle: number;
+}
+
+function clocks(trace: Trace): ClockMeta[] {
+  return [{ name: CLOCK, ...trace.clock }];
+}
+
+const clockColor = (_name: string): string => CLOCK_COLOR;
 
 const COLOR = {
   bubble: '#f97316',
@@ -154,7 +169,7 @@ const KIND_LABEL: Record<string, string> = {
 
 // ------------------------------------------------------------------ 类型
 
-/** 每个时钟域的沿集合（升序数组 + 集合，后者用于 O(1) 成员判断） */
+/** 时钟沿集合（升序数组 + 集合，后者用于 O(1) 成员判断） */
 interface DomainEdges {
   p: number[];
   n: number[];
@@ -665,7 +680,7 @@ function lowerBound(sorted: number[], v: number): number {
   return lo;
 }
 
-/** 记录在周期内的横向偏移：p 沿在起点、n 沿在中点；`async` 一律在区间中点（spec §6.7） */
+/** 记录在周期内的横向偏移：p 沿在起点、n 沿在中点；`async` 一律在区间中点（spec §6.5） */
 function phaseOffset(pos: Position, async: boolean): number {
   if (async) return 0.5;
   const phase: Phase = pos.phase;
@@ -727,7 +742,7 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
     return e;
   };
   for (const rec of trace.records) {
-    const name = rec.pos.domain;
+    const name = CLOCK;
     if (!visible.has(name)) continue;
     const c = rec.pos.cycle;
     if (c < from) from = c;
@@ -770,7 +785,7 @@ function scanRecords(trace: Trace, visible: Set<string>): Scan {
  * `scanRecords` 的结果按（轨迹, 可见域集合）缓存。
  *
  * 之前每次缩放/滚动重建都会重扫**全部**记录（几百万条），这是交互卡顿的主因之一；
- * 沿集合与异步记录只在换文件或切换时钟域时才可能变，缓存后重建不再碰 records。
+ * 沿集合与异步记录只在换文件时才可能变，缓存后重建不再碰 records。
  * WeakMap 与 Trace 同生命周期，换文件自然失效、可被 GC 回收。
  */
 const scanCache = new WeakMap<Trace, Map<string, Scan>>();
@@ -822,7 +837,7 @@ function cycleSurface(
     const raw = plot.scale.invert(clamp(userX, plot.x0, plot.x1));
     probe.cycle = clamp(Math.floor(raw), plot.from, plot.to);
     probe.half = raw - probe.cycle < 0.5 ? 0 : 1;
-    broadcastHover(ctx, { kind: 'cycle', domain, cycle: probe.cycle });
+    broadcastHover(ctx, { kind: 'cycle', cycle: probe.cycle });
     showHoverCycle(domain, probe.cycle, currentRow(), ctx);
   };
   // 高亮挂在这一行的**分组**上：鼠标压在条目/标记上时也要能高亮当前周期
@@ -832,12 +847,12 @@ function cycleSurface(
   // 捕获先于目标阶段执行，保证提示读到的是本拍刚算出的周期，而不是上一拍的残留
   host.addEventListener('mousemove', onMove as EventListener, true);
   host.addEventListener('mouseleave', () => hideHoverCycle());
-  node.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', domain, cycle: probe.cycle }));
+  node.addEventListener('click', () => ctx.selection.set({ kind: 'cycle', cycle: probe.cycle }));
   return hoverTarget(node, () => render(probe));
 }
 
 /**
- * 悬停高亮：把「鼠标所在行 + 该行所属时钟域的当前周期」框出来。
+ * 悬停高亮：把「鼠标所在行 + 当前周期」框出来。
  * 行头/泳道都可以拖拽排序，所以这里刻意不画横跨全图的竖线，避免误读成"全局时刻"。
  */
 function showHoverCycle(domain: string, cycle: number, rowAt: { key: string; y: number; h: number; color: string } | null, ctx: ViewContext): void {
@@ -913,20 +928,13 @@ function laneCanvas(g: SVGGElement, reg: Registry, y: number, h: number): SVGRec
 
 function build(host: HTMLElement, ctx: ViewContext): void {
   const trace = ctx.trace;
-  const visible = (name: string): boolean => ctx.options.domains.length === 0 || ctx.options.domains.includes(name);
-  const domains = [...trace.domains.values()].filter((d) => visible(d.name));
-  if (domains.length === 0) {
-    host.append(emptyState('没有可显示的时钟域'));
-    return;
-  }
+  const visible = (_name: string): boolean => true;
+  const domains = clocks(trace);
   // 每次渲染重新解析一次画布底色（跟着主题走），供 inkOn 判断字色
   backdrop = computeBackdrop(host);
-  const scan = scanRecordsCached(trace, new Set(domains.map((d) => d.name)));
+  const scan = scanRecordsCached(trace, new Set([CLOCK]));
 
-  // 时间轴换算的主域：优先 default，其次任意声明了 period 的可见域
-  const timeDomain =
-    domains.find((d) => d.name === 'default' && d.periodNs !== undefined) ?? domains.find((d) => d.periodNs !== undefined);
-  const primary = timeDomain ?? domains[0]!;
+  const primary = domains[0]!;
 
   // 轨迹的完整周期范围（视图窗口只能落在这个范围内）
   traceFrom = scan.from;
@@ -942,7 +950,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   const cardNode = card(
     '时间轴',
-    '共用横轴：周期（各时钟域独立计数）。行头可拖拽排序；Ctrl/⌘ + 滚轮缩放，横向滚动平移',
+    `共用横轴：周期（时钟 ${CLOCK}）。行头可拖拽排序；Ctrl/⌘ + 滚轮缩放，横向滚动平移`,
   );
   cardNode.body.append(buildStats(domains, scan, trace));
   // 先把卡片挂上去再量宽度：绘图区宽度 = 卡片内容宽度，之后不再依赖滚动容器
@@ -1183,15 +1191,15 @@ let paintReveal: HTMLElement | null = null;
 
 // ------------------------------------------------------------------ 卡片附属
 
-function buildStats(domains: DomainInfo[], scan: Scan, trace: Trace): HTMLElement {
+function buildStats(domains: ClockMeta[], scan: Scan, trace: Trace): HTMLElement {
   const names = new Set(domains.map((d) => d.name));
+  void names;
   let items = 0;
   let open = 0;
   let closed = 0;
   let bubbles = 0;
   let lanes = 0;
   for (const track of trace.tracks.values()) {
-    if (!names.has(track.domain)) continue;
     lanes++;
     items += track.items.length;
     open += track.open;
@@ -1201,10 +1209,10 @@ function buildStats(domains: DomainInfo[], scan: Scan, trace: Trace): HTMLElemen
   const clkEdges = [...scan.edges.values()].reduce((sum, e) => sum + e.p.length + e.n.length, 0);
   return el('div', { class: 'stat-row' }, [
     statTile('周期范围', `${countLabel(scan.from)} – ${countLabel(scan.to)}`, `${countLabel(scan.to - scan.from + 1)} 个周期槽`),
-    statTile('时钟域', countLabel(domains.length), `${countLabel(clkEdges)} 条 [clk] 记录`),
+    statTile(`时钟 ${CLOCK}`, countLabel(domains.length), `${countLabel(clkEdges)} 条 [clk] 记录`),
     statTile('流水线', countLabel(items), `${lanes} 轨道 · ${closed} 已结束 · ${open} 未闭合`),
     statTile('气泡周期', countLabel(bubbles), '占用度为 0 的活跃周期'),
-    statTile('异步记录', countLabel(scan.asyncRecords.length), '画在周期区间中点（spec §6.7）'),
+    statTile('异步记录', countLabel(scan.asyncRecords.length), '画在周期区间中点（spec §6.5）'),
   ]);
 }
 
@@ -1418,7 +1426,7 @@ function installRowDrag(node: HTMLElement, row: LaneRow): void {
 let axisGroup: SVGGElement | null = null;
 let gridGroup: SVGGElement | null = null;
 
-function axisLayer(svg: SVGSVGElement, plot: Plot, primary: DomainInfo, ctx: ViewContext): void {
+function axisLayer(svg: SVGSVGElement, plot: Plot, primary: ClockMeta, ctx: ViewContext): void {
   axisGroup = svgEl('g', {});
   svg.append(axisGroup);
 
@@ -1490,7 +1498,7 @@ function paintAxisGrid(reg: Registry): void {
 function buildRows(
   trace: Trace,
   ctx: ViewContext,
-  domains: DomainInfo[],
+  domains: ClockMeta[],
   scan: Scan,
   visible: (name: string) => boolean,
 ): LaneRow[] {
@@ -1500,30 +1508,30 @@ function buildRows(
 
   // 状态机：紧跟时钟之后 —— 它讲的是"这一拍这台机器在哪个状态"
   for (const fsm of trace.fsms.values()) {
-    if (visible(fsm.domain)) rows.push(fsmLane(fsm, ctx));
+    rows.push(fsmLane(fsm, ctx));
   }
 
   for (const track of trace.tracks.values()) {
-    if (visible(track.domain)) rows.push(pipLane(track, ctx));
+    rows.push(pipLane(track, ctx));
   }
 
   // 计数器：累计值是普通数值序列（默认折线），与数值行共用一套画法
   for (const track of trace.counters.values()) {
-    if (visible(track.domain)) rows.push(counterLane(track, ctx));
+    rows.push(counterLane(track, ctx));
   }
 
   // 数值：保持型阶梯（采样后一直保持到下一条），变化点单独标出来
   for (const track of trace.values.values()) {
-    if (visible(track.domain)) rows.push(valueLane(track, ctx));
+    rows.push(valueLane(track, ctx));
   }
 
   // 事件：evt 轨 + msg + （合并进来的）其它类型的异步记录 —— 不再单独占一节
   for (const track of trace.events.values()) {
-    if (visible(track.domain)) rows.push(eventLane(track.name, track.domain, track.key, track.samples, ctx));
+    rows.push(eventLane(track.name, CLOCK, track.key, track.samples, ctx));
   }
-  const messages = trace.messages.filter((m) => visible(m.pos.domain));
+  const messages = trace.messages;
   if (messages.length > 0) rows.push(messageLane(messages, ctx));
-  const otherAsync = scan.asyncRecords.filter((r) => r.kind !== 'evt' && visible(r.pos.domain));
+  const otherAsync = scan.asyncRecords.filter((r) => r.kind !== 'evt');
   if (otherAsync.length > 0) rows.push(asyncLane(otherAsync, ctx));
 
   allRows = rows;
@@ -1562,10 +1570,9 @@ function reorderRows(movingKeys: string[], targetKey: string, after: boolean): v
 
 // ------------------------------ 时钟
 
-function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
+function clockLane(d: ClockMeta, ctx: ViewContext, scan: Scan): LaneRow {
   const edges: DomainEdges =
     scan.edges.get(d.name) ?? { p: [], n: [], pSet: new Set(), nSet: new Set(), lo: d.firstCycle, hi: d.lastCycle, hasClk: false, synthN: false };
-  const period = d.periodNs !== undefined ? `${d.periodNs} ns/周期` : d.freqHz !== undefined ? `${fmtCompact(d.freqHz)}Hz` : '未声明 period/freq';
   return {
     kind: 'lane',
     key: `clk:${d.name}`,
@@ -1574,26 +1581,25 @@ function clockLane(d: DomainInfo, ctx: ViewContext, scan: Scan): LaneRow {
     label: d.name,
     color: colorFor(d.name),
     height: H.clk,
-    hover: { kind: 'cycle', domain: d.name, cycle: Math.max(1, d.firstCycle) },
+    hover: { kind: 'cycle', cycle: Math.max(1, d.firstCycle) },
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const high = y + 4;
       const low = y + h - 4;
       const win = visibleWindow(reg);
       g.append(svgEl('path', { d: clockPoints(edges, reg.plot, high, low, win.c0, win.c1), fill: 'none', stroke: clockColor(d.name), 'stroke-width': 1.4, 'stroke-linecap': 'square' }));
-      if (!edges.hasClk) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: `域 ${d.name} 没有 [clk] 记录` }));
+      if (!edges.hasClk) g.append(svgEl('text', { x: reg.plot.x0 + 6, y: y + h - 8, class: 'axis-label', text: `时钟 ${d.name} 没有 [clk] 记录` }));
       cycleSurface(hit, reg, d.name, ctx, (probe) => {
         const c = probe.cycle;
         const level = levelAt(edges, c, probe.half);
         const marks = [edges.pSet.has(c) ? 'p（上升）' : null, edges.nSet.has(c) ? 'n（下降）' : null].filter((v) => v !== null);
         return [
-          `时钟域 ${d.name}（${d.declared ? '@domain 声明' : '隐式建立'}）`,
+          `时钟 ${d.name}`,
           cycleLabel(c),
           `相位 ${probe.half === 0 ? 'p（上升沿之后）' : 'n（下降沿之后）'} · ${level ? '高电平' : '低电平'}`,
-          `周期参数：${period}`,
           `本周期沿：${marks.length > 0 ? marks.join(' + ') : '（无）'}`,
           ...(edges.synthN ? ['下降沿：文件里只写了 [clk] p，按相位模型补在周期中点'] : []),
-          `该域记录周期 ${d.firstCycle} – ${d.lastCycle} · 共 ${countLabel(d.cycles)} 周期`,
+          `记录周期 ${d.firstCycle} – ${d.lastCycle} · 共 ${countLabel(d.cycles)} 周期`,
         ].join('\n');
       });
     },
@@ -1710,7 +1716,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
     kind: 'lane',
     group: 'fsm',
     key: `fsm:${fsm.key}`,
-    domain: fsm.domain,
+    domain: CLOCK,
     label: fsm.name,
     color: COLOR.neutral,
     height: H.fsm,
@@ -1718,10 +1724,10 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
     hover: { kind: 'fsm', key: fsm.key },
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
-      cycleSurface(hit, reg, fsm.domain, ctx, (probe) => {
+      cycleSurface(hit, reg, CLOCK, ctx, (probe) => {
         const at = segmentAt(prep, probe.cycle);
         return [
-          `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+          `状态机 ${fsm.name}（域 ${CLOCK}）`,
           cycleLabel(probe.cycle),
           at ? `该周期状态：${at.state}（区段 ${at.start} – ${at.end}）` : '该周期没有状态记录',
           `状态集 {${fsm.stateSet.join(', ')}} · 转换 ${fsm.transitions.length} 次 · 采样 ${fsm.samples.length} 条`,
@@ -1731,7 +1737,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
       const win = visibleWindow(reg);
       // 低缩放：一列一个状态颜色（该列中心周期所在区段），连续同色合并成矩形
       if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
-        const domainEndC = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
+        const domainEndC = Math.min(reg.plot.to, ctx.trace.clock.lastCycle ?? reg.plot.to);
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
         const columns: LodColumn[] = [];
         // 指针由二分定位到窗口起点，放大后只走可见区段，不再从头扫
@@ -1751,7 +1757,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
       let drawn = 0;
       // 最后一段的状态会一直保持到轨迹结束（`fsm` 与 `val` 同为保持型），所以画到该域末尾；
       // 但它只到"最后一次上报"为止是确定的，之后纯属推断，所以照 §9.5 用开放样式区分。
-      const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(fsm.domain)?.lastCycle ?? reg.plot.to);
+      const domainEnd = Math.min(reg.plot.to, ctx.trace.clock.lastCycle ?? reg.plot.to);
       const openEnd = domainEnd + 1;
       // 只遍历与窗口相交的区段（段按 start 升序），放大后不再从头扫
       let sLo = lowerBound(prep.starts, win.c0);
@@ -1784,7 +1790,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
           shape,
           () =>
             [
-              `状态机 ${fsm.name}（域 ${fsm.domain}）`,
+              `状态机 ${fsm.name}（域 ${CLOCK}）`,
               `状态 ${seg.state}`,
               open
                 ? `周期 ${seg.start} → ${domainEnd}（一直保持到轨迹末尾）`
@@ -1836,9 +1842,9 @@ interface PipPrep {
 
 const pipPreps = new WeakMap<TrackInfo, PipPrep>();
 
-/** 条目在轨道上占据的末周期：已闭合取结束锚点，未闭合取 +∞（一直延续到域末尾） */
+/** 条目在轨道上占据的末周期：已闭合取结束周期，未闭合取 +∞（一直延续到域末尾） */
 function itemEnd(item: PipelineItem): number {
-  return item.close === null ? Number.POSITIVE_INFINITY : (item.closeAnchorCycle ?? item.enter.cycle);
+  return item.close === null ? Number.POSITIVE_INFINITY : item.close.cycle;
 }
 
 function pipLowerBound(items: PipelineItem[], v: number): number {
@@ -1927,11 +1933,11 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
     kind: 'lane',
     key: `pip:${track.name}`,
     group: 'pipeline',
-    domain: track.domain,
+    domain: CLOCK,
     label: track.name,
     color: laneColor,
     height: H.pip,
-    hover: { kind: 'cycle', domain: track.domain, cycle: Math.max(1, track.firstCycle) },
+    hover: { kind: 'cycle', cycle: Math.max(1, track.firstCycle) },
     menu: prep.menu,
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
@@ -1944,10 +1950,10 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       const truncated = inViewCount > shownCount;
       let tagsDrawn = 0;
       // 沿用/推断画面的上界：该域自己的末周期。域此后再无记录，画出去就是编造数据
-      const domainEnd = Math.min(reg.plot.to, ctx.trace.domains.get(track.domain)?.lastCycle ?? reg.plot.to);
-      cycleSurface(hit, reg, track.domain, ctx, (probe) =>
+      const domainEnd = Math.min(reg.plot.to, ctx.trace.clock.lastCycle ?? reg.plot.to);
+      cycleSurface(hit, reg, CLOCK, ctx, (probe) =>
         [
-          `轨道 ${track.name}（域 ${track.domain}）`,
+          `轨道 ${track.name}（域 ${CLOCK}）`,
           cycleLabel(probe.cycle),
           `本周期占用 ${track.occupancy.get(probe.cycle) ?? 0} · 到达 ${track.arrivals.get(probe.cycle) ?? 0} · 离开 ${track.departures.get(probe.cycle) ?? 0}`,
           `${track.items.length} 条目 · ${track.closed} 已结束 · ${track.open} 未闭合`,
@@ -2019,13 +2025,13 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
                     start <= track.lastCycle
                       ? `其中周期 ${start}${track.lastCycle > start ? ` – ${track.lastCycle}` : ''} 是实测的"没有内容"`
                       : null,
-                    `推断：第 ${track.lastCycle} 周期之后该轨道没有记录，而域 ${track.domain} 还在记录 —— 沿用"无内容"直到轨迹末尾`,
+                    `推断：第 ${track.lastCycle} 周期之后该轨道没有记录，而域 ${CLOCK} 还在记录 —— 沿用"无内容"直到轨迹末尾`,
                   ]
                     .filter((line): line is string => line !== null)
                     .join('\n')
                 : '这些周期该轨道没有在飞内容',
             ].join('\n'),
-          () => ctx.selection.set({ kind: 'cycle', domain: track.domain, cycle: start }),
+          () => ctx.selection.set({ kind: 'cycle', cycle: start }),
         );
         g.append(box);
       };
@@ -2057,13 +2063,12 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const color = pipItemColor(laneColor, item);
         const open = item.close === null;
         const enterX = reg.plot.scale(item.enter.cycle + phaseOffset(item.enter, item.async));
-        // 同域用结束周期作锚点；跨域锚点在起始域上（spec §9.4），不再叠加结束记录的相位；
-        // 未闭合只画到轨道末周期，**不伪造**结束周期
-        const anchor = item.closeAnchorCycle;
+        // 结束周期作锚点；未闭合只画到轨道末周期，**不伪造**结束周期
+        const anchor = item.close?.cycle ?? null;
         // 未闭合条目：内容一直在飞，画到该域末尾（不伪造退出周期，只是把已知状态延续下去）。
         // 这里用的是**半开**末端（与 anchor 同一口径）：要覆盖到第 domainEnd 周期，末端就得是 domainEnd + 1
         const endCycle = open || anchor === null ? domainEnd + 1 : anchor;
-        const endShift = open || anchor === null || item.crossDomain ? 0 : phaseOffset(item.close ?? item.enter, item.closeAsync);
+        const endShift = open || anchor === null ? 0 : phaseOffset(item.close ?? item.enter, item.closeAsync);
         const right = Math.max(reg.plot.x0 + 1, Math.min(reg.plot.scale(endCycle + endShift), reg.plot.x1));
         const x = clamp(enterX, reg.plot.x0, reg.plot.x1 - 1);
         const w = Math.max(1.5, right - x);
@@ -2132,18 +2137,16 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 
 function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
   const lines = [
-    `轨道 ${track.name}（域 ${track.domain}）`,
+    `轨道 ${track.name}`,
     `持有值 ${item.value ? formatScalarBy(item.value, valueFormatOf(`pip:${track.name}`)) : '（无）'}`,
   ];
   lines.push(`起始：${formatPosition(item.enter)}${item.async ? ' · 异步（画在区间中点）' : ''}`);
   lines.push(item.close ? `结束：${formatPosition(item.close)}${item.closeAsync ? ' · 异步' : ''}` : '结束：（没有后续记录改掉它）');
-  if (item.latencyCycles !== null) lines.push(`驻留：${item.latencyCycles} 周期（同域）`);
-  else if (item.latencyNs !== null) lines.push(`驻留：${fmtNs(item.latencyNs)}（跨域，两端域都声明了 period）`);
-  else if (item.crossDomain) lines.push('驻留：跨域条目不给周期延迟（spec §6.5），按两端位置读数');
+  if (item.latencyCycles !== null) lines.push(`驻留：${item.latencyCycles} 周期`);
   else lines.push('驻留：—（未闭合）');
   lines.push(`状态：${item.close ? '已结束（被后续记录改掉）' : '文件结束时仍持有'}`);
-  if (open) lines.push(`未闭合：该级一直持有到这个域的第 ${track.lastCycle} 周期之后（不伪造结束周期）`);
-  lines.push(`跨域 ${item.crossDomain ? '是' : '否'} · 起始 seq ${item.enterSeq}${item.closeSeq !== null ? ` · 结束 seq ${item.closeSeq}` : ''}`);
+  if (open) lines.push(`未闭合：该级一直持有到第 ${track.lastCycle} 周期之后（不伪造结束周期）`);
+  lines.push(`起始 seq ${item.enterSeq}${item.closeSeq !== null ? ` · 结束 seq ${item.closeSeq}` : ''}`);
   return lines.join('\n');
 }
 
@@ -2488,7 +2491,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
     {
       key: `val:${track.key}`,
       name: track.name,
-      domain: track.domain,
+      domain: CLOCK,
       group: 'value',
       color: colorFor(track.key),
       height: H.value,
@@ -2504,7 +2507,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
         const current = valueAt(track, cycle);
         const numericNow = current === null ? null : numericOf(current);
         return [
-          `数值 ${track.name}（域 ${track.domain}）`,
+          `数值 ${track.name}（域 ${CLOCK}）`,
           cycleLabel(cycle),
           `该周期末取值 ${current === null ? '（尚未采样）' : formatScalarBy(current, format)}`,
           numericNow === null || !prep.hasRange ? '' : `区间 ${fmtCompact(prep.rangeLo)} – ${fmtCompact(prep.rangeHi)}`,
@@ -2526,7 +2529,7 @@ function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
     {
       key: `cnt:${track.key}`,
       name: track.name,
-      domain: track.domain,
+      domain: CLOCK,
       group: 'counter',
       color: colorFor(track.key),
       height: H.cnt,
@@ -2541,7 +2544,7 @@ function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
         const total = counterTotalAt(track, cycle);
         const delta = track.deltaByCycle.get(cycle) ?? 0;
         return [
-          `计数器 ${track.name}（域 ${track.domain}）`,
+          `计数器 ${track.name}（域 ${CLOCK}）`,
           cycleLabel(cycle),
           `该周期末累计 ${total === null ? '（尚未采样）' : formatScalarBy(intScalar(total), format)}`,
           `本周期增量 ${delta === 0 ? '0' : `${delta > 0 ? '+' : ''}${fmtInt(delta)}`}`,
@@ -2785,7 +2788,7 @@ function markerMenuSections(event: MouseEvent, row: LaneRow): MenuSection[] {
       label: `在此处加标记（周期 ${cycle}，已有 ${current.length}/${MAX_MARKERS}）`,
       checked: false,
       pick: () => {
-        ctx.markers.add({ domain: row.domain, cycle });
+        ctx.markers.add({ cycle });
       },
     });
   }
@@ -2799,7 +2802,7 @@ function markerMenuSections(event: MouseEvent, row: LaneRow): MenuSection[] {
   const range = ctx.markers.range();
   return [
     {
-      title: range === null ? `标记（${current.length}/${MAX_MARKERS}）` : `标记：${range.domain} 周期 ${range.from} – ${range.to}`,
+      title: range === null ? `标记（${current.length}/${MAX_MARKERS}）` : `标记：周期 ${range.from} – ${range.to}`,
       items,
     },
   ];
@@ -2944,7 +2947,7 @@ function eventLane(
     label: name,
     color,
     height: H.evt,
-    hover: { kind: 'cycle', domain, cycle: samples.length > 0 ? samples[0]!.pos.cycle : 1 },
+    hover: { kind: 'cycle', cycle: samples.length > 0 ? samples[0]!.pos.cycle : 1 },
     draw(g, reg, y, h) {
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
@@ -3019,11 +3022,11 @@ function eventLane(
           `事件 ${name}（域 ${domain}）`,
           `位置：${formatPosition(sample.pos)}`,
           `取值：${fmtValue(sample.value)}`,
-          sample.async ? '异步记录：不吸附时钟沿，画在周期区间中点（spec §6.7）' : '',
+          sample.async ? '异步记录：不吸附时钟沿，画在周期区间中点（spec §6.5）' : '',
         ]
           .filter((line) => line !== '')
           .join('\n');
-        hoverTarget(tri, () => tip, () => ctx.selection.set({ kind: 'cycle', domain, cycle: c }));
+        hoverTarget(tri, () => tip, () => ctx.selection.set({ kind: 'cycle', cycle: c }));
         g.append(tri);
         count++;
       }
@@ -3038,7 +3041,7 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
     kind: 'lane',
     group: 'event',
     key: 'msg:all',
-    domain: messages[0]!.pos.domain,
+    domain: CLOCK,
     label: '消息',
     color: COLOR.msg,
     height: H.evt,
@@ -3046,7 +3049,7 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
       const win = visibleWindow(reg);
-      cycleSurface(hit, reg, messages[0]!.pos.domain, ctx, (probe) => {
+      cycleSurface(hit, reg, CLOCK, ctx, (probe) => {
         const here = byCycle.get(probe.cycle) ?? [];
         return [
           `消息（${messages.length} 条）`,
@@ -3067,21 +3070,21 @@ function messageLane(messages: { pos: Position; text: string; async: boolean }[]
           'stroke-width': 1.2,
         });
         const tip = [
-          `消息（域 ${msg.pos.domain}）`,
+          `消息（域 ${CLOCK}）`,
           `位置：${formatPosition(msg.pos)}`,
           `正文：${msg.text}`,
-          msg.async ? '异步记录：画在周期区间中点（spec §6.7）' : '',
+          msg.async ? '异步记录：画在周期区间中点（spec §6.5）' : '',
         ]
           .filter((line) => line !== '')
           .join('\n');
-        hoverTarget(dot, () => tip, () => ctx.selection.set({ kind: 'cycle', domain: msg.pos.domain, cycle: c }));
+        hoverTarget(dot, () => tip, () => ctx.selection.set({ kind: 'cycle', cycle: c }));
         g.append(dot);
       }
     },
   };
 }
 
-// ------------------------------ 异步事件汇总（spec §6.7）
+// ------------------------------ 异步事件汇总（spec §6.5）
 
 function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
   const byCycle = listByCycle(records, records);
@@ -3089,7 +3092,7 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
     kind: 'lane',
     group: 'event',
     key: 'async:all',
-    domain: records[0]!.pos.domain,
+    domain: CLOCK,
     label: '异步事件',
     color: COLOR.async,
     height: H.evt,
@@ -3097,7 +3100,7 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
       const hit = laneCanvas(g, reg, y, h);
       const plot = reg.plot;
       const win = visibleWindow(reg);
-      cycleSurface(hit, reg, records[0]!.pos.domain, ctx, (probe) => {
+      cycleSurface(hit, reg, CLOCK, ctx, (probe) => {
         const here = byCycle.get(probe.cycle) ?? [];
         return [
           `异步记录（${records.length} 条）`,
@@ -3127,9 +3130,9 @@ function asyncLane(records: EventRecord[], ctx: ViewContext): LaneRow {
           `异步${KIND_LABEL[rec.kind] ?? rec.kind}：${recordName(rec)}`,
           `位置：${formatPosition(rec.pos)}`,
           `原始行：${rec.raw.length > 160 ? `${rec.raw.slice(0, 160)}…` : rec.raw}`,
-          '画在周期区间中点（两个时钟沿之间），空心标记 + 虚线连回区间（spec §6.7）',
+          '画在周期区间中点（两个时钟沿之间），空心标记 + 虚线连回区间（spec §6.5）',
         ].join('\n');
-        hoverTarget(mark, () => tip, () => ctx.selection.set({ kind: 'cycle', domain: rec.pos.domain, cycle: c }));
+        hoverTarget(mark, () => tip, () => ctx.selection.set({ kind: 'cycle', cycle: c }));
         g.append(mark);
       }
     },
@@ -3142,7 +3145,7 @@ function laneTargets(sel: Selection): { lanes?: string[]; domain?: string } | nu
   if (sel === null) return null;
   switch (sel.kind) {
     case 'cycle':
-      return { domain: sel.domain };
+      return {};
     case 'item':
       return { lanes: [`pip:${sel.track}`] };
     case 'fsm':
@@ -3164,7 +3167,7 @@ function applyState(): void {
     const scope = laneTargets(target);
     if (!scope) return;
     for (const lane of reg.lanes) {
-      const hit = scope.lanes ? scope.lanes.includes(lane.key) : lane.domain === scope.domain;
+      const hit = scope.lanes ? scope.lanes.includes(lane.key) : scope.domain === undefined ? true : lane.domain === scope.domain;
       const value = hit ? keep : others;
       const prev = opacity.get(lane.key);
       opacity.set(lane.key, prev === undefined ? value : Math.min(prev, value));
@@ -3196,7 +3199,7 @@ function placeCycleMark(line: SVGLineElement, label: SVGTextElement | null, sel:
   if (label) {
     label.setAttribute('x', String(clamp(x, plot.x0 + 46, plot.x1 - 46)));
     label.setAttribute('display', '');
-    label.textContent = `${sel.domain} · ${cycleLabel(sel.cycle)}`;
+    label.textContent = `${CLOCK} · ${cycleLabel(sel.cycle)}`;
   }
 }
 

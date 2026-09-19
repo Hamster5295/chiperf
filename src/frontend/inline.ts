@@ -8,20 +8,24 @@
 
 const STYLE_MARKER = '/*__CHIPERF_STYLES__*/';
 const SCRIPT_MARKER = '/*__CHIPERF_SCRIPT__*/';
+const FAVICON_MARKER = '__CHIPERF_FAVICON__';
 
 export interface Artifacts {
   jsBundle: string;
   css: string;
   template: string;
+  /** favicon.svg 的 data URI（构建时读出并内联，保证产物自包含） */
+  favicon: string;
 }
 
 /** 把模板里的占位注释替换成真实内容（用函数替换，避免 `$&` 等被当成替换模式） */
 export function inlineIntoSingleFile(template: string, artifacts: Artifacts): string {
-  if (!template.includes(STYLE_MARKER) || !template.includes(SCRIPT_MARKER)) {
-    throw new Error(`index.html 模板缺少占位标记：${STYLE_MARKER} / ${SCRIPT_MARKER}`);
+  if (!template.includes(STYLE_MARKER) || !template.includes(SCRIPT_MARKER) || !template.includes(FAVICON_MARKER)) {
+    throw new Error(`index.html 模板缺少占位标记：${STYLE_MARKER} / ${SCRIPT_MARKER} / ${FAVICON_MARKER}`);
   }
   const hardenedJs = artifacts.jsBundle.replaceAll('</script', '<\\/script');
   return template
     .replace(STYLE_MARKER, () => artifacts.css)
-    .replace(SCRIPT_MARKER, () => hardenedJs);
+    .replace(SCRIPT_MARKER, () => hardenedJs)
+    .replace(FAVICON_MARKER, () => artifacts.favicon);
 }

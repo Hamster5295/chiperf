@@ -64,6 +64,9 @@ describe('dist/index.html（独立单文件）', () => {
     // 占位标记必须已经被替换掉
     expect(html).not.toContain('__CHIPERF_STYLES__');
     expect(html).not.toContain('__CHIPERF_SCRIPT__');
+    expect(html).not.toContain('__CHIPERF_FAVICON__');
+    // favicon 内联成 data URI
+    expect(html).toContain('rel="icon" href="data:image/svg+xml;base64,');
   });
 
   test('内联脚本里没有会被浏览器当成结束标签的 </script>', async () => {

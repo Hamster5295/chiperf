@@ -1,12 +1,13 @@
 /**
  * 视图层契约 —— 每个可视化视图都实现这个接口，由 app.ts 挂载与调度。
  */
-import type { DomainInfo, Position, ScalarValue, Trace } from '../../parser/src/index.ts';
+import type { Position, ScalarValue, Trace } from '../../parser/src/index.ts';
+import { CLOCK_NAME } from '../../parser/src/index.ts';
 
 /** 全局选中态：表格 ↔ 时间轴 ↔ 图表的联动锚点 */
 export type Selection =
   | { kind: 'item'; track: string; enterSeq: number }
-  | { kind: 'cycle'; domain: string; cycle: number }
+  | { kind: 'cycle'; cycle: number }
   | { kind: 'counter'; key: string }
   | { kind: 'value'; key: string }
   | { kind: 'fsm'; key: string }
@@ -27,7 +28,7 @@ export interface ViewContext {
   trace: Trace;
   /** 源文件信息（文件名、字节数、是否 gzip） */
   source: { name: string; bytes: number; gzip: boolean };
-  /** 全局筛选/选项（如"仅显示某域"），视图读取后自行应用 */
+  /** 全局筛选/选项，视图读取后自行应用 */
   options: AppOptions;
   selection: SelectionBus;
   /** 波形上的标记（最多两个）：两个标记之间的区间就是流水线/状态机统计的范围 */
@@ -39,10 +40,6 @@ export interface ViewContext {
 }
 
 export interface AppOptions {
-  /** 只显示这些域（空 = 全部） */
-  domains: string[];
-  /** 时间轴是否用真实时间轴（需要域声明 period/freq） */
-  useTimeAxis: boolean;
   /** 时间轴缩放：每周期像素；0 = 尚未设置（自动铺满），否则为用户显式选择的缩放 */
   zoom: number;
 }
@@ -81,17 +78,8 @@ export function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }
 
-export function fmtNs(ns: number): string {
-  if (ns === 0) return '0 ns';
-  const abs = Math.abs(ns);
-  if (abs >= 1e6) return `${(ns / 1e6).toFixed(3)} ms`;
-  if (abs >= 1e3) return `${(ns / 1e3).toFixed(3)} µs`;
-  if (abs >= 1) return `${ns.toFixed(3)} ns`;
-  return `${(ns * 1000).toFixed(1)} ps`;
-}
-
 export function fmtPosition(pos: Position): string {
-  return `${pos.domain} #${pos.cycle}${pos.phase === '-' ? '' : `.${pos.phase}`} (seq ${pos.seq})`;
+  return `${CLOCK_NAME} #${pos.cycle}${pos.phase === '-' ? '' : `.${pos.phase}`} (seq ${pos.seq})`;
 }
 
 export function fmtValue(value: ScalarValue | null | undefined): string {
@@ -100,10 +88,8 @@ export function fmtValue(value: ScalarValue | null | undefined): string {
   return value.text;
 }
 
-/** 周期 → 人类可读时间（域声明了 period/freq 时） */
-export function cycleTime(domain: DomainInfo | undefined, cycle: number, useTime: boolean): string {
+/** 周期 → 人类可读文本（v1.0 只有周期号，不再做时间换算） */
+export function cycleTime(cycle: number): string {
   if (cycle <= 0) return '时钟之前（周期 0）';
-  if (!useTime || !domain || domain.periodNs === undefined) return `周期 ${cycle}`;
-  // spec §8.2：第 k 个上升沿位于 (k-1)×period，所以周期 1 是 0 ns
-  return `周期 ${cycle} · ${fmtNs((cycle - 1) * domain.periodNs)}`;
+  return `周期 ${cycle}`;
 }

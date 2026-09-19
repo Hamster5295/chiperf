@@ -5,7 +5,7 @@
  * 任何时刻 DOM 里最多 ~50 个 <tr>，因此几万行也不会卡。
  * 排序键、选中键一律用**列键 / 字符串键**而不是行列下标，切数据集或换文件都不会错位。
  */
-import { cycleTime, fmtInt, fmtNs, fmtPosition, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
+import { cycleTime, fmtInt, fmtPosition, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
 import { clear, colorFor, el, hoverTarget } from '../charts.ts';
 import type {
   CounterTrack,
@@ -79,14 +79,12 @@ interface Dataset {
   columns: ColumnSpec<never>[];
   colKeys: string[];
   rows: unknown[];
-  hasDomain: boolean;
   /** 记录页的类型 chip（值为 null 时不显示） */
   kinds: { kind: string; count: number }[] | null;
   defaultSort: SortSpec[];
   cell(row: unknown, col: number): CellOut;
   sortValue(row: unknown, col: number): SortValue;
   selection(row: unknown): Selection;
-  domain(row: unknown): string | null;
   kindOf(row: unknown): string | null;
   titleOf(row: unknown): string;
   detail(row: unknown): [string, string][];
@@ -99,12 +97,10 @@ interface DatasetSpec<T> {
   empty: string;
   columns: ColumnSpec<T>[];
   rows(): T[];
-  hasDomain?: boolean;
   /** 需要类型快速过滤时给出候选类型 */
   kinds?: string[];
   defaultSort?: { key: string; dir: 1 | -1 }[];
   selection(row: T): Selection;
-  domain?(row: T): string | null;
   kindOf?(row: T): string | null;
   titleOf(row: T): string;
   detail(row: T): [string, string][];
@@ -136,13 +132,11 @@ function defineDataset<T>(spec: DatasetSpec<T>): Dataset {
     columns: spec.columns as unknown as ColumnSpec<never>[],
     colKeys: spec.columns.map((c) => c.key),
     rows,
-    hasDomain: spec.hasDomain ?? false,
     kinds,
     defaultSort,
     cell: (row, col) => spec.columns[col]!.cell(row as T),
     sortValue: (row, col) => sortKeyOf(spec.columns[col]!.cell(row as T)),
     selection: (row) => spec.selection(row as T),
-    domain: (row) => spec.domain?.(row as T) ?? null,
     kindOf: (row) => spec.kindOf?.(row as T) ?? null,
     titleOf: (row) => spec.titleOf(row as T),
     detail: (row) => spec.detail(row as T),
@@ -189,7 +183,7 @@ function selectionKey(sel: Selection): string | null {
     case 'item':
       return `item\u0000${sel.track}\u0000${sel.enterSeq}`;
     case 'cycle':
-      return `cycle\u0000${sel.domain}\u0000${sel.cycle}`;
+      return `cycle\u0000${sel.cycle}`;
     case 'counter':
       return `counter\u0000${sel.key}`;
     case 'value':
@@ -264,7 +258,6 @@ function recordDetail(r: EventRecord): [string, string][] {
     ['行号', String(r.line)],
     ['类型', r.kind],
     ['位置', fmtPosition(r.pos)],
-    ['域', r.pos.domain],
     ['周期', String(r.pos.cycle)],
     ['相位', phaseName(r.pos.phase)],
     ['async', r.async ? '是（不在时钟沿上，落在周期内部）' : '否'],
@@ -302,26 +295,23 @@ function recordDataset(trace: Trace): Dataset {
     title: '记录',
     hint: '逐条事件记录；async=1 的记录不是时钟沿采样得到的，落在周期内部',
     empty: '这份轨迹没有任何事件记录',
-    hasDomain: true,
     kinds: ['clk', 'cnt', 'val', 'pip', 'fsm', 'evt', 'msg'],
     defaultSort: [{ key: 'seq', dir: 1 }],
     rows: () => trace.records,
     kindOf: (r) => r.kind,
-    domain: (r) => r.pos.domain,
     selection: (r) => ({ kind: 'record', seq: r.seq }),
     titleOf: (r) => `${r.kind} · ${fmtPosition(r.pos)}`,
     columns: [
       { key: 'seq', label: 'seq', width: 66, align: 'right', cell: (r) => numeric(String(r.seq), r.seq) },
       { key: 'line', label: '行', width: 62, align: 'right', cell: (r) => numeric(String(r.line), r.line) },
       { key: 'kind', label: '类型', width: 64, cell: (r) => chip(r.kind, colorFor(r.kind), r.kind) },
-      { key: 'domain', label: '域', width: 96, mono: true, cell: (r) => ({ t: r.pos.domain, mono: true, color: colorFor(r.pos.domain) }) },
       {
         key: 'cycle',
         label: '周期',
         width: 148,
         align: 'right',
         cell: (r) => ({
-          t: cycleTime(trace.domains.get(r.pos.domain), r.pos.cycle, state.ctx?.options.useTimeAxis ?? false),
+          t: cycleTime(r.pos.cycle),
           sort: r.pos.cycle,
         }),
       },
@@ -345,15 +335,11 @@ type ItemRow = { item: PipelineItem };
 function itemDetail(item: PipelineItem): [string, string][] {
   return [
     ['轨道', item.track],
-    ['域', item.enter.domain],
     ['持有值', item.value ? `${fmtValue(item.value)}（原始 ${item.value.raw}）` : DASH],
     ['起始位置', fmtPosition(item.enter)],
     ['结束位置', item.close ? fmtPosition(item.close) : DASH],
     ['状态', item.close ? '已结束（被后续记录改掉）' : '文件结束时仍持有至今'],
     ['驻留周期', item.latencyCycles !== null ? `${item.latencyCycles} 周期` : DASH],
-    ['时间差', item.latencyNs !== null ? fmtNs(item.latencyNs) : DASH],
-    ['结束锚定周期', item.closeAnchorCycle !== null ? String(item.closeAnchorCycle) : DASH],
-    ['跨域', item.crossDomain ? '是' : '否'],
     ['起始记录异步', item.async ? '是' : '否'],
     ['结束记录异步', item.closeAsync ? '是' : '否'],
     ['起始行号', String(item.enterLine)],
@@ -368,19 +354,16 @@ function itemDataset(trace: Trace): Dataset {
     title: '轨道条目',
     hint: '每条 pip 条目一行：该级连续持有同一个值的那一段；占用区间是半开区间 [enter, close)',
     empty: '这份轨迹没有 pip 条目',
-    hasDomain: true,
     defaultSort: [{ key: 'enter', dir: 1 }],
     rows: () => {
       const out: ItemRow[] = [];
       for (const track of trace.tracks.values()) for (const item of track.items) out.push({ item });
       return out;
     },
-    domain: (r) => r.item.enter.domain,
     selection: (r) => ({ kind: 'item', track: r.item.track, enterSeq: r.item.enterSeq }),
     titleOf: (r) => `条目 ${r.item.track} #${r.item.enterSeq}`,
     columns: [
       { key: 'track', label: '轨道', width: 130, mono: true, cell: (r) => ({ t: r.item.track, mono: true, color: colorFor(r.item.track) }) },
-      { key: 'domain', label: '域', width: 92, mono: true, cell: (r) => ({ t: r.item.enter.domain, mono: true }) },
       {
         key: 'value',
         label: '持有值',
@@ -397,7 +380,7 @@ function itemDataset(trace: Trace): Dataset {
         cell: (r) => {
           const close = r.item.close;
           if (!close) return { t: DASH, sort: null };
-          return numeric(`${close.cycle}${r.item.crossDomain ? ` (${close.domain})` : ''}`, close.cycle);
+          return numeric(String(close.cycle), close.cycle);
         },
       },
       {
@@ -407,7 +390,6 @@ function itemDataset(trace: Trace): Dataset {
         align: 'right',
         cell: (r) => {
           if (r.item.latencyCycles !== null) return numeric(String(r.item.latencyCycles), r.item.latencyCycles);
-          if (r.item.latencyNs !== null) return { t: fmtNs(r.item.latencyNs), sort: r.item.latencyNs, mono: true };
           return { t: DASH, sort: null };
         },
       },
@@ -417,7 +399,6 @@ function itemDataset(trace: Trace): Dataset {
         width: 82,
         cell: (r) => (r.item.close ? chip('已结束', 'var(--ok)', 0) : chip('未闭合', 'var(--warn)', 2)),
       },
-      { key: 'cross', label: '跨域', width: 66, cell: (r) => yesNo(r.item.crossDomain) },
       {
         key: 'async',
         label: '异步',
@@ -440,19 +421,16 @@ function counterDataset(trace: Trace): Dataset {
     title: '计数器',
     hint: '追踪键 = (域, 名字)；abs= 记录只置总量、不贡献增量',
     empty: '这份轨迹没有计数器',
-    hasDomain: true,
     defaultSort: [{ key: 'name', dir: 1 }],
     rows: () =>
       [...trace.counters.values()].map((track) => ({
         track,
         absReads: track.samples.reduce((n, s) => (s.abs !== null ? n + 1 : n), 0),
       })),
-    domain: (r) => r.track.domain,
     selection: (r) => ({ kind: 'counter', key: r.track.key }),
-    titleOf: (r) => `计数器 ${r.track.name} @ ${r.track.domain}`,
+    titleOf: (r) => `计数器 ${r.track.name}`,
     columns: [
       { key: 'name', label: '名字', width: 170, mono: true, cell: (r) => ({ t: r.track.name, mono: true }) },
-      { key: 'domain', label: '域', width: 96, mono: true, cell: (r) => ({ t: r.track.domain, mono: true, color: colorFor(r.track.domain) }) },
       { key: 'total', label: '终值', width: 110, align: 'right', cell: (r) => numeric(String(r.track.total), r.track.total) },
       { key: 'samples', label: '采样数', width: 84, align: 'right', cell: (r) => numeric(String(r.track.samples.length), r.track.samples.length) },
       { key: 'abs', label: 'abs 回读', width: 86, align: 'right', cell: (r) => numeric(String(r.absReads), r.absReads) },
@@ -480,7 +458,6 @@ function counterDataset(trace: Trace): Dataset {
       const last = r.track.samples[r.track.samples.length - 1];
       return [
         ['计数器', r.track.name],
-        ['域', r.track.domain],
         ['追踪键', r.track.key],
         ['终值', String(r.track.total)],
         ['采样数', String(r.track.samples.length)],
@@ -502,19 +479,16 @@ function valueDataset(trace: Trace): Dataset {
     title: '数值',
     hint: '保持型数值轨：采样后一直保持到下一条记录',
     empty: '这份轨迹没有数值轨',
-    hasDomain: true,
     defaultSort: [{ key: 'name', dir: 1 }],
     rows: () =>
       [...trace.values.values()].map((track) => ({
         track,
         last: track.samples[track.samples.length - 1],
       })),
-    domain: (r) => r.track.domain,
     selection: (r) => ({ kind: 'value', key: r.track.key }),
-    titleOf: (r) => `数值 ${r.track.name} @ ${r.track.domain}`,
+    titleOf: (r) => `数值 ${r.track.name}`,
     columns: [
       { key: 'name', label: '名字', width: 180, mono: true, cell: (r) => ({ t: r.track.name, mono: true }) },
-      { key: 'domain', label: '域', width: 96, mono: true, cell: (r) => ({ t: r.track.domain, mono: true, color: colorFor(r.track.domain) }) },
       { key: 'samples', label: '采样数', width: 84, align: 'right', cell: (r) => numeric(String(r.track.samples.length), r.track.samples.length) },
       { key: 'changes', label: '变化数', width: 84, align: 'right', cell: (r) => numeric(String(r.track.changes.length), r.track.changes.length) },
       {
@@ -534,7 +508,6 @@ function valueDataset(trace: Trace): Dataset {
     ],
     detail: (r) => [
       ['数值轨', r.track.name],
-      ['域', r.track.domain],
       ['追踪键', r.track.key],
       ['采样数', String(r.track.samples.length)],
       ['变化数', String(r.track.changes.length)],
@@ -554,7 +527,6 @@ function fsmDataset(trace: Trace): Dataset {
     title: '状态机跳转',
     hint: '逐条状态跳转；自环是状态没变但仍然写下的记录',
     empty: '这份轨迹没有状态机',
-    hasDomain: true,
     defaultSort: [{ key: 'cycle', dir: 1 }],
     rows: () => {
       const out: FsmRow[] = [];
@@ -565,17 +537,15 @@ function fsmDataset(trace: Trace): Dataset {
       }
       return out;
     },
-    domain: (r) => r.fsm.domain,
     selection: (r) => ({ kind: 'fsm', key: r.fsm.key }),
     titleOf: (r) => `跳转 ${r.fsm.name}: ${r.from ?? '(初始)'} → ${r.to}`,
     columns: [
       { key: 'fsm', label: '状态机', width: 160, mono: true, cell: (r) => ({ t: r.fsm.name, mono: true, color: colorFor(r.fsm.name) }) },
-      { key: 'domain', label: '域', width: 96, mono: true, cell: (r) => ({ t: r.fsm.domain, mono: true }) },
       { key: 'from', label: 'from', width: 130, mono: true, cell: (r) => ({ t: r.from ?? '(初始)', mono: true, sort: r.from }) },
       { key: 'to', label: 'to', width: 130, mono: true, cell: (r) => ({ t: r.to, mono: true, sort: r.to }) },
       { key: 'cycle', label: '周期', width: 92, align: 'right', cell: (r) => numeric(String(r.cycle), r.cycle) },
       { key: 'phase', label: '相位', width: 58, cell: (r) => ({ t: r.phase, sort: r.phase }) },
-      { key: 'loop', label: '自环', width: 70, cell: (r) => (r.selfLoop ? chip('自环', 'var(--warn)', 1) : { t: DASH, sort: 0 }) },
+      { key: 'loop', label: '自环', width: 70, cell: (r) => (r.selfLoop ? chip('自环', 'var(--accent)', 1) : { t: DASH, sort: 0 }) },
       {
         key: 'dwell',
         label: 'to 驻留',
@@ -586,7 +556,6 @@ function fsmDataset(trace: Trace): Dataset {
     ],
     detail: (r) => [
       ['状态机', r.fsm.name],
-      ['域', r.fsm.domain],
       ['追踪键', r.fsm.key],
       ['from', r.from ?? '(初始)'],
       ['to', r.to],
@@ -609,19 +578,16 @@ function eventDataset(trace: Trace): Dataset {
     title: '事件',
     hint: '瞬时事件（evt）：每一次到达算一行',
     empty: '这份轨迹没有瞬时事件',
-    hasDomain: true,
     defaultSort: [{ key: 'cycle', dir: 1 }],
     rows: () => {
       const out: EventRow[] = [];
       for (const track of trace.events.values()) for (const sample of track.samples) out.push({ track, sample });
       return out;
     },
-    domain: (r) => r.track.domain,
     selection: (r) => ({ kind: 'record', seq: r.sample.pos.seq }),
     titleOf: (r) => `事件 ${r.track.name} · ${fmtPosition(r.sample.pos)}`,
     columns: [
       { key: 'name', label: '名字', width: 190, mono: true, cell: (r) => ({ t: r.track.name, mono: true, color: colorFor(r.track.name) }) },
-      { key: 'domain', label: '域', width: 96, mono: true, cell: (r) => ({ t: r.track.domain, mono: true }) },
       {
         key: 'payload',
         label: '载荷',
@@ -635,7 +601,6 @@ function eventDataset(trace: Trace): Dataset {
     ],
     detail: (r) => [
       ['事件', r.track.name],
-      ['域', r.track.domain],
       ['追踪键', r.track.key],
       ['载荷', r.sample.value ? fmtValue(r.sample.value) : DASH],
       ['载荷原始记号', r.sample.value?.raw ?? DASH],
@@ -744,7 +709,6 @@ interface State {
   visible: number[];
   hidden: Set<string>;
   query: string;
-  domain: string;
   kinds: Set<string>;
   sort: SortSpec[];
   filtered: Row[];
@@ -766,7 +730,6 @@ const state: State = {
   visible: [],
   hidden: new Set(),
   query: '',
-  domain: '',
   kinds: new Set(),
   sort: [],
   filtered: [],
@@ -803,7 +766,6 @@ function ensureDataset(ctx: ViewContext): Dataset {
     state.rows = ds.rows.map((raw, index) => ({ raw, index, hay: '', haySig: '' }));
     state.hidden = new Set();
     state.kinds = new Set();
-    state.domain = '';
     state.query = '';
     state.sort = ds.defaultSort.map((s) => ({ ...s }));
     state.range = { start: -1, end: -1 };
@@ -844,7 +806,6 @@ function applyFilter(): void {
   const query = state.query.trim().toLowerCase();
   const out: Row[] = [];
   for (const row of state.rows) {
-    if (state.domain !== '' && ds.domain(row.raw) !== state.domain) continue;
     if (state.kinds.size > 0) {
       const kind = ds.kindOf(row.raw);
       if (kind === null || !state.kinds.has(kind)) continue;
@@ -1093,21 +1054,6 @@ function buildFilterBar(ds: Dataset, ctx: ViewContext): HTMLElement {
   });
   bar.append(el('div', { class: 'toolbar-group' }, [el('span', { class: 'toolbar-label', text: '搜索' }), input]));
 
-  // 只看域：选项来自 ctx.options.domains（空 = 全部域）
-  const choices = ctx.options.domains.length > 0 ? ctx.options.domains.filter((d) => ctx.trace.domains.has(d)) : [...ctx.trace.domains.keys()];
-  if (ds.hasDomain && choices.length > 0) {
-    const select = el('select', { style: SELECT_STYLE });
-    select.append(el('option', { value: '', text: `全部域（${choices.length}）` }));
-    for (const name of choices) select.append(el('option', { value: name, text: `${name} · ${fmtInt(ctx.trace.domains.get(name)?.cycles ?? 0)} 周期` }));
-    select.value = choices.includes(state.domain) ? state.domain : '';
-    state.domain = select.value;
-    select.addEventListener('change', () => {
-      state.domain = select.value;
-      applyFilter();
-    });
-    bar.append(el('div', { class: 'toolbar-group' }, [el('span', { class: 'toolbar-label', text: '只看域' }), select]));
-  }
-
   // 记录页的类型快速过滤
   if (ds.kinds && ds.kinds.length > 1) {
     const group = el('div', { class: 'toolbar-group' }, [el('span', { class: 'toolbar-label', text: '类型' })]);
@@ -1163,7 +1109,7 @@ function buildFilterBar(ds: Dataset, ctx: ViewContext): HTMLElement {
   const reset = el('button', { class: 'btn btn-ghost', text: '重置' });
   reset.addEventListener('click', () => {
     state.query = '';
-    state.domain = '';
+
     state.kinds = new Set();
     state.hidden = new Set();
     state.sort = ds.defaultSort.map((s) => ({ ...s }));
