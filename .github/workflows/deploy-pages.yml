@@ -44,11 +44,13 @@ jobs:
       #   /chiperf/            -> 跳转到文档首页
       #   /chiperf/docs/       <- 文档站
       #   /chiperf/visualize   <- 可视化器（无末尾斜杠）
+      #   /chiperf/llms.txt    <- 给 Agent 的 logger 编写指示
       - name: Assemble site
         run: |
           mkdir -p _site/docs
           cp -r docs/.vitepress/dist/. _site/docs/
           cp dist/index.html _site/visualize.html
+          cp docs/llms.txt _site/llms.txt
           cat > _site/index.html <<'HTML'
           <!doctype html>
           <html lang="zh-CN">
