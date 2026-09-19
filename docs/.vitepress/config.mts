@@ -1,7 +1,15 @@
 import { defineConfig } from "vitepress";
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 // 部署到 GitHub Pages 的路径：https://<user>.github.io/chiperf/docs/
 const DOCS_BASE = process.env.DOCS_BASE ?? '/chiperf/docs/'
+
+// 与可视化器共用同一个 favicon（单一来源：src/frontend/favicon.svg），
+// 以 data URI 内联，避免再往 public/ 里维护一份拷贝。
+const FAVICON = `data:image/svg+xml;base64,${readFileSync(
+    fileURLToPath(new URL('../../src/frontend/favicon.svg', import.meta.url)),
+).toString('base64')}`
 
 export default defineConfig({
     base: DOCS_BASE,
@@ -16,6 +24,7 @@ export default defineConfig({
     ignoreDeadLinks: [/\.chiperf$/],
     head: [
         ['meta', { name: 'theme-color', content: '#6f42c1' }],
+        ['link', { rel: 'icon', type: 'image/svg+xml', href: FAVICON }],
     ],
     markdown: {
         // chiperf / ebnf 无内置语法高亮：注册为纯文本语法，避免构建告警

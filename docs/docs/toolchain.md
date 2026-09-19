@@ -16,4 +16,4 @@ Chiperf 项目不仅规定 Chiperf 文件格式，同时也提供 (或计划提�
 
 ## 可视化器
 
-- [`src/frontend`](https://github.com/Hamster5295/chiperf/tree/main/src/frontend)
+- 源代码: [`src/frontend`](https://github.com/Hamster5295/chiperf/tree/main/src/frontend)

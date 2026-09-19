@@ -1,6 +1,5 @@
 chiperf 1.0
 @meta design="robustness fixture" note="故意注入未知类型/未知指令/未知属性/非法记录/语义异常"
-@domain core, period=1.0ns, note="声明了 core；文件里故意把一条写成 cor 来触发域拼写诊断"
 # 期望的解析结果见 docs/examples.md（每个注入点标注了期望诊断）
 
 @unknown_directive foo=1                     # skipped_unknown_directive
@@ -18,9 +17,9 @@ chiperf 1.0
 [clk] n                                      # redundant_edge
 [cnt] "Retired", -10                         # negative_total
 [fsm] "ctrl", IDLE
-[fsm] "ctrl", IDLE                           # self_transition
+[fsm] "ctrl", IDLE                           # 自环：正常写法，不是异常
 [val] "PC", 4'b10xz                          # 4 态值：未知位/高阻位
 [msg] tail text with, commas and # a hash are literal
-[cnt] "Retired", dom="cor"                   # undeclared_domain（把 core 写成 cor -> 新建了一条 cor 时间轴）
+[cnt] "Other"                                # 正常累加
 [clk] p, async=1                             # async_on_clk（时钟沿本身不可能异步：属性被忽略，沿仍然生效）
 @end

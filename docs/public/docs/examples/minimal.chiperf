@@ -1,6 +1,5 @@
 chiperf 1.0
 @meta design="demo" note="AGENT.md 中的示例；补上可选的版本行与 @end"
-@domain default, period=1.0ns
 
 # ---- 周期 1 ----
 [clk] p

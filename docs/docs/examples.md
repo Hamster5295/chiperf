@@ -1,8 +1,8 @@
 # 示例
 
-本页给出 9 个 Chiperf 示例文件。每个文件都先完整地列出内容，再说明每个记录在什么时候生效、能算出哪些结果。文中的数字都可以对照[格式规范](spec/v1.0.md)自行复核。
+本页给出 8 个 Chiperf 示例文件。每个文件都先完整地列出内容，再说明每个记录在什么时候生效、能算出哪些结果。文中的数字都可以对照[格式规范](spec/v1.0.md)自行复核。
 
-记录的位置写作 `(时间线, 周期, 相位, 序号)`。`@domain` 声明的“时间线”可以理解为一组独立的时间刻度；`p` 表示上升沿所在的前半段，`n` 表示下降沿所在的后半段；序号是该周期内的第几条记录。
+记录的位置写作 `(周期, 相位, 序号)`。`p` 表示上升沿所在的前半段，`n` 表示下降沿所在的后半段；序号是该周期内的第几条记录。v1.0 只有一条全局时钟（`clock`），不再有时钟域。
 
 > 本段几乎由 LLM 完成，仅供参考，其可读性可能并不高
 
@@ -11,11 +11,10 @@
 | 文件 | 记录条数 | 提示 | 主要演示 |
 | --- | --- | --- | --- |
 | `minimal.chiperf` | 8 | 无 | 最短的完整文件：一次上升沿、一次下降沿、计数、数值、一个流水级 |
-| `rv32i-pipeline.chiperf` | 102 | `self_transition` ×1 | 五级流水线：分支猜错、丢弃指令、计数器、状态机 |
-| `multiclk.chiperf` | 25 | `cross_domain` ×1 | 两个时钟同时存在；同名但属于不同时钟的计数互不影响 |
+| `rv32i-pipeline.chiperf` | 102 | 无 | 五级流水线：分支猜错、丢弃指令、计数器、状态机 |
 | `postprocess.chiperf` | 11 | 无 | 没有任何时钟记录，时间全部由 `at=` 指定 |
 | `async-events.chiperf` | 17 | 无 | `async=1`：事件不在时钟跳变的那一刻发生 |
-| `faults.chiperf` | 17 | 5 类提示各 ×1；跳过 3 行 | 各类错误写法，以及解析器应该怎么应对 |
+| `faults.chiperf` | 17 | 4 类提示各 ×1；跳过 3 行 | 各类错误写法，以及解析器应该怎么应对 |
 | `truncated.chiperf` | 7 | `truncated_tail`、`eof_without_end_marker` | 写到一半被中断的文件仍然可以使用 |
 | `future-version.chiperf` | 2 | 未知主版本 | 遇到更高的主版本号时应当拒绝 |
 | `reset.chiperf` | 4 | `rst_boundary` | 系统复位后，此前的记录全部作废 |
@@ -27,7 +26,6 @@
 ```chiperf
 chiperf 1.0
 @meta design="demo" note="AGENT.md 中的示例；补上可选的版本行与 @end"
-@domain default, period=1.0ns
 
 # ---- 周期 1 ----
 [clk] p
@@ -47,18 +45,18 @@ chiperf 1.0
 
 | 序号 | 记录 | 位置 | 结果 |
 | --- | --- | --- | --- |
-| 1 | `[clk] p` | `(default, 1, p, 1)` | 第 1 个上升沿 |
-| 2 | `[cnt] "Branch Miss"` | `(default, 1, p, 2)` | 该计数变为 1（没写增量时默认为 +1） |
-| 3 | `[cnt] "Cache Hit"` | `(default, 1, p, 3)` | 该计数变为 1 |
-| 4 | `[val] "PC", 0x800001d0` | `(default, 1, p, 4)` | `PC` 从这一刻起保持 0x800001d0 |
-| 5 | `[pip] "IF", 0x1234abcd` | `(default, 1, p, 5)` | `IF` 开始持有 0x1234abcd |
-| 6 | `[pip] "IF", bubble` | `(default, 1, p, 6)` | `IF` 在同一周期又变空 |
-| 7 | `[clk] n` | `(default, 1, n, 7)` | 同一周期进入后半段 |
-| 8 | `[clk] p` | `(default, 2, p, 8)` | 进入第 2 个周期 |
+| 1 | `[clk] p` | `(1, p, 1)` | 第 1 个上升沿 |
+| 2 | `[cnt] "Branch Miss"` | `(1, p, 2)` | 该计数变为 1（没写增量时默认为 +1） |
+| 3 | `[cnt] "Cache Hit"` | `(1, p, 3)` | 该计数变为 1 |
+| 4 | `[val] "PC", 0x800001d0` | `(1, p, 4)` | `PC` 从这一刻起保持 0x800001d0 |
+| 5 | `[pip] "IF", 0x1234abcd` | `(1, p, 5)` | `IF` 开始持有 0x1234abcd |
+| 6 | `[pip] "IF", bubble` | `(1, p, 6)` | `IF` 在同一周期又变空 |
+| 7 | `[clk] n` | `(1, n, 7)` | 同一周期进入后半段 |
+| 8 | `[clk] p` | `(2, p, 8)` | 进入第 2 个周期 |
 
 ### 能算出什么
 
-- 时间线 `default`：2 个上升沿、1 个下降沿、共 2 个周期；周期为 1.0ns，所以两个上升沿分别在 0ns 和 1.0ns。
+- 时钟 `clock`：2 个上升沿、1 个下降沿、共 2 个周期。
 - 计数：`Branch Miss` 与 `Cache Hit` 各为 1，都发生在第 1 周期的前半段。
 - 数值：`PC` 从第 1 周期前半段起一直是 0x800001d0；在这之前是未知。
 - 观察项 `IF`：第 5、6 行在同一周期一进一出，所以它停留了 0 个周期。按照“只算开始、不算结束”的规则，它不计入任何周期的同时占用数量。
@@ -71,7 +69,6 @@ chiperf 1.0
 ```chiperf
 chiperf 1.0
 @meta design="rv32i-demo" tool="hand-written" note="演示轨迹：覆盖 7 种记录类型，非时序精确模型"
-@domain default, period=1.0ns, note="单一时钟，只插桩上升沿"
 # 指令表（tag 即 PC）：
 #   A 0x80000000 addi a0,a0,1
 #   B 0x80000004 lw   a1,0(a0)      <- I-cache miss
@@ -235,16 +232,16 @@ chiperf 1.0
 
 ### 2.2 每行的序号与位置
 
-`seq` 从 1 开始，只给事件记录编号（`@meta`、`@domain`、`@end` 和注释都不占号）。每个周期的第一条记录的序号如下：
+`seq` 从 1 开始，只给事件记录编号（`@meta`、`@end` 和注释都不占号）。每个周期的第一条记录的序号如下：
 
 | 周期 | 0（时钟之前） | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 该周期首个序号 | 1 | 7 | 13 | 23 | 33 | 45 | 59 | 71 | 81 | 89 | 92 | 95 | 99 |
 | 该周期记录数 | 6 | 6 | 10 | 10 | 12 | 14 | 12 | 10 | 8 | 3 | 3 | 4 | 4 |
 
-- 时钟之前的 6 条记录位于 `(default, 0, -, 1..6)`，依次是：一段文字说明、两个状态机的初态、`cnt abs=0`、`val if.pc = x`（未知）、`val if.valid = 0`。
-- 第 6 周期把两级清空：`[pip] "core.if", bubble` 位于 `(default, 6, p, 63)`，`[pip] "core.id", bubble` 位于 `(default, 6, p, 64)`。前一条结束了 `core.if` 里的 `0x80000010`，后一条结束了 `core.id` 里的 `0x8000000c`。
-- 文件共 102 条事件记录，最后一个位置是 `(default, 12, p, 102)`；`clk` 记录共 12 条（12 个上升沿），没有下降沿记录（这个文件只在上升沿记录）。
+- 时钟之前的 6 条记录位于 `(0, -, 1..6)`，依次是：一段文字说明、两个状态机的初态、`cnt abs=0`、`val if.pc = x`（未知）、`val if.valid = 0`。
+- 第 6 周期把两级清空：`[pip] "core.if", bubble` 位于 `(6, p, 63)`，`[pip] "core.id", bubble` 位于 `(6, p, 64)`。前一条结束了 `core.if` 里的 `0x80000010`，后一条结束了 `core.id` 里的 `0x8000000c`。
+- 文件共 102 条事件记录，最后一个位置是 `(12, p, 102)`；`clk` 记录共 12 条（12 个上升沿），没有下降沿记录（这个文件只在上升沿记录）。
 
 ### 2.3 各观察项的停留时间
 
@@ -294,7 +291,7 @@ chiperf 1.0
 | `core.ctrl` | `RESET(c0)`、`FETCH(c1)`、`RUN(c2)`、`FETCH(c7)`、`RUN(c8)`、`DRAIN(c11)`、`DONE(c12)` | `RESET→FETCH`、`FETCH→RUN`、`RUN→FETCH`、`FETCH→RUN`、`RUN→DRAIN`、`DRAIN→DONE` 共 6 次 | 0 |
 | `core.icache.ctrl` | `IDLE(c0)`、`LOOKUP(c2)`、`FILL(c3)`、`FILL(c4)`、`IDLE(c5)` | `IDLE→LOOKUP`、`LOOKUP→FILL`、`FILL→FILL`、`FILL→IDLE` 共 4 次 | 1 |
 
-- `FILL→FILL` 是连续两次报告同一个状态：`core.icache.ctrl` 在第 3、4 两个周期都是 `FILL`（填充需要两个周期），所以会出现 `self_transition` 提示 **恰好 1 次**。这是预料之中的提示，不是错误。
+- `FILL→FILL` 是连续两次报告同一个状态：`core.icache.ctrl` 在第 3、4 两个周期都是 `FILL`（填充需要两个周期）。保持型语义下"状态未变但被再次上报"是正常写法，只记成一次自环，**不产生诊断**。
 - 第 7、8 周期 `core.ctrl` 回到 `FETCH`、`RUN`：重新开始取指。
 
 ### 2.7 数值
@@ -311,97 +308,17 @@ chiperf 1.0
 
 | 提示 | 次数 | 说明 |
 | --- | --- | --- |
-| `self_transition` | 1 | `core.icache.ctrl` 连续两个周期都是 `FILL` |
-| 其它全部提示 | 0 | 没有悬空未结束的条目、重复属性或非法记录 |
+| 全部提示 | 0 | 自环（`FILL→FILL`）是保持型语义下的正常写法，不计异常；也没有悬空未结束的条目、重复属性或非法记录 |
 
 ---
 
-## 3. multiclk.chiperf
-
-```chiperf
-chiperf 1.0
-@meta design="dual-clock demo" note="两个时钟域 + 跨时钟域轨道 + 同名不同域的独立计数"
-@domain core, period=1.0ns, note="主时钟 1GHz"
-@domain mem, freq=800MHz, note="内存时钟 800MHz（周期 1.25ns）"
-
-# ---- core 周期 1 ----
-[clk] p, dom=core
-[cnt] "stall", dom="core"
-[val] "core.if.pc", 32'h8000_0000, dom="core"
-[pip] "core.l2", 0x4000, dom="core"
-
-# ---- mem 周期 1 ----
-[clk] p, dom=mem
-[cnt] "stall", dom="mem"                      # 与 core.stall 是两条独立轨迹
-[cnt] "mem.access", dom="mem"
-[clk] n, dom=core                             # 同一 core 周期 1 的下降沿
-[clk] n, dom=mem
-
-# ---- mem 周期 2 ----
-[clk] p, dom=mem
-[pip] "mem.bank0", 0x40, dom="mem"
-[pip] "core.l2", bubble, dom="mem"          # 跨域：入在 core 周期 1，出在 mem 周期 2
-[cnt] "mem.access", dom="mem"
-[pip] "mem.bank0", bubble, dom="mem"          # 同周期进出 ⇒ 延迟 0 周期
-
-# ---- core 周期 2 ----
-[clk] p, dom=core
-[val] "core.if.pc", 32'h8000_0004, dom="core"
-[cnt] "stall", dom="core"                     # core.stall 累计到 2
-[clk] n, dom=core
-
-# ---- mem 周期 3 ----
-[clk] p, dom=mem
-[pip] "mem.bank0", 0x44, dom="mem"
-[clk] n, dom=mem
-
-# ---- mem 周期 4 ----
-[clk] p, dom=mem
-[pip] "mem.bank0", bubble, dom="mem"          # 延迟 1 个 mem 周期
-[cnt] "mem.access", dom="mem"
-[clk] n, dom=mem
-@end
-```
-
-这个文件同时使用两个时钟：`core` 周期 1.0ns，`mem` 频率 800MHz（周期 1.25ns）。两条时间线各记各的，互不干扰。
-
-### 位置与两条时间线的状态
-
-| 事件 | 位置 | 说明 |
-| --- | --- | --- |
-| `[clk] p, dom=core` | `(core, 1, p)` | `core` 的第 1 个上升沿 |
-| `[cnt] "stall", dom="core"` | `(core, 1, p)` | 记到 `core` 的 `stall` 计数上 |
-| `[val] "core.if.pc", …, dom="core"` | `(core, 1, p)` | —— |
-| `[pip] "core.l2", 0x4000, dom="core"` | `(core, 1, p)` | `core.l2` 开始持有 `0x4000` |
-| `[clk] p, dom=mem` | `(mem, 1, p)` | `mem` 的第 1 个上升沿（与 `core` 的周期编号无关） |
-| `[cnt] "stall", dom="mem"` | `(mem, 1, p)` | 记到 `mem` 的 `stall` 计数上，与 `core` 的 `stall` 不是同一个 |
-| `[clk] n, dom=core` / `[clk] n, dom=mem` | `(core, 1, n)` / `(mem, 1, n)` | 两个时钟各自的下降沿 |
-| `[pip] "core.l2", bubble, dom="mem"` | `(mem, 2, p)` | `core.l2` 变空；它开始于 `core` 的时钟、结束于 `mem` 的时钟（`cross_domain`） |
-
-### 能算出什么
-
-| 结果 | 值 |
-| --- | --- |
-| 周期数 | `core` = 2、`mem` = 4 |
-| 下降沿数 | `core` = 2、`mem` = 3 |
-| 上升沿时刻 | `core`：0ns、1.0ns；`mem`：0ns、1.25ns、2.5ns、3.75ns（`@domain` 只用来换算时间，不推进周期） |
-| 计数器 | `(core, "stall") = 2`、`(mem, "stall") = 1`、`(mem, "mem.access") = 3` |
-| 观察项 `core.l2` | 1 个条目：开始 = `(core,1,p)`，结束 = `(mem,2,p)` |
-| 观察项 `mem.bank0` | 2 个条目：`0x40`（`mem c2→c2`，停留 0 周期）、`0x44`（`mem c3→c4`，停留 1 周期） |
-
-- 起点和终点落在不同时钟上的条目，不计算相差多少个周期（`core.l2` 的两端分别在 `core` 和 `mem` 上，两个周期号不能相减），因此出现 `cross_domain` 提示 **恰好 1 次**。
-- 两条 `"stall"` 记录属于不同的时间线，是两个独立的计数，不会相加，也不会互相覆盖，同时不会产生 `name_reused`。
-- `mem.bank0` 的第 1 个条目在同一周期进出：停留 0 周期，也不计入任何周期的同时占用数量（只算开始、不算结束）。
-
----
-
-## 4. postprocess.chiperf
+## 3. postprocess.chiperf
 
 ```chiperf
 chiperf 1.0
 @meta tool="chiperf-postproc" note="后处理工具输出的轨迹：没有 clk 记录，时间轴完全由 at= 给出"
 # 位置全部显式：cycle + 可选相位字母（缺省 p）。
-# 解析器不得因缺少 clk 记录而拒绝该文件，也不得让 at= 影响域的时钟状态。
+# 解析器不得因缺少 clk 记录而拒绝该文件，也不得让 at= 影响时钟状态。
 
 [val] "PC", 32'h8000_0000, at=1p
 [cnt] "Retired", at=1p
@@ -415,9 +332,9 @@ chiperf 1.0
 [pip] "ID", bubble, at=3p
 [cnt] "Retired", at=3p
 
-# 同一条记录也可以指定相位 n，或另一个域
+# 同一条记录也可以指定相位 n
 [val] "PC", 32'h8000_000c, at=3n
-[cnt] "stall", dom="mem", at=7p
+[cnt] "stall", at=7p
 @end
 ```
 
@@ -425,31 +342,30 @@ chiperf 1.0
 
 | 序号 | 记录 | 位置 |
 | --- | --- | --- |
-| 1 | `[val] "PC", 32'h8000_0000, at=1p` | `(default, 1, p, 1)` |
-| 2 | `[cnt] "Retired", at=1p` | `(default, 1, p, 2)` |
-| 3 | `[pip] "IF", 0x80000000, at=1p` | `(default, 1, p, 3)` |
-| 4 | `[val] "PC", 32'h8000_0004, at=2p` | `(default, 2, p, 4)` |
-| 5 | `[pip] "IF", bubble, at=2p` | `(default, 2, p, 5)`，该条目停留 `2-1 = 1` 个周期 |
-| 6 | `[pip] "ID", 0x80000000, at=2` | `(default, 2, p, 6)`（没写相位字母时默认为 `p`） |
-| 7 | `[val] "PC", 32'h8000_0008, at=3p` | `(default, 3, p, 7)` |
-| 8 | `[pip] "ID", bubble, at=3p` | `(default, 3, p, 8)`，该条目停留 1 个周期 |
-| 9 | `[cnt] "Retired", at=3p` | `(default, 3, p, 9)` |
-| 10 | `[val] "PC", 32'h8000_000c, at=3n` | `(default, 3, n, 10)` |
-| 11 | `[cnt] "stall", dom="mem", at=7p` | `(mem, 7, p, 11)` |
+| 1 | `[val] "PC", 32'h8000_0000, at=1p` | `(1, p, 1)` |
+| 2 | `[cnt] "Retired", at=1p` | `(1, p, 2)` |
+| 3 | `[pip] "IF", 0x80000000, at=1p` | `(1, p, 3)` |
+| 4 | `[val] "PC", 32'h8000_0004, at=2p` | `(2, p, 4)` |
+| 5 | `[pip] "IF", bubble, at=2p` | `(2, p, 5)`，该条目停留 `2-1 = 1` 个周期 |
+| 6 | `[pip] "ID", 0x80000000, at=2` | `(2, p, 6)`（没写相位字母时默认为 `p`） |
+| 7 | `[val] "PC", 32'h8000_0008, at=3p` | `(3, p, 7)` |
+| 8 | `[pip] "ID", bubble, at=3p` | `(3, p, 8)`，该条目停留 1 个周期 |
+| 9 | `[cnt] "Retired", at=3p` | `(3, p, 9)` |
+| 10 | `[val] "PC", 32'h8000_000c, at=3n` | `(3, n, 10)` |
+| 11 | `[cnt] "stall", at=7p` | `(7, p, 11)` |
 
-- `default` 和 `mem` 两条时间线都没有上升沿记录，它们的周期数和相位保持初始值（`0` 和空）。这不影响每条记录各自的位置，也不会产生任何提示。
+- 整条轨迹没有任何 `clk` 记录，时钟的周期数和相位保持初始值（`0` 和空）。这不影响每条记录各自的位置，也不会产生任何提示。
 - `at=` 不会推进时钟：即便出现了 `at=7p`，`mem` 的周期计数仍然是 0。
 - 计数器：`Retired = 2`、`(mem, "stall") = 1`；观察项 `IF`、`ID` 各 1 个条目，都停留 1 个周期，且都已结束。
 - 没有提示。
 
 ---
 
-## 5. async-events.chiperf
+## 4. async-events.chiperf
 
 ```chiperf
 chiperf 1.0
 @meta design="async demo" note="async=1：事件不是时钟沿采样得到的，可视化落在两个时钟沿之间"
-@domain core, period=1.0ns
 
 # ---- cycle 1 ----
 [clk] p
@@ -516,12 +432,11 @@ chiperf 1.0
 
 ---
 
-## 6. faults.chiperf
+## 5. faults.chiperf
 
 ```chiperf
 chiperf 1.0
 @meta design="robustness fixture" note="故意注入未知类型/未知指令/未知属性/非法记录/语义异常"
-@domain core, period=1.0ns, note="声明了 core；文件里故意把一条写成 cor 来触发域拼写诊断"
 # 期望的解析结果见 docs/examples.md（每个注入点标注了期望诊断）
 
 @unknown_directive foo=1                     # skipped_unknown_directive
@@ -539,10 +454,10 @@ chiperf 1.0
 [clk] n                                      # redundant_edge
 [cnt] "Retired", -10                         # negative_total
 [fsm] "ctrl", IDLE
-[fsm] "ctrl", IDLE                           # self_transition
+[fsm] "ctrl", IDLE                           # 自环：正常写法，不是异常
 [val] "PC", 4'b10xz                          # 4 态值：未知位/高阻位
 [msg] tail text with, commas and # a hash are literal
-[cnt] "Retired", dom="cor"                   # undeclared_domain（把 core 写成 cor -> 新建了一条 cor 时间轴）
+[cnt] "Retired"                              # 正常累加
 [clk] p, async=1                             # async_on_clk（时钟沿本身不可能异步：属性被忽略，沿仍然生效）
 @end
 ```
@@ -562,22 +477,21 @@ chiperf 1.0
 | `[clk] p` ×2 | 只有上升沿 | 第 2、3 周期 |
 | `[clk] n` / `[clk] n` | 重复的下降沿 | 第 2 条产生 `redundant_edge` +1 |
 | `[cnt] "Retired", -10` | 累计变成负数 | `total = 2-10 = -8`，`negative_total` +1 |
-| `[fsm] "ctrl", IDLE` ×2 | 连续两次同一状态 | `self_transition` +1 |
+| `[fsm] "ctrl", IDLE` ×2 | 连续两次同一状态 | 正常：记成一次自环，**不产生提示**（自环不是异常，规范 §9.5） |
 | `[val] "PC", 4'b10xz` | 含未知位和高阻位的值 | 正常，值里第 1 位未知、第 0 位高阻 |
 | `[msg] tail text with, commas and # a hash are literal` | 自由文本 | 整段都是文本（包括 `,` 和 `#`），序号 15 |
-| `[cnt] "Retired", dom="cor"` | 时钟名写错 | 记录有效（序号 16），落到新建的 `cor` 时间线上，产生 `undeclared_domain` +1；它**不会**并入 `core` 的 `Retired`（计数按“时间线 + 名字”区分） |
+| `[cnt] "Retired"` | 正常 | 记录有效（序号 16），`total` 再 +1 |
 | `[clk] p, async=1` | 把 `async` 用在时钟上 | 记录有效且**沿仍然生效**（第 4 周期，序号 17），属性被忽略，产生 `async_on_clk` +1 |
 | `@end` | 正常结束 | 不产生 `eof_without_end_marker` |
 
-统计：**17 条有效事件记录**；跳过 3 行（未知类型 1、非法记录 1、未知指令 1）；提示 5 次（`redundant_edge`、`negative_total`、`self_transition`、`undeclared_domain`、`async_on_clk` 各 1）。
+统计：**17 条有效事件记录**；跳过 3 行（未知类型 1、非法记录 1、未知指令 1）；提示 3 次（`redundant_edge`、`negative_total`、`async_on_clk` 各 1）。
 
 几个要点：
 
 - `x-vendor-tag=7` 与 `[stall]` 这两行说明了两种不同的容错方式——**未知属性会被忽略，但这一行继续使用**；**未知类型则整行跳过**。前者不丢数据，后者无法解释含义。
-- `dom="cor"` 说明为什么需要 `undeclared_domain` 提示：名字拼错时不会报错，而是**悄悄新建一条时间线**，数据被拆开却看不出异常。
 - 本文件的边沿顺序是 `p, p, n, n, p`，故意混合了“只写 p”和“写 p/n”两种写法来触发 `redundant_edge`，因此它同时也是写入者指南 W10 的反例：容错用例本来就要覆盖不合规的输入。
 
-## 7. truncated.chiperf
+## 6. truncated.chiperf
 
 ```chiperf
 chiperf 1.0
@@ -596,21 +510,21 @@ chiperf 1.0
 
 | 序号 | 记录 | 位置 | 结果 |
 | --- | --- | --- | --- |
-| 1 | `[clk] p` | `(default, 1, p, 1)` | 第 1 周期 |
-| 2 | `[cnt] "Retired"` | `(default, 1, p, 2)` | `total = 1` |
-| 3 | `[pip] "IF", 0x80000000` | `(default, 1, p, 3)` | `IF` 开始持有它 |
-| 4 | `[pip] "IF", bubble` | `(default, 1, p, 4)` | 停留 0 周期 |
-| 5 | `[pip] "ID", 0x80000000` | `(default, 1, p, 5)` | `ID` 开始持有它，**之后没有任何记录改写它** |
-| 6 | `[val] "PC", 0x80000000` | `(default, 1, p, 6)` | `PC` 保持 |
-| 7 | `[clk] p` | `(default, 2, p, 7)` | 第 2 周期 |
+| 1 | `[clk] p` | `(1, p, 1)` | 第 1 周期 |
+| 2 | `[cnt] "Retired"` | `(1, p, 2)` | `total = 1` |
+| 3 | `[pip] "IF", 0x80000000` | `(1, p, 3)` | `IF` 开始持有它 |
+| 4 | `[pip] "IF", bubble` | `(1, p, 4)` | 停留 0 周期 |
+| 5 | `[pip] "ID", 0x80000000` | `(1, p, 5)` | `ID` 开始持有它，**之后没有任何记录改写它** |
+| 6 | `[val] "PC", 0x80000000` | `(1, p, 6)` | `PC` 保持 |
+| 7 | `[clk] p` | `(2, p, 7)` | 第 2 周期 |
 | — | `[cnt] "Retire` | 丢弃 | `truncated_tail` 保留原文 |
 
 - **7 条有效事件记录**；残行**不得**被解析（否则会得到一条名为 `Retire` 的假计数）。
-- 观察项 `ID` 还留着 1 个没有结束的条目（开始 = `(default,1,p,5)`，值 `0x80000000`），显示时应当画成开放的区间，而不是伪造一个结束位置。
+- 观察项 `ID` 还留着 1 个没有结束的条目（开始 = `(1,p,5)`，值 `0x80000000`），显示时应当画成开放的区间，而不是伪造一个结束位置。
 - 没有 `@end`，因此产生 `eof_without_end_marker`。
 - 这正是规范 §10.1 所说的“前缀封闭”的具体例子：无论在哪一行边界被切断，剩下的部分都是一个可以正常解析、含义完整的 Chiperf 文件。
 
-## 8. future-version.chiperf
+## 7. future-version.chiperf
 
 ```chiperf
 chiperf 2.0
@@ -622,11 +536,10 @@ chiperf 2.0
 
 第一行是 `chiperf 2.0`，比当前主版本更高。默认情况下解析器**必须**拒绝这个文件；只有在明确开启“忽略版本”模式时才尽力解析。文件里这 2 条事件记录本身是合法的，因此这个用例可以区分“因版本拒绝”和“因语法错误拒绝”两种失败。
 
-## 9. reset.chiperf —— 系统复位
+## 8. reset.chiperf —— 系统复位
 
 ```chiperf
 chiperf 1.0
-@domain default, period=1.0ns
 @meta design="rst-demo", tool="handwritten", note="演示 [rst]：复位前的记录整批作废"
 
 # ---- 复位之前：这些记录都不会进入可视化 ----
@@ -658,7 +571,7 @@ chiperf 1.0
 | 计数器 `retired` | 终值 **1**（复位前那次增量已随记录作废） |
 | 数值 `core.pc` | 只剩复位后的 0x8000 一次采样；复位前是未知，而不是 0x1000 |
 | 观察项 `core.if` | **不存在**：它唯一那条记录在复位前，随复位一起消失 |
-| 时间线 `default` | `period=1.0ns` 与 `@meta` **保留**（`@` 开头的指令是声明，不是记录）；边沿数和记录范围按新窗口重新计算 |
+| 时钟状态 | 时钟的周期号**不重编**，继续往下排；边沿数和记录范围按新窗口重新计算 |
 | 周期号 | 不重新编号：复位后的记录接着原来的周期号（本例是第 3 个周期），时钟不会“回到 0” |
 | 提示 | 一条 `rst_boundary`（信息性）；复位前的提示和跳过行一并作废 |
 

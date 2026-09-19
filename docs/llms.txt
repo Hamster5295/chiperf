@@ -1,0 +1,291 @@
+# Chiperf Logger 编写指示
+
+> 目标：在一个 RTL 项目（SystemVerilog / Verilog / Chisel，或带 DPI 的 C++ testbench）中编写插桩代码，
+> 让仿真在运行期产出 **合法** 且 **人类易读** 的 `*.chiperf` 文件。
+>
+> 规范版本：**Chiperf 1.0**。只有一个全局时钟 `clock`，**没有时钟域**（不存在 `dom=` / `@domain`），
+> **不做**时间/频率换算（不存在 `1.0ns` / `800MHz`，只记录周期号）。
+
+## 0. 先读什么
+
+- 规范：<https://hamster5295.github.io/chiperf/docs/spec/v1.0>
+- 事件总览：<https://hamster5295.github.io/chiperf/docs/events/>
+- 逐条示例：<https://hamster5295.github.io/chiperf/docs/examples>
+- 可视化器（写完文件后用它自检）：<https://hamster5295.github.io/chiperf/visualize>
+
+## 1. 你要交付什么
+
+1. 一份 **logger 模块 / 任务集**（建议 `chiperf_logger.sv`，或集成进 `tb_top`），提供：
+   - 初始化（写版本行与 `@meta`）；
+   - 每类事件的写入任务（`clk` / `cnt` / `val` / `pip` / `fsm` / `evt` / `msg` / `rst`）；
+   - 收尾（`@end` + 关闭文件）。
+2. 在 RTL/tb 的恰当位置调用这些任务（时钟沿、流水级、计数点、状态机、复位点）。
+3. 产出文件可直接被 Chiperf 解析器解析、被可视化器打开，且尽可能做到 **零诊断 / 零非法行 / 零未知类型**。
+
+## 2. 文件骨架（必须遵守）
+
+```chiperf
+chiperf 1.0                                     # 第一行，必须写
+@meta design="mycore" tool="verilator" date="2026-09-19"
+# 注释：'#' 在行首，或前面是空白
+
+[clk] p                                         # 上升沿：开启一个新周期
+[cnt] "core.retired"                            # 这一拍发生的事件
+[val] "core.if.pc", 32'h8000_0010
+[pip] "core.if", 0x80000010
+[fsm] "core.ctrl", FETCH
+[clk] n                                         # 下降沿（可选；见 §5 的边沿模式）
+@end                                            # 正常结束，推荐写
+```
+
+硬性要求：
+
+- **一条记录一行**，每条记录以 `\n` 结尾；记录内不得有裸换行。
+- 首行是版本行 `chiperf 1.0`。
+- 参数在前、属性在后；属性形如 `key=value`。
+- 字符串转义只支持 `\"` `\\` `\n` `\t` `\r`。
+- 名字非空，且在一次仿真内 **固定不变**。
+
+## 3. 记录类型速查
+
+```ebnf
+clk = "clk" , ( "p" | "n" ) ;
+cnt = "cnt" , <名字> , [ <int 增量> ] ;              (* abs=<int> 可代替增量 *)
+val = "val" , <名字> , <任意标量> ;
+pip = "pip" , <轨> , ( <任意标量> | bubble ) ;       (* bubble = 该级为空 *)
+fsm = "fsm" , <名字> , <状态> ;
+evt = "evt" , <名字> , [ <载荷> ] ;
+msg = "msg" , <行尾原文> ;
+rst = "rst" ;                                       (* 无参数 *)
+```
+
+通用属性（所有事件类型可用）：
+
+| 属性 | 取值 | 作用 |
+| --- | --- | --- |
+| `at=` | `int[p\|n]` | 显式覆盖该条记录的周期/相位。**非后处理场景不要用**，会打乱顺序 |
+| `async=` | `0` / `1` | `1` = 该事件不是在时钟沿上采样的（中断、DMA 完成、异步握手） |
+| `note=` | 字符串 | 人类可读注解，不影响派生量 |
+
+值的写法（`int` / `bits` / `real` / `str` / `sym`）：
+
+```chiperf
+[cnt] "events", -1                 # 十进制（可为负）
+[val] "core.pc", 0x80000010        # 十六进制
+[val] "core.pc", 32'h8000_0010     # Verilog 字面量（带宽度，推荐用于位向量）
+[val] "ok", 4'b10xz                # 4 态：x 未知 / z 高阻（只认小写 x/z）
+[val] "instr", "addi a0,a0,1"      # 字符串
+[val] "vdd", 0.95                  # 实数
+[fsm] "core.ctrl", IDLE            # 裸词符号
+```
+
+## 4. 语义要点（决定文件是否"有意义"）
+
+- **`clk` 是唯一推进时间的记录。** `[clk] p` 开启新周期；`[clk] n` 进入同周期后半段。
+  每拍 `[clk] p` 之后、`[clk] n` 之前写下该周期的全部事件。
+- **`pip` 是保持型**：`[pip] "core.if", <值>` 表示该级 **此刻变成** 这个值；
+  `[pip] "core.if", bubble` 表示该级变空。**没写就不变**（不需要"出队/撤销"记录）。
+  因此只在 **值发生变化** 的那一拍写一条，不要把同一级每拍都写一遍。
+- **`val` 是保持型**：只写变化点，其余周期自动保持。字符串值适合记录反汇编文本。
+- **`fsm` 是保持型**：状态变化时写一条即可；连续写同一状态是合法的自环，不必刻意避免。
+- **`cnt` 每次出现都是一次事件**：`[cnt] "x"` = 又发生一次（+1）；`[cnt] "x", 4` = 一次 +4。
+  硬件计数器回读用 `[cnt] "x", abs=<当前值>`（不贡献增量）。
+- **`evt` 是瞬时离散标记**（不累加），可带载荷；与 `cnt` 的区别在意图。
+- **`msg` 是写给人看的一行文本**，不支持属性；仿真开始/结束、模式切换用它可以极大提升可读性。
+- **`rst` 丢弃此前的全部事件记录**，用于去掉热身阶段；复位释放时写一条即可。
+- **`async=1`** 用于不在时钟沿采样的事件，否则可视化会把它错误吸附到沿上。
+
+## 5. 插桩模式（SystemVerilog 推荐模板）
+
+关键约定：
+
+1. **只在一处集中输出**（一个 `always` 块或一套任务），避免不同 `always` 块执行顺序导致
+   事件跑到错误的时钟沿。
+2. **边沿模式二选一**：要么只插 `[clk] p`（推荐，周期编号完整），要么 `p`/`n` 都插；
+   **不要**在同一份轨迹里混用。
+3. 每条记录写完立刻 `$fflush`（鲁棒性：仿真被杀也能保留已写内容）。
+4. 结束用 `final` / `$finish` 钩子写 `@end`。
+
+```systemverilog
+// ---------------- chiperf_logger.sv ----------------
+module chiperf_logger #(parameter string PATH = "trace.chiperf");
+
+  integer fd;
+
+  task automatic open_log();
+    fd = $fopen(PATH, "w");
+    if (fd == 0) $fatal(1, "cannot open %s", PATH);
+    $fwrite(fd, "chiperf 1.0\n");
+    $fwrite(fd, "@meta design=\"mycore\" tool=\"verilator\" date=\"2026-09-19\"\n");
+    $fflush(fd);
+  endtask
+
+  task automatic close_log();
+    $fwrite(fd, "@end\n");
+    $fflush(fd);
+    $fclose(fd);
+  endtask
+
+  // 每个 task 都自己换行 + flush，调用方不需要关心格式
+  task automatic log_clk_p();            $fwrite(fd, "[clk] p\n");                      $fflush(fd); endtask
+  task automatic log_clk_n();            $fwrite(fd, "[clk] n\n");                      $fflush(fd); endtask
+  task automatic log_msg(input string s);$fwrite(fd, "[msg] %s\n", s);                 $fflush(fd); endtask
+  task automatic log_cnt(input string name);            // 默认 +1
+    $fwrite(fd, "[cnt] \"%s\"\n", name);                                                $fflush(fd);
+  endtask
+  task automatic log_cnt_delta(input string name, input int delta);
+    $fwrite(fd, "[cnt] \"%s\", %0d\n", name, delta);                                    $fflush(fd);
+  endtask
+  task automatic log_cnt_abs(input string name, input int value);
+    $fwrite(fd, "[cnt] \"%s\", abs=%0d\n", name, value);                                $fflush(fd);
+  endtask
+  task automatic log_val_hex(input string name, input logic [63:0] value);
+    $fwrite(fd, "[val] \"%s\", 0x%0h\n", name, value);                                  $fflush(fd);
+  endtask
+  task automatic log_val_str(input string name, input string value);
+    $fwrite(fd, "[val] \"%s\", \"%s\"\n", name, value);                                 $fflush(fd);
+  endtask
+  task automatic log_pip_hex(input string track, input logic [63:0] value);
+    $fwrite(fd, "[pip] \"%s\", 0x%0h\n", track, value);                                 $fflush(fd);
+  endtask
+  task automatic log_pip_bubble(input string track);
+    $fwrite(fd, "[pip] \"%s\", bubble\n", track);                                       $fflush(fd);
+  endtask
+  task automatic log_fsm(input string name, input string state);
+    $fwrite(fd, "[fsm] \"%s\", %s\n", name, state);                                     $fflush(fd);
+  endtask
+  task automatic log_evt(input string name, input logic [63:0] payload);
+    $fwrite(fd, "[evt] \"%s\", 0x%0h\n", name, payload);                                $fflush(fd);
+  endtask
+  task automatic log_evt_async(input string name, input logic [63:0] payload);
+    $fwrite(fd, "[evt] \"%s\", 0x%0h, async=1\n", name, payload);                       $fflush(fd);
+  endtask
+  task automatic log_rst();               // 丢弃此前全部记录（去掉热身段）
+    $fwrite(fd, "[rst]\n");                                                             $fflush(fd);
+  endtask
+
+endmodule
+
+// ---------------- tb 中的用法 ----------------
+chiperf_logger logger();
+
+// 影子寄存器：记住"上次写出的值"，保持型事件只在变化时写一条。
+// 初值给成不可能的值/未知，确保仿真开始时也会写出第一条采样。
+logic [63:0] if_pc_q   = 'x;
+logic        if_valid_q = 1'bx;
+string       ctrl_q     = "<none>";
+
+initial begin
+  logger.open_log();
+  logger.log_msg("reset released, starting trace");
+end
+
+// 所有记录集中在这一个块里，保证同一拍的顺序是确定的
+always @(posedge clk) begin
+  logger.log_clk_p();                                  // 每个沿先写 clk
+
+  if (retire_valid) logger.log_cnt("core.retired");    // 计数：发生一次写一条
+
+  if (if_pc !== if_pc_q) begin                         // 数值：只写变化点
+    logger.log_val_hex("core.if.pc", if_pc);
+    if_pc_q <= if_pc;
+  end
+
+  if (ctrl_state.name() != ctrl_q) begin               // 状态机：只在状态变化时写
+    logger.log_fsm("core.ctrl", ctrl_state.name());
+    ctrl_q <= ctrl_state.name();
+  end
+
+  if (if_valid !== if_valid_q || if_pc !== if_pc_q) begin   // 流水级：值变了才写
+    if (if_valid) logger.log_pip_hex("core.if", {32'b0, if_pc});
+    else          logger.log_pip_bubble("core.if");
+    if_pc_q    <= if_pc;
+    if_valid_q <= if_valid;
+  end
+end
+
+always @(negedge clk) if (trace_both_edges) logger.log_clk_n();
+
+always @(posedge irq) logger.log_evt_async("irq.assert", irq_id);  // 不在沿上 → async=1
+
+final begin
+  logger.log_msg("simulation finished");
+  logger.close_log();
+end
+```
+
+C++ / DPI testbench 同理：用一个 `chiperfWriter` 类，方法对应上面的 task，
+每次 `fprintf` 后 `fflush`；gzip 输出用 `gzprintf` + `gzflush(Z_SYNC_FLUSH)`，
+或先写 `.chiperf` 再离线压缩成 `.chiperf.gz`。
+
+## 6. 人类易读建议（评审会看）
+
+- 首行版本 + `@meta`（`design` / `tool` / `date`），让文件自描述。
+- 名字用 **层级路径**：`core.if.pc`、`core.mem.lsq`、`core.ctrl`；不要用 `sig1` 这类临时名。
+- 文件开头用 `[msg]` 写一句本次仿真的目的；关键阶段（开始取指、进入 turbo、退出）也写 `[msg]`。
+- 可以对周期做注释（注释对解析器透明，但方便人读）：
+
+  ```chiperf
+  # ---- cycle 12 ----
+  [clk] p
+  [cnt] "core.retired"
+  [clk] n
+  ```
+
+- 位向量优先用 Verilog 字面量（`32'h...`）并保留宽度；反汇编文本用字符串值。
+- 数值只在变化点写（保持型），避免每拍刷屏。
+- 反汇编等说明放 `note=` 或字符串值，不要拼进名字。
+
+## 7. 常见错误（会被判非法或产生诊断）
+
+- 写 `dom=` / `@domain`：v1.0 不存在时钟域，`dom=` 会被当作未知属性**静默忽略**。
+- 写单位：`1.0ns`、`800MHz` 不是合法值。
+- 参数写在属性之后：`[val] "x", 1, note="a", 2` ⇒ 整行非法。
+- 记录跨行 / 字符串里有裸换行。
+- `cnt` 的增量不是整数，或增量与 `abs=` 同时出现。
+- `msg` 带属性：`[msg] a, note=b` 中 `note=b` 只是正文。
+- 同一名字被不同类型使用（如 `cnt` 与 `val` 同名）⇒ `name_reused` 诊断。
+- 把运行时对象拼进名字（`core.rob[17]`）⇒ 追踪对象数无界，应改用稳定名字 + 载荷。
+- 忘记 `@end`（⇒ `eof_without_end_marker`）或忘记 flush（崩溃时丢数据）。
+- 同一轨迹里只写 `p` 与 `p`/`n` 混用 ⇒ `redundant_edge` 等诊断。
+
+## 8. 自检清单（交付前逐条确认）
+
+- [ ] 首行 `chiperf 1.0`，结尾 `@end`。
+- [ ] 每条记录一行、以 `\n` 结尾；每条写完 `flush`。
+- [ ] 位置非递减：先 `[clk] p`，再写该周期事件。
+- [ ] 没有 `dom=`、`@domain`、单位数值、参数后置。
+- [ ] 名字稳定、层级化，且不同类型不重名。
+- [ ] `pip` 只在值变化时写；`val`/`fsm` 只写变化点。
+- [ ] 异步事件标了 `async=1`。
+- [ ] 用可视化器打开一遍，头部诊断数为 0。
+
+## 9. 参考最小示例（可直接对照产出）
+
+```chiperf
+chiperf 1.0
+@meta design="mini" tool="verilator" date="2026-09-19"
+
+[msg] reset released
+[pip] "core.if", 0x80000000
+[fsm] "core.ctrl", RESET
+
+[clk] p
+[cnt] "core.icache.access"
+[val] "core.if.pc", 32'h8000_0000
+[pip] "core.if", 0x80000004
+[fsm] "core.ctrl", FETCH
+
+[clk] p
+[cnt] "core.retired"
+[val] "core.if.pc", 32'h8000_0008
+[pip] "core.if", bubble
+[fsm] "core.ctrl", RUN
+
+[msg] trace complete
+@end
+```
+
+---
+
+本文件是给 Agent 的编写指示，规范以 <https://hamster5295.github.io/chiperf/docs/spec/v1.0> 为准。

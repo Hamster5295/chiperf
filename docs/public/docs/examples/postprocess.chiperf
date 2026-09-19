@@ -15,7 +15,7 @@ chiperf 1.0
 [pip] "ID", bubble, at=3p
 [cnt] "Retired", at=3p
 
-# 同一条记录也可以指定相位 n，或另一个域
+# 同一条记录也可以指定相位 n
 [val] "PC", 32'h8000_000c, at=3n
-[cnt] "stall", dom="mem", at=7p
+[cnt] "stall", at=7p
 @end

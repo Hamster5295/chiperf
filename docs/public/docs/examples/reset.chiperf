@@ -1,5 +1,4 @@
 chiperf 1.0
-@domain default, period=1.0ns
 @meta design="rst-demo", tool="handwritten", note="演示 [rst]：复位前的记录整批作废"
 
 # ---- 复位之前：这些记录都不会进入可视化 ----
