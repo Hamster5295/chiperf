@@ -2221,7 +2221,25 @@ interface SeriesPrep {
   marks: { pos: Position; async: boolean }[];
   rangeLo: number;
   rangeHi: number;
+  /**
+   * 中间 90% 分位区间（5%~95%）。低缩放的折线用它当上下界，极端 10% 贴边显示 ——
+   * 个别离群值不再把整条趋势压扁。计数器轨不启用（末值本身就是重点）。
+   */
+  robustLo: number;
+  robustHi: number;
   hasRange: boolean;
+}
+
+/**
+ * 取一组数的中间 90% 分位区间。样本太少或区间退化时回退到全量上下界。
+ */
+function robustRange(values: number[], fallbackLo: number, fallbackHi: number): [number, number] {
+  if (values.length < 5 || !(fallbackLo < fallbackHi)) return [fallbackLo, fallbackHi];
+  const sorted = [...values].sort((a, b) => a - b);
+  const q = (p: number): number => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))]!;
+  const lo = q(0.05);
+  const hi = q(0.95);
+  return lo < hi ? [lo, hi] : [fallbackLo, fallbackHi];
 }
 
 /** 采样序列的二分：第一个 `pos.cycle >= v` 的下标（采样按文件顺序，周期通常升序） */
@@ -2259,7 +2277,10 @@ function valuePrepOf(track: ValueTrack): SeriesPrep {
     if (numeric < rangeLo) rangeLo = numeric;
     if (numeric > rangeHi) rangeHi = numeric;
   }
-  const prep: SeriesPrep = { points, marks: shown, rangeLo, rangeHi, hasRange: points.length > 0 };
+  const prep: SeriesPrep = (() => {
+    const [robustLo, robustHi] = robustRange(points.map((p) => p.numeric), rangeLo, rangeHi);
+    return { points, marks: shown, rangeLo, rangeHi, robustLo, robustHi, hasRange: points.length > 0 };
+  })();
   valuePreps.set(track, prep);
   return prep;
 }
@@ -2281,7 +2302,8 @@ function counterPrepOf(track: CounterTrack): SeriesPrep {
     if (sample.total < rangeLo) rangeLo = sample.total;
     if (sample.total > rangeHi) rangeHi = sample.total;
   }
-  const prep: SeriesPrep = { points, marks: [], rangeLo, rangeHi, hasRange: points.length > 0 };
+  // 计数器不做稳健裁剪：末值（终值）本身就是读者要看的东西
+  const prep: SeriesPrep = { points, marks: [], rangeLo, rangeHi, robustLo: rangeLo, robustHi: rangeHi, hasRange: points.length > 0 };
   counterPreps.set(track, prep);
   return prep;
 }
@@ -2331,6 +2353,8 @@ interface SeriesConfig {
   allowRv: boolean;
   /** 纵轴取值范围（来自全量，缩放/平移时保持稳定） */
   range: [number, number];
+  /** 低缩放折线用的中间 90% 分位区间（计数器轨与全量相同） */
+  robustRange: [number, number];
   /**
    * 放大后的窗口读取：只取可见（含左端一条保持值）采样，最多 `max` 个。
    * 返回 null 表示该轨回退到下采样轮廓（`at=` 导致顺序不可二分时）。
@@ -2373,14 +2397,23 @@ function seriesLane(cfg: SeriesConfig, ctx: ViewContext): LaneRow {
       // 放大（full）：按可见窗口读取全量采样，只 materialize 看得见的那一段；
       // 缩小（coarse）：用下采样轮廓做逐像素聚合，不碰全量数据。
       const numeric = lod === 'full' && cfg.window !== null ? (cfg.window(win.c0, win.c1, MAX_ITEMS) ?? outline) : outline;
-      // 纵轴用全量取值范围，缩放/平移时不跟着窗口内的极值抖
+      // 纵轴用全量取值范围，缩放/平移时不跟着窗口内的极值抖。
+      // 低缩放（coarse）改用中间 90% 分位当上下界，极端 10% clamp 到边界 ——
+      // 个别离群采样不再把整条趋势压扁。计数器轨的 90% 区间就是全量，等于不变。
       let min = cfg.range[0];
       let max = cfg.range[1];
+      if (lod === 'coarse' && cfg.robustRange[0] < cfg.robustRange[1]) {
+        min = cfg.robustRange[0];
+        max = cfg.robustRange[1];
+      }
       if (!(min < max)) {
         min = 0;
         max = 1;
       }
-      const yOf = (value: number): number => (max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top));
+      const yOf = (value: number): number => {
+        const raw = max === min ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top);
+        return clamp(raw, top, bottom);
+      };
       const xOf = (pos: Position, isAsync: boolean): number => clamp(reg.plot.scale(pos.cycle + phaseOffset(pos, isAsync)), reg.plot.x0, reg.plot.x1);
 
       // 低缩放：忽略显示模式（波形/折线/六边形块在这一比例下都退化成一回事），
@@ -2541,6 +2574,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
       defaultMode: 'blocks',
       allowRv: true,
       range: [prep.rangeLo, prep.rangeHi],
+      robustRange: [prep.robustLo, prep.robustHi],
       // `at=` 出现过时采样周期不保证单调，二分窗口不成立，退回下采样轮廓
       window: ctx.trace.hasAtOverride ? null : (from, to, max) => valueWindow(track, from, to, max),
       tip: (cycle, format) => {
@@ -2579,6 +2613,7 @@ function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
       defaultMode: 'line',
       allowRv: false,
       range: [prep.rangeLo, prep.rangeHi],
+      robustRange: [prep.robustLo, prep.robustHi],
       window: ctx.trace.hasAtOverride ? null : (from, to, max) => counterWindow(track, from, to, max),
       tip: (cycle, format) => {
         const total = counterTotalAt(track, cycle);

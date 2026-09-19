@@ -191,6 +191,23 @@ function unknownBand(parent: SVGSVGElement, g: Gap, plot: { x: number; y: number
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
+/**
+ * 中间 90% 分位区间（5%~95%），供低缩放折线的上下界使用。
+ *
+ * 低缩放时数据点被压得很密，个别离群值会把整条折线压扁；改用分位数当上下界、
+ * 把其余 10% clamp 到边界，趋势更可读。样本很多时按步长抽样再排序，避免大轨迹卡顿。
+ */
+function robustBounds(values: number[], fallbackLo: number, fallbackHi: number): [number, number] {
+  if (values.length < 5 || !(fallbackLo < fallbackHi)) return [fallbackLo, fallbackHi];
+  const stride = Math.max(1, Math.ceil(values.length / 20000));
+  const sample = stride === 1 ? values : values.filter((_, index) => index % stride === 0);
+  const sorted = [...sample].sort((a, b) => a - b);
+  const q = (p: number): number => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))]!;
+  const lo = q(0.05);
+  const hi = q(0.95);
+  return lo < hi ? [lo, hi] : [fallbackLo, fallbackHi];
+}
+
 /** 纵坐标刻度按 hex 写（负数写成 `-0x…`；非有限值退回紧凑十进制） */
 function hexTick(value: number): string {
   if (!Number.isFinite(value)) return fmtCompact(value);
@@ -337,6 +354,8 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
     min -= slack;
     max += slack;
   }
+  // 低缩放折线用的稳健上下界（中间 90% 分位）；高缩放仍用全量 min/max
+  const [robustMin, robustMax] = robustBounds(numeric.map((item) => item.num!), min, max);
   // 前一条采样（变化点提示用）：整卡只建一次，缩放重画时不重复扫
   const prevOf = new Map<Timed<ScalarValue>, Timed<ScalarValue> | null>();
   let previous: Timed<ScalarValue> | null = null;
@@ -351,7 +370,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
   const holder = el('div', { class: 'chart-frame', 'data-key': key });
   const draw = (): void => {
     clear(holder);
-    holder.append(buildWaveSvg(track, items, full, windowFor(key, full), prevOf, ctx, available, color, min, max, hexAxis));
+    holder.append(buildWaveSvg(track, items, full, windowFor(key, full), prevOf, ctx, available, color, min, max, robustMin, robustMax, hexAxis));
   };
   draw();
   installChartViewport(holder, {
@@ -364,7 +383,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
   node.body.append(
     el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
       el('span', { text: `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化` }),
-      el('span', { text: '实线阶梯 = 保持型取值；缩得很小时退化为折线' }),
+      el('span', { text: '实线阶梯 = 保持型取值；缩得很小时退化为折线（纵轴取中间 90% 分位，极端值贴边）' }),
       unknown.length > 0 ? el('span', { text: `◇ 空心斜纹标记 + 斜纹底 = 含未知位 x/z（${fmtInt(unknown.length)} 次）` }) : null,
       el('span', { text: '● 橙点 = 取值发生变化' }),
       items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.5）' }) : null,
@@ -389,6 +408,8 @@ function buildWaveSvg(
   color: string,
   min: number,
   max: number,
+  robustMin: number,
+  robustMax: number,
   hexAxis: boolean,
 ): SVGSVGElement {
   const height = 168;
@@ -398,8 +419,15 @@ function buildWaveSvg(
   const plot = { x: pad.left, y: pad.top, width: width - pad.left - pad.right, height: height - pad.top - pad.bottom };
   const span = Math.max(1e-9, view.to - view.from);
   const x = drawXAxis(svg, { ...plot, from: view.from, to: view.to });
-  numericAxis(svg, { ...plot, min, max, label: '值', ...(hexAxis ? { format: hexTick } : {}) });
-  const ys = linearScale(min, max, plot.y + plot.height, plot.y);
+  const pxPerCycle = plot.width / span;
+  // 低缩放退化为折线：用中间 90% 分位当上下界，极端 10% clamp 到边界；
+  // 高缩放画阶梯/块，仍用全量 min/max（读数要精确）
+  const useRobust = pxPerCycle < LOD_LINE_PX && robustMin < robustMax;
+  const axisMin = useRobust ? robustMin : min;
+  const axisMax = useRobust ? robustMax : max;
+  numericAxis(svg, { ...plot, min: axisMin, max: axisMax, label: '值', ...(hexAxis ? { format: hexTick } : {}) });
+  const sy = linearScale(axisMin, axisMax, plot.y + plot.height, plot.y);
+  const ys = (value: number): number => clamp(sy(value), plot.y, plot.y + plot.height);
   const at = (item: Item): number => clamp(x.px(item.cycle) + (item.async ? 0.5 * x.unit(item.cycle) : 0), plot.x - 24, plot.x + plot.width + 24);
   void full;
 
@@ -409,8 +437,7 @@ function buildWaveSvg(
 
   const windowed = itemsInWindow(items, view);
   if (windowed.length === 0) return svg;
-  const pxPerCycle = plot.width / span;
-  if (pxPerCycle < LOD_LINE_PX) {
+  if (useRobust) {
     // 低缩放：只把窗口内有值的采样连成折线
     const pts = decimateItems(windowed.filter((it) => it.num !== null), MAX_STEPS).map((it): [number, number] => [at(it), ys(it.num!)]);
     if (pts.length >= 2) {
