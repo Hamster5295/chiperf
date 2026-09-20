@@ -105,6 +105,7 @@ rst = "rst" ;                                       (* 无参数 *)
    **不要**在同一份轨迹里混用。
 3. 每条记录写完立刻 `$fflush`（鲁棒性：仿真被杀也能保留已写内容）。
 4. 结束用 `final` / `$finish` 钩子写 `@end`。对于 `Chisel` 等隐藏了该功能的 DSL, 可以不写 `@end`
+5. 尽可能不影响已有功能模块实现，应当使用额外模块外挂在主模块下，通过 foo.bar.signal 等方式抓取信号，而非额外拉线
 
 ### Chisel
 
@@ -118,6 +119,8 @@ override def mvnDeps = Seq(
 ```
 
 仓库见[此处](https://codeberg.org/hamster5295/chiperf-chisel)
+
+在该库中，继承 `ChiperfModule` 即可由框架接管文件头、[rst] 等功能，只需在内部写 when (clock.asBool) 做时钟沿与其他记录即可。
 
 
 ### SystemVerilog
