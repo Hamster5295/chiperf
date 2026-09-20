@@ -129,10 +129,16 @@ const BAR_MIN_PX = 2;
  */
 const BLOCK_FILL = 0.6;
 /**
- * 气泡的填充不透明度。高缩放下的空心虚线六边形与低缩放的橙色叠加层共用同一档，
- * 这样两种缩放下"这里没有内容"的观感一致。
+ * 气泡的填充不透明度。高缩放下的空心虚线六边形与低缩放的橙色叠加层共用这一档，
+ * 作为低缩放下气泡密度最高时的"底色"。
  */
 const BUBBLE_FILL = 0.08;
+/**
+ * 低缩放聚合时，气泡叠加层的透明度按**每列里的气泡周期数**插值：
+ * 1 个周期 → 完全不透明（孤立气泡看得见），64 个周期及以上 → 与六边形填充同档（长空段淡出）。
+ * 只看聚合到一列里的气泡总量（密度），不看某一条气泡有多长。
+ */
+const LOD_BUBBLE_FADE_CYCLES = 64;
 
 /** 时钟泳道的颜色：全局时钟画成绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
@@ -2031,9 +2037,12 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
           valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
-          // 只要这一列有气泡就叠加橙色；透明度与高缩放下的气泡六边形一致，不按密度加深
+          // 只要这一列有气泡就叠加橙色；透明度按该列气泡周期数从 1（1 周期）降到 BUBBLE_FILL（≥64 周期）
+          const fade = clamp((bubbles - 1) / (LOD_BUBBLE_FADE_CYCLES - 1), 0, 1);
           bubbleCols.push(
-            bubbles > 0 ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: BUBBLE_FILL } : blank(),
+            bubbles > 0
+              ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: 1 - (1 - BUBBLE_FILL) * Math.sqrt(fade) }
+              : blank(),
           );
         }
         paintLodShades(g, valueCols, win.x0, win.x1);
