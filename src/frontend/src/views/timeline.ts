@@ -137,7 +137,22 @@ const BUBBLE_FILL = 0.08;
  *  - 启动-休息型轨道两段工作区间之间的长空闲段 → 淡出，不抢视线、降低视疲劳。
  * 只能按段长区分这两类：紧凑流水线和长空闲段的"气泡密度/占比"可能都很高。
  */
-let bubbleFadeCycles = 64;
+const BUBBLE_FADE_STORE = 'chiperf.timeline.bubbleFadeCycles';
+const BUBBLE_FADE_DEFAULT = 64;
+
+/** 读取持久化的阈值；localStorage 不可用（如 file:// 直接打开）时退回默认值 */
+function readBubbleFadeCycles(): number {
+  try {
+    const raw = localStorage.getItem(BUBBLE_FADE_STORE);
+    const n = raw === null ? Number.NaN : Math.floor(Number(raw));
+    if (Number.isFinite(n) && n >= 1) return n;
+  } catch {
+    // 读不到就用默认值
+  }
+  return BUBBLE_FADE_DEFAULT;
+}
+
+let bubbleFadeCycles = readBubbleFadeCycles();
 
 /** 时钟泳道的颜色：全局时钟画成绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
@@ -1312,6 +1327,11 @@ function buildBubbleFadeCard(): HTMLElement {
     }
     bubbleFadeCycles = next;
     input.value = String(next);
+    try {
+      localStorage.setItem(BUBBLE_FADE_STORE, String(next));
+    } catch {
+      // 存不进去也不影响本次会话
+    }
     updateView();
   };
   input.addEventListener('change', apply);
