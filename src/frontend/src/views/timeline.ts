@@ -2042,6 +2042,27 @@ function bubbleShadeIn(ranges: { start: number; end: number }[], from: number, t
   return cycles > 0 ? shaded / cycles : 0;
 }
 
+/**
+ * 低缩放"有值"层专用的配色：只取蓝绿紫青一类冷色，避开红橙色系。
+ * 气泡叠加层也是橙色，若流水线取值再用红/橙/黄，两者会糊在一起分不清。
+ */
+const LOD_LANE_PALETTE = [
+  '#3b82f6', '#10b981', '#8b5cf6', '#06b6d4', '#6366f1', '#14b8a6',
+  '#0ea5e9', '#22c55e', '#0891b2', '#a855f7', '#64748b', '#84cc16',
+];
+const lodLaneCache = new Map<string, string>();
+
+/** 与 `colorFor` 同源（同一个 key 稳定），但只在冷色里选 */
+function lodLaneColor(key: string): string {
+  const cached = lodLaneCache.get(key);
+  if (cached !== undefined) return cached;
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  const color = LOD_LANE_PALETTE[hash % LOD_LANE_PALETTE.length]!;
+  lodLaneCache.set(key, color);
+  return color;
+}
+
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
   const laneColor = colorFor(track.key);
   const prep = pipPrepOf(track);
@@ -2078,14 +2099,16 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 
       const barH = h - 9;
       const barY = y + 4;
-      // 低缩放：只表达两件事 —— 有没有值（按**行色**，每行不同）与气泡有多密（橙色，越密越不透明）。
+      // 低缩放：只表达两件事 —— 有没有值（按行色，每行不同）与气泡（橙色，按段长决定深浅）。
       // 气泡是**叠加**在行色之上的独立一层：否则"气泡很少但成片出现"的区域会被有值那一层盖掉、
       // 整段看不出橙色。逐条目的取值着色在这一比例下没有意义，不做。
+      // 行色在这里改用冷色系：气泡是橙色，暖色的取值层会与它糊在一起。
       if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
         const activeFrom = track.firstCycle;
         const activeTo = track.lastCycle + 1;
         const ranges = track.bubbleRanges;
+        const coldColor = lodLaneColor(track.key);
         const valueCols: LodShade[] = [];
         const bubbleCols: LodShade[] = [];
         const blank = (): LodShade => ({ color: null, y0: barY, y1: barY + barH, alpha: 1 });
@@ -2101,7 +2124,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           }
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
-          valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
+          valueCols.push(bubbles < active ? { color: coldColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
           // 只要这一列有气泡就叠加橙色；透明度由列内气泡段的长度决定（短气泡亮、长空闲段淡出）
           const shade = bubbleShadeIn(ranges, from, to);
           bubbleCols.push(shade > 0 ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: shade } : blank());
