@@ -5,7 +5,7 @@
 
 ## 提交时机
 
-当项目有进展时, 应当合理执行 git commit 提交
+当项目有进展时，有文件修改时, **必须** 合理执行 git commit 提交
 
 提交应当 **原子化**, 即每次提交都仅包含 1 项 feature/enhancement/refactor/fix
 
