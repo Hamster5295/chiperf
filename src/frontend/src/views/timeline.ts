@@ -128,15 +128,13 @@ const BAR_MIN_PX = 2;
  * 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
  */
 const BLOCK_FILL = 0.6;
-/**
- * 气泡的填充不透明度。高缩放下的空心虚线六边形与低缩放的橙色叠加层共用这一档，
- * 作为低缩放下气泡密度最高时的"底色"。
- */
+/** 气泡（空心虚线六边形）的填充不透明度；低缩放的橙色叠加层另有动态透明度 */
 const BUBBLE_FILL = 0.08;
 /**
- * 低缩放聚合时，气泡叠加层的透明度按**每列里的气泡周期数**插值：
- * 1 个周期 → 完全不透明（孤立气泡看得见），64 个周期及以上 → 与六边形填充同档（长空段淡出）。
- * 只看聚合到一列里的气泡总量（密度），不看某一条气泡有多长。
+ * 低缩放聚合时，气泡叠加层的透明度按**气泡段的长度**衰减：
+ * 1 个周期 → 完全不透明（紧密流水线里的偶发气泡一眼可见），
+ * 到 64 个周期及以上 → 完全透明（启动-休息型轨道两段工作区间之间的长空闲段不抢视线、降低视疲劳）。
+ * 只能按段长区分这两类：紧凑流水线和长空闲段的"气泡密度/占比"可能都很高。
  */
 const LOD_BUBBLE_FADE_CYCLES = 64;
 
@@ -1977,6 +1975,32 @@ function bubbleCyclesIn(ranges: { start: number; end: number }[], from: number, 
   return total;
 }
 
+/** 长度为 `len` 的气泡段的可见度：1 周期 → 1，≥ `LOD_BUBBLE_FADE_CYCLES` → 0（线性过渡） */
+function bubbleVisibility(len: number): number {
+  if (len <= 1) return 1;
+  if (len >= LOD_BUBBLE_FADE_CYCLES) return 0;
+  return 1 - (len - 1) / (LOD_BUBBLE_FADE_CYCLES - 1);
+}
+
+/** 一列 `[from, to)` 内气泡周期的平均可见度（按各气泡段的长度加权）；列内没有气泡时为 0 */
+function bubbleShadeIn(ranges: { start: number; end: number }[], from: number, to: number): number {
+  if (to <= from) return 0;
+  let i = lowerBoundRanges(ranges, from);
+  if (i > 0 && ranges[i - 1]!.end >= from) i--;
+  let cycles = 0;
+  let shaded = 0;
+  for (; i < ranges.length; i++) {
+    const range = ranges[i]!;
+    if (range.start >= to) break;
+    const a = Math.max(range.start, from);
+    const b = Math.min(range.end + 1, to);
+    if (b <= a) continue;
+    cycles += b - a;
+    shaded += (b - a) * bubbleVisibility(range.end - range.start + 1);
+  }
+  return cycles > 0 ? shaded / cycles : 0;
+}
+
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
   const laneColor = colorFor(track.key);
   const prep = pipPrepOf(track);
@@ -2037,13 +2061,9 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
           valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
-          // 只要这一列有气泡就叠加橙色；透明度按该列气泡周期数从 1（1 周期）降到 BUBBLE_FILL（≥64 周期）
-          const fade = clamp((bubbles - 1) / (LOD_BUBBLE_FADE_CYCLES - 1), 0, 1);
-          bubbleCols.push(
-            bubbles > 0
-              ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: 1 - (1 - BUBBLE_FILL) * Math.sqrt(fade) }
-              : blank(),
-          );
+          // 只要这一列有气泡就叠加橙色；透明度由列内气泡段的长度决定（短气泡亮、长空闲段淡出）
+          const shade = bubbleShadeIn(ranges, from, to);
+          bubbleCols.push(shade > 0 ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: shade } : blank());
         }
         paintLodShades(g, valueCols, win.x0, win.x1);
         paintLodShades(g, bubbleCols, win.x0, win.x1);
