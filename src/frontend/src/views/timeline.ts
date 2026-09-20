@@ -128,15 +128,16 @@ const BAR_MIN_PX = 2;
  * 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
  */
 const BLOCK_FILL = 0.6;
-/** 气泡（空心虚线六边形）的填充不透明度；低缩放的橙色叠加层另有动态透明度 */
+/** 气泡（空心虚线六边形）的填充不透明度；低缩放下"淡出"的气泡也降到这一档 */
 const BUBBLE_FILL = 0.08;
 /**
- * 低缩放聚合时，气泡叠加层的透明度按**气泡段的长度**衰减：
- * 1 个周期 → 完全不透明（紧密流水线里的偶发气泡一眼可见），
- * 到 64 个周期及以上 → 完全透明（启动-休息型轨道两段工作区间之间的长空闲段不抢视线、降低视疲劳）。
+ * 低缩放聚合时气泡段保持全不透明的最大长度（周期，可在波形下方的卡片里调）。
+ * 长度达到它的气泡段淡出为 `BUBBLE_FILL`：
+ *  - 紧凑流水线里的偶发短气泡 → 全亮，一眼可见；
+ *  - 启动-休息型轨道两段工作区间之间的长空闲段 → 淡出，不抢视线、降低视疲劳。
  * 只能按段长区分这两类：紧凑流水线和长空闲段的"气泡密度/占比"可能都很高。
  */
-const LOD_BUBBLE_FADE_CYCLES = 64;
+let bubbleFadeCycles = 64;
 
 /** 时钟泳道的颜色：全局时钟画成绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
@@ -1083,6 +1084,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [svg]);
   surface.append(el('div', { style: 'display:flex;align-items:flex-start' }, [gutter, plotWrap]));
   cardNode.body.append(surface);
+  host.append(buildBubbleFadeCard());
 
   installWheelZoom(surface);
   installDragZoom(svg);
@@ -1285,6 +1287,47 @@ function buildControls(ctx: ViewContext, plot: Plot): HTMLElement {
   );
   row.append(readout);
   return row;
+}
+
+/**
+ * 波形图下方的设置卡片：低缩放下气泡段的淡出阈值。
+ * 长度达到该阈值（周期）的气泡段淡出为半透明，更短的保持全不透明 ——
+ * 用来在"紧凑流水线要看气泡"与"启动-休息型轨道不想被长空闲段晃眼"之间取一个合适的界。
+ */
+function buildBubbleFadeCard(): HTMLElement {
+  const input = el('input', {
+    type: 'number',
+    min: '1',
+    step: '1',
+    class: 'chip',
+    style: 'width:88px;font:inherit;text-align:right',
+    title: '长度 ≥ 该值（周期）的气泡段在低缩放下淡出',
+  });
+  input.value = String(bubbleFadeCycles);
+  const apply = (): void => {
+    const next = Math.max(1, Math.floor(Number(input.value)));
+    if (!Number.isFinite(next) || next === bubbleFadeCycles) {
+      input.value = String(bubbleFadeCycles);
+      return;
+    }
+    bubbleFadeCycles = next;
+    input.value = String(next);
+    updateView();
+  };
+  input.addEventListener('change', apply);
+  input.addEventListener('keydown', (event) => {
+    if ((event as KeyboardEvent).key === 'Enter') apply();
+  });
+
+  const node = card('气泡淡出（低缩放）', '只影响低缩放：长度 ≥ 阈值的气泡段淡出为半透明，更短的保持全不透明');
+  node.body.append(
+    el('div', { class: 'row' }, [
+      el('span', { class: 'toolbar-label', text: '淡出阈值' }),
+      input,
+      el('span', { class: 'muted', text: '周期 · ≥ 该值的气泡段淡出' }),
+    ]),
+  );
+  return node.root;
 }
 
 /** 时间轴只讲周期，不换算真实时间 */
@@ -1975,11 +2018,9 @@ function bubbleCyclesIn(ranges: { start: number; end: number }[], from: number, 
   return total;
 }
 
-/** 长度为 `len` 的气泡段的可见度：1 周期 → 1，≥ `LOD_BUBBLE_FADE_CYCLES` → 0（线性过渡） */
+/** 长度为 `len` 的气泡段的可见度：短于阈值 → 1（全亮），达到阈值 → 淡出为 `BUBBLE_FILL` */
 function bubbleVisibility(len: number): number {
-  if (len <= 1) return 1;
-  if (len >= LOD_BUBBLE_FADE_CYCLES) return 0;
-  return 1 - (len - 1) / (LOD_BUBBLE_FADE_CYCLES - 1);
+  return len < bubbleFadeCycles ? 1 : BUBBLE_FILL;
 }
 
 /** 一列 `[from, to)` 内气泡周期的平均可见度（按各气泡段的长度加权）；列内没有气泡时为 0 */
