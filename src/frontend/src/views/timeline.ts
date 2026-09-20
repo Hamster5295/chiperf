@@ -124,10 +124,15 @@ const BAR_MIN_PX = 2;
 /**
  * 内容型六边形色块的填充不透明度。
  * 只作用于"实色内容块"（流水线条目、状态机状态段、数值/计数器块）；
- * 空心与推断类标记另有更淡的值：气泡 0.08、推断段 0.15、未闭合条目空心 ——
+ * 空心与推断类标记另有更淡的值：气泡 `BUBBLE_FILL`、推断段 0.15、未闭合条目空心 ——
  * 它们靠"空心"表达"这里没有内容"，填充率一高就看不出来了。
  */
 const BLOCK_FILL = 0.6;
+/**
+ * 气泡的填充不透明度。高缩放下的空心虚线六边形与低缩放的橙色叠加层共用同一档，
+ * 这样两种缩放下"这里没有内容"的观感一致。
+ */
+const BUBBLE_FILL = 0.08;
 
 /** 时钟泳道的颜色：全局时钟画成绿色 —— 波形查看器里时钟基本都画成绿色，扫一眼就能找到节拍 */
 const CLOCK_COLOR = '#22c55e';
@@ -2026,11 +2031,9 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
           valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
-          // 只要这一列有气泡就叠加橙色：密度用 √ 放大，少而集中的区域也能看见
+          // 只要这一列有气泡就叠加橙色；透明度与高缩放下的气泡六边形一致，不按密度加深
           bubbleCols.push(
-            bubbles > 0
-              ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: clamp(0.15 + 0.8 * Math.sqrt(bubbles / active), 0.15, 0.95) }
-              : blank(),
+            bubbles > 0 ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: BUBBLE_FILL } : blank(),
           );
         }
         paintLodShades(g, valueCols, win.x0, win.x1);
@@ -2046,7 +2049,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
         const box = svgEl('path', {
           d: hexPath(left + 0.5, left + 0.5 + Math.max(2, width - 1), y + 4, y + h - 5, 4),
           fill: COLOR.bubble,
-          'fill-opacity': 0.08,
+          'fill-opacity': BUBBLE_FILL,
           stroke: COLOR.bubble,
           'stroke-width': 1,
           // 推断段与实测段靠虚线疏密区分（推断的更疏）：靠降低不透明度区分太弱，
