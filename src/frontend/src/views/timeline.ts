@@ -2038,9 +2038,14 @@ function bubbleCyclesIn(ranges: { start: number; end: number }[], from: number, 
   return total;
 }
 
-/** 长度为 `len` 的气泡段的可见度：短于阈值 → 1（全亮），达到阈值 → 淡出为 `BUBBLE_FILL` */
+/** 长度为 `len` 的气泡段的淡出分量：短于阈值 → 1（不淡出），达到阈值 → 淡到 `BUBBLE_FILL` */
 function bubbleVisibility(len: number): number {
   return len < bubbleFadeCycles ? 1 : BUBBLE_FILL;
+}
+
+/** 气泡的"底色亮度"按密度加亮/减暗（沿用本轮改动前的公式）：占比 0 → 0.15，占比 1 → 0.95 */
+function bubbleDensityAlpha(density: number): number {
+  return clamp(0.15 + 0.8 * Math.sqrt(density), 0.15, 0.95);
 }
 
 /** 一列 `[from, to)` 内气泡周期的平均可见度（按各气泡段的长度加权）；列内没有气泡时为 0 */
@@ -2145,9 +2150,18 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
           valueCols.push(bubbles < active ? { color: coldColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
-          // 只要这一列有气泡就叠加橙色；透明度由列内气泡段的长度决定（短气泡亮、长空闲段淡出）
+          // 只要这一列有气泡就叠加橙色：
+          //  - 淡出分量由列内气泡段的长度决定（短气泡不淡、长空闲段淡到 BUBBLE_FILL）；
+          //  - 实际亮度再按该列气泡密度加亮/减暗（沿用改动前的公式），避免短气泡一律全亮、太刺眼。
           const shade = bubbleShadeIn(ranges, from, to);
-          bubbleCols.push(shade > 0 ? { color: COLOR.bubble, y0: barY, y1: barY + barH, alpha: shade } : blank());
+          if (shade > 0) {
+            const densityAlpha = bubbleDensityAlpha(bubbles / active);
+            const shortFraction = clamp((shade - BUBBLE_FILL) / (1 - BUBBLE_FILL), 0, 1);
+            const alpha = BUBBLE_FILL + (densityAlpha - BUBBLE_FILL) * shortFraction;
+            bubbleCols.push({ color: COLOR.bubble, y0: barY, y1: barY + barH, alpha });
+          } else {
+            bubbleCols.push(blank());
+          }
         }
         paintLodShades(g, valueCols, win.x0, win.x1);
         paintLodShades(g, bubbleCols, win.x0, win.x1);
