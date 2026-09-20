@@ -11,6 +11,9 @@
  *  - **Zba/Zbb/Zbc/Zbs** 位操作（clz/ctz/cpop/rev8/rol/ror/andn/min/max/
  *    sh1add/clmul/bset/bclr/binv/bext/sext.b/zext.h…）
  *  - **Zicond**（czero.eqz/nez）、**Zfh**(H) 的半精度浮点
+ *  - **V**（RVV 1.0）：vsetvli/vsetivli/vsetvl、整数/定点/浮点算术、
+ *    掩码/归约/搬移/转换，以及单位步长/跨步/索引与段式的向量访存
+ *    （含 fault-only-first、整寄存器与掩码访存）
  *
  * 译码只影响显示，不改动解析结果。没有 PC，所以跳转/分支给的是**相对偏移**；
  * 认不出的编码给 `.word 0x…` / `.c 0x…`，不抛异常。
@@ -273,10 +276,13 @@ export function rvDecode(word: number, xlen: 32 | 64): string {
       return ok ? `${name!.padEnd(6)} ${reg(rs2)}, ${immS}(${reg(rs1)})` : unknown;
     }
     case 0x07: {
+      // funct3 0/5/6/7 是向量访存（EEW 8/16/32/64），标量浮点用 1/2/3
+      if (funct3 === 0 || funct3 === 5 || funct3 === 6 || funct3 === 7) return decodeVectorMem(w, false);
       const name = FLOAD[funct3];
       return name === undefined ? unknown : `${name.padEnd(6)} ${freg(rd)}, ${immI}(${reg(rs1)})`;
     }
     case 0x27: {
+      if (funct3 === 0 || funct3 === 5 || funct3 === 6 || funct3 === 7) return decodeVectorMem(w, true);
       const name = FSTORE[funct3];
       return name === undefined ? unknown : `${name.padEnd(6)} ${freg(rs2)}, ${immS}(${reg(rs1)})`;
     }
@@ -478,6 +484,9 @@ export function rvDecode(word: number, xlen: 32 | 64): string {
       return `${name.padEnd(6)} ${reg(rd)}, ${csrName(bits(w, 31, 20) & 0xfff)}, ${source}`;
     }
 
+    case 0x57:
+      return decodeVector(w, xlen);
+
     default:
       return unknown;
   }
@@ -621,4 +630,411 @@ function decodeCompressed(h: number, xlen: 32 | 64): string {
     default:
       return r64 ? `c.sdsp ${reg(rs2)}, ${(bits(h, 12, 10) << 3) | (bits(h, 9, 7) << 6)}(sp)` : fallback;
   }
+}
+
+// ------------------------------------------------------------------ V 扩展
+
+/** 向量寄存器名（v0–v31） */
+const vreg = (index: number): string => `v${index}`;
+
+/** 掩码后缀：vm=0 表示结果受 v0 掩码约束，GNU 写作 `, v0.t` */
+const vmask = (vm: number): string => (vm === 0 ? ', v0.t' : '');
+
+/** 向量访存 EEW：width[2:0]（001/010/011 留给标量浮点，向量不使用） */
+const V_EEW: Record<number, number> = { 0: 8, 5: 16, 6: 32, 7: 64 };
+
+/** vtype 的 LMUL 编码：100 保留，101/110/111 分别是 mf8/mf4/mf2 */
+const V_LMUL = ['m1', 'm2', 'm4', 'm8', null, 'mf8', 'mf4', 'mf2'];
+const V_SEW = [8, 16, 32, 64];
+
+/** vtype 低 8 位（inst[27:20]）→ `e32, m1, ta, ma`；保留组合返回 null */
+function vtypeText(vt: number): string | null {
+  const lmul = V_LMUL[vt & 0b111];
+  const sew = V_SEW[(vt >> 3) & 0b111];
+  if (lmul === null || sew === undefined) return null;
+  return `e${sew}, ${lmul}, ${(vt >> 6) & 1 ? 'ta' : 'tu'}, ${(vt >> 7) & 1 ? 'ma' : 'mu'}`;
+}
+
+/**
+ * 向量访存（opcode 0x07 / 0x27，funct3 = width）。mop 选寻址模式，
+ * lumop/sumop（bits[24:20]，单位步长的 rs2 槽）再分出整寄存器与掩码访存。
+ */
+function decodeVectorMem(w: number, store: boolean): string {
+  const unknown = `.word  ${hex(w)}`;
+  const nf = bits(w, 31, 29);
+  const mew = bits(w, 28, 28);
+  const mop = bits(w, 27, 26);
+  const vm = bits(w, 25, 25);
+  const field = bits(w, 24, 20);
+  const base = bits(w, 19, 15);
+  const width = bits(w, 14, 12);
+  const data = bits(w, 11, 7);
+  const eew = V_EEW[width];
+  if (mew !== 0 || eew === undefined) return unknown;
+  const m = vmask(vm);
+  const addr = `(${reg(base)})`;
+
+  if (mop === 0b00) {
+    if (field === 0b00000) {
+      if (nf === 0) return `${store ? 'vse' : 'vle'}${eew}.v ${vreg(data)}, ${addr}${m}`;
+      const seg = nf + 1;
+      return `${store ? 'vsseg' : 'vlseg'}${seg}e${eew}.v ${vreg(data)}, ${addr}${m}`;
+    }
+    if (field === 0b01000) {
+      const nreg = nf === 0 ? 1 : nf === 1 ? 2 : nf === 3 ? 4 : nf === 7 ? 8 : 0;
+      if (nreg === 0 || vm !== 1) return unknown;
+      if (store) return width === 0 ? `vs${nreg}r.v ${vreg(data)}, ${addr}` : unknown;
+      return eew === 8 ? `vl${nreg}r.v ${vreg(data)}, ${addr}` : `vl${nreg}re${eew}.v ${vreg(data)}, ${addr}`;
+    }
+    if (field === 0b01011) {
+      // 掩码访存固定 EEW=8、nf=0 且不允许掩码
+      return width === 0 && nf === 0 && vm === 1 ? `${store ? 'vsm' : 'vlm'}.v ${vreg(data)}, ${addr}` : unknown;
+    }
+    if (field === 0b10000 && !store) {
+      // fault-only-first 对段式同样成立（vlseg<nf>e<eew>ff.v）
+      const root = nf === 0 ? `vle${eew}` : `vlseg${nf + 1}e${eew}`;
+      return `${root}ff.v ${vreg(data)}, ${addr}${m}`;
+    }
+    return unknown;
+  }
+
+  // 跨步用 GPR 步长，索引用向量字节偏移；段式把段数编进 nf
+  const seg = nf > 0 ? `${nf + 1}` : '';
+  const last = mop === 0b10 ? reg(field) : vreg(field);
+  if (mop === 0b10) {
+    const name = nf === 0 ? `${store ? 'vsse' : 'vlse'}${eew}.v` : `${store ? 'vssseg' : 'vlsseg'}${seg}e${eew}.v`;
+    return `${name} ${vreg(data)}, ${addr}, ${last}${m}`;
+  }
+  if (mop === 0b01) {
+    const name = nf === 0 ? `${store ? 'vsuxei' : 'vluxei'}${eew}.v` : `${store ? 'vsuxseg' : 'vluxseg'}${seg}ei${eew}.v`;
+    return `${name} ${vreg(data)}, ${addr}, ${last}${m}`;
+  }
+  const name = nf === 0 ? `${store ? 'vsoxei' : 'vloxei'}${eew}.v` : `${store ? 'vsoxseg' : 'vloxseg'}${seg}ei${eew}.v`;
+  return `${name} ${vreg(data)}, ${addr}, ${last}${m}`;
+}
+
+/** OPIVV/OPIVX/OPIVI 的助记词（下标 0=VV、1=VX、2=VI；空串表示该组合不合法） */
+const V_INT: Record<number, [string, string, string]> = {
+  0x00: ['vadd.vv', 'vadd.vx', 'vadd.vi'],
+  0x02: ['vsub.vv', 'vsub.vx', ''],
+  0x03: ['', 'vrsub.vx', 'vrsub.vi'],
+  0x04: ['vminu.vv', 'vminu.vx', ''],
+  0x05: ['vmin.vv', 'vmin.vx', ''],
+  0x06: ['vmaxu.vv', 'vmaxu.vx', ''],
+  0x07: ['vmax.vv', 'vmax.vx', ''],
+  0x09: ['vand.vv', 'vand.vx', 'vand.vi'],
+  0x0a: ['vor.vv', 'vor.vx', 'vor.vi'],
+  0x0b: ['vxor.vv', 'vxor.vx', 'vxor.vi'],
+  0x0c: ['vrgather.vv', 'vrgather.vx', 'vrgather.vi'],
+  0x0e: ['vrgatherei16.vv', 'vslideup.vx', 'vslideup.vi'],
+  0x0f: ['', 'vslidedown.vx', 'vslidedown.vi'],
+  0x18: ['vmseq.vv', 'vmseq.vx', 'vmseq.vi'],
+  0x19: ['vmsne.vv', 'vmsne.vx', 'vmsne.vi'],
+  0x1a: ['vmsltu.vv', 'vmsltu.vx', ''],
+  0x1b: ['vmslt.vv', 'vmslt.vx', ''],
+  0x1c: ['vmsleu.vv', 'vmsleu.vx', 'vmsleu.vi'],
+  0x1d: ['vmsle.vv', 'vmsle.vx', 'vmsle.vi'],
+  0x1e: ['', 'vmsgtu.vx', 'vmsgtu.vi'],
+  0x1f: ['', 'vmsgt.vx', 'vmsgt.vi'],
+  0x20: ['vsaddu.vv', 'vsaddu.vx', 'vsaddu.vi'],
+  0x21: ['vsadd.vv', 'vsadd.vx', 'vsadd.vi'],
+  0x22: ['vssubu.vv', 'vssubu.vx', ''],
+  0x23: ['vssub.vv', 'vssub.vx', ''],
+  0x25: ['vsll.vv', 'vsll.vx', 'vsll.vi'],
+  0x27: ['vsmul.vv', 'vsmul.vx', ''],
+  0x28: ['vsrl.vv', 'vsrl.vx', 'vsrl.vi'],
+  0x29: ['vsra.vv', 'vsra.vx', 'vsra.vi'],
+  0x2a: ['vssrl.vv', 'vssrl.vx', 'vssrl.vi'],
+  0x2b: ['vssra.vv', 'vssra.vx', 'vssra.vi'],
+  0x2c: ['vnsrl.wv', 'vnsrl.wx', 'vnsrl.wi'],
+  0x2d: ['vnsra.wv', 'vnsra.wx', 'vnsra.wi'],
+  0x2e: ['vnclipu.wv', 'vnclipu.wx', 'vnclipu.wi'],
+  0x2f: ['vnclip.wv', 'vnclip.wx', 'vnclip.wi'],
+};
+
+/** VI 形式里立即数按无符号解释的 funct6（其余按 5 位有符号） */
+const V_IMM_UNSIGNED = new Set([0x0c, 0x0e, 0x0f, 0x25, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f]);
+
+/** OPMVV/OPMVX 普通三操作数（vd, vs2, vs1/rs1） */
+const V_MV: Record<number, string> = {
+  0x08: 'vaaddu', 0x09: 'vaadd', 0x0a: 'vasubu', 0x0b: 'vasub',
+  0x20: 'vdivu', 0x21: 'vdiv', 0x22: 'vremu', 0x23: 'vrem',
+  0x24: 'vmulhu', 0x25: 'vmul', 0x26: 'vmulhsu', 0x27: 'vmulh',
+  0x30: 'vwaddu', 0x31: 'vwadd', 0x32: 'vwsubu', 0x33: 'vwsub',
+  0x34: 'vwaddu.w', 0x35: 'vwadd.w', 0x36: 'vwsubu.w', 0x37: 'vwsub.w',
+  0x38: 'vwmulu', 0x3a: 'vwmulsu', 0x3b: 'vwmul',
+};
+
+/** OPMVV/OPMVX 乘加：GNU 的源码顺序是 vd, vs1, vs2（与编码槽顺序不同） */
+const V_FMA: Record<number, string> = {
+  0x29: 'vmadd', 0x2b: 'vnmsub', 0x2d: 'vmacc', 0x2f: 'vnmsac',
+  0x3c: 'vwmaccu', 0x3d: 'vwmacc', 0x3e: 'vwmaccus', 0x3f: 'vwmaccsu',
+};
+
+/** OPMVV 整数归约（仅 VV） */
+const V_RED_I: Record<number, string> = {
+  0x00: 'vredsum', 0x01: 'vredand', 0x02: 'vredor', 0x03: 'vredxor',
+  0x04: 'vredminu', 0x05: 'vredmin', 0x06: 'vredmaxu', 0x07: 'vredmax',
+};
+
+/** OPMVV 掩码逻辑；vs1==vs2 时 GNU 给 vmmv/vmnot/vmclr/vmset 别名 */
+const V_MASK_LOGIC: Record<number, string> = {
+  0x18: 'vmandn.mm', 0x19: 'vmand.mm', 0x1a: 'vmor.mm', 0x1b: 'vmxor.mm',
+  0x1c: 'vmorn.mm', 0x1d: 'vmnand.mm', 0x1e: 'vmnor.mm', 0x1f: 'vmxnor.mm',
+};
+
+/** OPFVV/OPFVF 普通三操作数（下标 0=VV、1=VF） */
+const V_FP_OP: Record<number, [string, string]> = {
+  0x00: ['vfadd.vv', 'vfadd.vf'],
+  0x02: ['vfsub.vv', 'vfsub.vf'],
+  0x04: ['vfmin.vv', 'vfmin.vf'],
+  0x06: ['vfmax.vv', 'vfmax.vf'],
+  0x08: ['vfsgnj.vv', 'vfsgnj.vf'],
+  0x09: ['vfsgnjn.vv', 'vfsgnjn.vf'],
+  0x0a: ['vfsgnjx.vv', 'vfsgnjx.vf'],
+  0x18: ['vmfeq.vv', 'vmfeq.vf'],
+  0x19: ['vmfle.vv', 'vmfle.vf'],
+  0x1b: ['vmflt.vv', 'vmflt.vf'],
+  0x1c: ['vmfne.vv', 'vmfne.vf'],
+  0x1d: ['', 'vmfgt.vf'],
+  0x1f: ['', 'vmfge.vf'],
+  0x20: ['vfdiv.vv', 'vfdiv.vf'],
+  0x21: ['', 'vfrdiv.vf'],
+  0x24: ['vfmul.vv', 'vfmul.vf'],
+  0x27: ['', 'vfrsub.vf'],
+  0x30: ['vfwadd.vv', 'vfwadd.vf'],
+  0x32: ['vfwsub.vv', 'vfwsub.vf'],
+  0x34: ['vfwadd.wv', 'vfwadd.wf'],
+  0x36: ['vfwsub.wv', 'vfwsub.wf'],
+  0x38: ['vfwmul.vv', 'vfwmul.vf'],
+};
+
+/** OPFVV/OPFVF 乘加：源码顺序同样是 vd, vs1, vs2 */
+const V_FMA_FP: Record<number, string> = {
+  0x28: 'vfmadd', 0x29: 'vfnmadd', 0x2a: 'vfmsub', 0x2b: 'vfnmsub',
+  0x2c: 'vfmacc', 0x2d: 'vfnmacc', 0x2e: 'vfmsac', 0x2f: 'vfnmsac',
+  0x3c: 'vfwmacc', 0x3d: 'vfwnmacc', 0x3e: 'vfwmsac', 0x3f: 'vfwnmsac',
+};
+
+/** OPFVV 浮点归约（仅 VV） */
+const V_RED_FP: Record<number, string> = {
+  0x01: 'vfredusum.vs', 0x03: 'vfredosum.vs', 0x05: 'vfredmin.vs', 0x07: 'vfredmax.vs',
+  0x31: 'vfwredusum.vs', 0x33: 'vfwredosum.vs',
+};
+
+/** OPFVV 转换类：vs1 选转换方向 */
+const V_FPCVT: Record<number, string> = {
+  0: 'vfcvt.xu.f.v', 1: 'vfcvt.x.f.v', 2: 'vfcvt.f.xu.v', 3: 'vfcvt.f.x.v',
+  6: 'vfcvt.rtz.xu.f.v', 7: 'vfcvt.rtz.x.f.v',
+  8: 'vfwcvt.xu.f.v', 9: 'vfwcvt.x.f.v', 10: 'vfwcvt.f.xu.v', 11: 'vfwcvt.f.x.v', 12: 'vfwcvt.f.f.v',
+  14: 'vfwcvt.rtz.xu.f.v', 15: 'vfwcvt.rtz.x.f.v',
+  16: 'vfncvt.xu.f.w', 17: 'vfncvt.x.f.w', 18: 'vfncvt.f.xu.w', 19: 'vfncvt.f.x.w',
+  20: 'vfncvt.f.f.w', 21: 'vfncvt.rod.f.f.w', 22: 'vfncvt.rtz.xu.f.w', 23: 'vfncvt.rtz.x.f.w',
+};
+
+/** OPFVV 单目：vs1 选 sqrt/分类 */
+const V_FPUNARY: Record<number, string> = { 0: 'vfsqrt.v', 4: 'vfrsqrt7.v', 5: 'vfrec7.v', 16: 'vfclass.v' };
+
+/** 带进位的加法/减法族（funct6 → 助记词） */
+const V_CARRY: Record<number, string> = { 0x10: 'vadc', 0x11: 'vmadc', 0x12: 'vsbc', 0x13: 'vmsbc' };
+
+/**
+ * 译一条向量算术/配置指令（opcode 0x57）。funct3 是操作数类别
+ * （OPIVV/OPFVV/OPMVV/OPIVI/OPIVX/OPFVF/OPMVX/OPCFG），funct6 选具体指令。
+ */
+function decodeVector(w: number, _xlen: 32 | 64): string {
+  const unknown = `.word  ${hex(w)}`;
+  const funct6 = bits(w, 31, 26);
+  const vm = bits(w, 25, 25);
+  const vs2 = bits(w, 24, 20);
+  const vs1 = bits(w, 19, 15);
+  const funct3 = bits(w, 14, 12);
+  const vd = bits(w, 11, 7);
+
+  // ---- 配置：vsetvli / vsetvl / vsetivli（vtype 低 8 位在 inst[27:20]）
+  if (funct3 === 7) {
+    const vt = bits(w, 27, 20);
+    // vtype 无法符号化（保留位/非法 sew/lmul）时 GNU 直接给原始立即数
+    if (bits(w, 31, 31) === 0) {
+      const t = bits(w, 30, 28) === 0 ? vtypeText(vt) : null;
+      return `vsetvli ${reg(vd)}, ${reg(vs1)}, ${t ?? bits(w, 30, 20)}`;
+    }
+    // vsetvl 的 bits[29:25] 是保留位，必须为 0
+    if (bits(w, 30, 30) === 0) {
+      if (bits(w, 29, 25) !== 0) return unknown;
+      return `vsetvl  ${reg(vd)}, ${reg(vs1)}, ${reg(vs2)}`;
+    }
+    const t = bits(w, 29, 28) === 0 ? vtypeText(vt) : null;
+    return `vsetivli ${reg(vd)}, ${vs1}, ${t ?? bits(w, 29, 20)}`;
+  }
+
+  const m = vmask(vm);
+
+  // ---- 整数 OPIVV / OPIVX / OPIVI
+  if (funct3 === 0 || funct3 === 3 || funct3 === 4) {
+    const src = funct3 === 0 ? vreg(vs1) : funct3 === 4 ? reg(vs1) : '';
+    const sfx = funct3 === 0 ? 'vv' : 'vx';
+
+    // vadc / vmadc / vsbc / vmsbc（进位输入是隐式 v0，作为第 4 操作数写出）
+    if (funct6 === 0x10 || funct6 === 0x11 || funct6 === 0x12 || funct6 === 0x13) {
+      const isCarry = funct6 === 0x10 || funct6 === 0x12; // vadc / vsbc 只有 masked 形式
+      if (funct3 === 3) {
+        if (funct6 === 0x11) return vm === 0 ? `vmadc.vim ${vreg(vd)}, ${vreg(vs2)}, ${sext(vs1, 5)}, v0` : `vmadc.vi ${vreg(vd)}, ${vreg(vs2)}, ${sext(vs1, 5)}`;
+        return funct6 === 0x10 && vm === 0 ? `vadc.vim ${vreg(vd)}, ${vreg(vs2)}, ${sext(vs1, 5)}, v0` : unknown;
+      }
+      const name = V_CARRY[funct6]!;
+      if (isCarry || vm === 0) {
+        if (isCarry && vm !== 0) return unknown;
+        return `${name}.${sfx}m ${vreg(vd)}, ${vreg(vs2)}, ${src}, v0`;
+      }
+      return `${name}.${sfx} ${vreg(vd)}, ${vreg(vs2)}, ${src}`;
+    }
+
+    // vmerge.vvm/vxm/vim 与 vmv.v.v/v.x/v.i 共用 funct6
+    if (funct6 === 0x17) {
+      if (funct3 === 3) {
+        if (vm === 1 && vs2 === 0) return `vmv.v.i ${vreg(vd)}, ${sext(vs1, 5)}`;
+        return vm === 0 ? `vmerge.vim ${vreg(vd)}, ${vreg(vs2)}, ${sext(vs1, 5)}, v0` : unknown;
+      }
+      if (vm === 1 && vs2 === 0) return `vmv.v.${funct3 === 0 ? 'v' : 'x'} ${vreg(vd)}, ${src}`;
+      return vm === 0 ? `vmerge.${sfx}m ${vreg(vd)}, ${vreg(vs2)}, ${src}, v0` : unknown;
+    }
+
+    // vwredsumu.vs / vwredsum.vs 是 OPIVV 槽里的归约
+    if (funct6 === 0x30 || funct6 === 0x31) {
+      if (funct3 !== 0) return unknown;
+      return `${funct6 === 0x30 ? 'vwredsumu' : 'vwredsum'}.vs ${vreg(vd)}, ${vreg(vs2)}, ${vreg(vs1)}${m}`;
+    }
+
+    // vmv<nreg>r.v 借 OPIVI 的 vmv 槽，nreg 编在 vs1
+    if (funct6 === 0x27 && funct3 === 3) {
+      const nreg = vs1 === 0 ? 1 : vs1 === 1 ? 2 : vs1 === 3 ? 4 : vs1 === 7 ? 8 : 0;
+      if (nreg === 0 || vm !== 1) return unknown;
+      return `vmv${nreg}r.v ${vreg(vd)}, ${vreg(vs2)}`;
+    }
+
+    const names = V_INT[funct6];
+    const name = names?.[funct3 === 0 ? 0 : funct3 === 4 ? 1 : 2];
+    if (name === undefined || name === '') return unknown;
+
+    // GNU 别名：vneg / vnot / vncvt
+    if (funct6 === 0x03 && funct3 === 4 && vs1 === 0) return `vneg.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+    if (funct6 === 0x0b && funct3 === 3 && vs1 === 0x1f) return `vnot.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+    if (funct6 === 0x2c && funct3 === 4 && vs1 === 0) return `vncvt.x.x.w ${vreg(vd)}, ${vreg(vs2)}${m}`;
+
+    const imm = V_IMM_UNSIGNED.has(funct6) ? String(vs1) : String(sext(vs1, 5));
+    return `${name} ${vreg(vd)}, ${vreg(vs2)}, ${funct3 === 3 ? imm : src}${m}`;
+  }
+
+  // ---- OPMVV / OPMVX
+  if (funct3 === 2 || funct3 === 6) {
+    const sfx = funct3 === 2 ? 'vv' : 'vx';
+
+    const red = V_RED_I[funct6];
+    if (red !== undefined && funct3 === 2) return `${red}.vs ${vreg(vd)}, ${vreg(vs2)}, ${vreg(vs1)}${m}`;
+
+    const fma = V_FMA[funct6];
+    if (fma !== undefined) {
+      if (funct6 === 0x3e && funct3 === 2) return unknown; // vwmaccus 只有 VX
+      return funct3 === 2
+        ? `${fma}.vv ${vreg(vd)}, ${vreg(vs1)}, ${vreg(vs2)}${m}`
+        : `${fma}.vx ${vreg(vd)}, ${reg(vs1)}, ${vreg(vs2)}${m}`;
+    }
+
+    if (funct3 === 6 && funct6 === 0x0e) return `vslide1up.vx ${vreg(vd)}, ${vreg(vs2)}, ${reg(vs1)}${m}`;
+    if (funct3 === 6 && funct6 === 0x0f) return `vslide1down.vx ${vreg(vd)}, ${vreg(vs2)}, ${reg(vs1)}${m}`;
+
+    // 别名：vwcvt.x.x.v / vwcvtu.x.x.v
+    if (funct3 === 6 && vs1 === 0) {
+      if (funct6 === 0x30) return `vwcvtu.x.x.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+      if (funct6 === 0x31) return `vwcvt.x.x.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+    }
+
+    const mv = V_MV[funct6];
+    if (mv !== undefined) {
+      // .w 形式的操作数后缀是 .wv/.wx，而不是 .vv/.vx
+      const name = mv.endsWith('.w') ? `${mv}${sfx[1]}` : `${mv}.${sfx}`;
+      return `${name} ${vreg(vd)}, ${vreg(vs2)}, ${funct3 === 2 ? vreg(vs1) : reg(vs1)}${m}`;
+    }
+
+    if (funct3 === 2) {
+      if (funct6 === 0x10) {
+        if (vm === 1 && vs1 === 0) return `vmv.x.s ${reg(vd)}, ${vreg(vs2)}`;
+        if (vs1 === 16) return `vcpop.m ${reg(vd)}, ${vreg(vs2)}${m}`;
+        if (vs1 === 17) return `vfirst.m ${reg(vd)}, ${vreg(vs2)}${m}`;
+        return unknown;
+      }
+      if (funct6 === 0x14) {
+        const mask = { 1: 'vmsbf.m', 2: 'vmsof.m', 3: 'vmsif.m', 16: 'viota.m' } as Record<number, string>;
+        const name = mask[vs1];
+        if (name !== undefined) return `${name} ${vreg(vd)}, ${vreg(vs2)}${m}`;
+        return vs1 === 17 && vs2 === 0 ? `vid.v ${vreg(vd)}${m}` : unknown;
+      }
+      if (funct6 === 0x12) {
+        const ext = { 2: 'vzext.vf8', 3: 'vsext.vf8', 4: 'vzext.vf4', 5: 'vsext.vf4', 6: 'vzext.vf2', 7: 'vsext.vf2' } as Record<number, string>;
+        const name = ext[vs1];
+        return name === undefined ? unknown : `${name} ${vreg(vd)}, ${vreg(vs2)}${m}`;
+      }
+      if (funct6 === 0x17) {
+        return vm === 1 ? `vcompress.vm ${vreg(vd)}, ${vreg(vs2)}, ${vreg(vs1)}` : unknown;
+      }
+      const logic = V_MASK_LOGIC[funct6];
+      if (logic !== undefined) {
+        if (vm !== 1) return unknown;
+        if (vs1 === vs2) {
+          if (funct6 === 0x19) return `vmmv.m ${vreg(vd)}, ${vreg(vs2)}`;
+          if (funct6 === 0x1d) return `vmnot.m ${vreg(vd)}, ${vreg(vs2)}`;
+          // vmclr/vmset 要求三个寄存器相同（vd = vs2 op vs1 = 常量）
+          if (funct6 === 0x1b && vd === vs2) return `vmclr.m ${vreg(vd)}`;
+          if (funct6 === 0x1f && vd === vs2) return `vmset.m ${vreg(vd)}`;
+        }
+        return `${logic} ${vreg(vd)}, ${vreg(vs2)}, ${vreg(vs1)}`;
+      }
+    }
+    // vmv.s.x（OPMVX）
+    if (funct6 === 0x10 && vm === 1 && vs2 === 0) return `vmv.s.x ${vreg(vd)}, ${reg(vs1)}`;
+    return unknown;
+  }
+
+  // ---- 浮点 OPFVV / OPFVF
+  if (funct3 === 1 || funct3 === 5) {
+    const sfx = funct3 === 1 ? 'vv' : 'vf';
+    const src = funct3 === 1 ? vreg(vs1) : freg(vs1);
+
+    if (funct6 === 0x10) {
+      if (funct3 === 1 && vm === 1 && vs1 === 0) return `vfmv.f.s ${freg(vd)}, ${vreg(vs2)}`;
+      if (funct3 === 5 && vm === 1 && vs2 === 0) return `vfmv.s.f ${vreg(vd)}, ${freg(vs1)}`;
+      return unknown;
+    }
+    if (funct6 === 0x17) {
+      if (funct3 !== 5) return unknown;
+      if (vm === 0) return `vfmerge.vfm ${vreg(vd)}, ${vreg(vs2)}, ${freg(vs1)}, v0`;
+      return vs2 === 0 ? `vfmv.v.f ${vreg(vd)}, ${freg(vs1)}` : unknown;
+    }
+    if (funct6 === 0x12 || funct6 === 0x13) {
+      if (funct3 !== 1) return unknown;
+      const name = funct6 === 0x12 ? V_FPCVT[vs1] : V_FPUNARY[vs1];
+      return name === undefined ? unknown : `${name} ${vreg(vd)}, ${vreg(vs2)}${m}`;
+    }
+    if (funct3 === 5 && funct6 === 0x0e) return `vfslide1up.vf ${vreg(vd)}, ${vreg(vs2)}, ${freg(vs1)}${m}`;
+    if (funct3 === 5 && funct6 === 0x0f) return `vfslide1down.vf ${vreg(vd)}, ${vreg(vs2)}, ${freg(vs1)}${m}`;
+
+    const red = V_RED_FP[funct6];
+    if (red !== undefined && funct3 === 1) return `${red} ${vreg(vd)}, ${vreg(vs2)}, ${vreg(vs1)}${m}`;
+
+    const fma = V_FMA_FP[funct6];
+    if (fma !== undefined) return `${fma}.${sfx} ${vreg(vd)}, ${src}, ${vreg(vs2)}${m}`;
+
+    const op = V_FP_OP[funct6];
+    const name = op?.[funct3 === 1 ? 0 : 1];
+    if (name === undefined || name === '') return unknown;
+    // GNU 别名：vfneg / vfabs（vs1==vs2 的符号注入）
+    if (funct3 === 1 && vs1 === vs2) {
+      if (funct6 === 0x09) return `vfneg.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+      if (funct6 === 0x0a) return `vfabs.v ${vreg(vd)}, ${vreg(vs2)}${m}`;
+    }
+    return `${name} ${vreg(vd)}, ${vreg(vs2)}, ${src}${m}`;
+  }
+
+  return unknown;
 }

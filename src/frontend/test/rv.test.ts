@@ -4,7 +4,7 @@
  * 用例里的**指令编码全部来自真实工具链**（riscv64-unknown-elf-as / objdump，
  * -march=rv64gc_zicsr_zifencei_zba_zbb_zbc_zbs_zicond_zihintpause_zfh），
  * 不是手推的：位域取错、立即数拼错、funct3 张冠李戴都会在这里失败。
- * 覆盖面见 src/rv.ts 的文件头 —— RV64GC + Zicsr/Zifencei + Zba/Zbb/Zbc/Zbs + Zicond。
+ * 覆盖面见 src/rv.ts 的文件头 —— RV64GC + Zicsr/Zifencei + Zba/Zbb/Zbc/Zbs + Zicond + V。
  */
 import { describe, expect, test } from 'bun:test';
 import { formatScalarBy, rvDecode } from '../src/rv.ts';
@@ -176,6 +176,161 @@ describe('Zba / Zbb / Zbc / Zbs / Zicond', () => {
     expect(decode(0x4875d513, 64)).toBe('bexti a0, a1, 7');
     expect(decode(0x0ac5b533, 64)).toBe('clmulh a0, a1, a2');
     expect(decode(0x0ec5f533, 64)).toBe('czero.nez a0, a1, a2');
+  });
+});
+
+describe('V 扩展（RVV 1.0）', () => {
+  test('配置：vsetvli / vsetivli / vsetvl', () => {
+    expect(decode(0x0d0572d7, 64)).toBe('vsetvli t0, a0, e32, m1, ta, ma');
+    expect(decode(0x001572d7, 64)).toBe('vsetvli t0, a0, e8, m2, tu, mu');
+    expect(decode(0x0df572d7, 64)).toBe('vsetvli t0, a0, e64, mf2, ta, ma');
+    expect(decode(0xcd0272d7, 64)).toBe('vsetivli t0, 4, e32, m1, ta, ma');
+    expect(decode(0x80b572d7, 64)).toBe('vsetvl t0, a0, a1');
+    // 保留 vtype 不做符号化，GNU 直接给原始立即数
+    expect(decode(0x100572d7, 64)).toBe('vsetvli t0, a0, 256');
+    expect(decode(0xf00272d7, 64)).toBe('vsetivli t0, 4, 768');
+  });
+
+  test('单位步长 / 跨步 / 索引访存', () => {
+    expect(decode(0x02050087, 64)).toBe('vle8.v v1, (a0)');
+    expect(decode(0x02055087, 64)).toBe('vle16.v v1, (a0)');
+    expect(decode(0x02056087, 64)).toBe('vle32.v v1, (a0)');
+    expect(decode(0x02057087, 64)).toBe('vle64.v v1, (a0)');
+    expect(decode(0x020560a7, 64)).toBe('vse32.v v1, (a0)');
+    expect(decode(0x00056087, 64)).toBe('vle32.v v1, (a0), v0.t');
+    expect(decode(0x03056087, 64)).toBe('vle32ff.v v1, (a0)');
+    expect(decode(0xa3056087, 64)).toBe('vlseg6e32ff.v v1, (a0)');
+    expect(decode(0x0ab56087, 64)).toBe('vlse32.v v1, (a0), a1');
+    expect(decode(0x06256087, 64)).toBe('vluxei32.v v1, (a0), v2');
+    expect(decode(0x0e257087, 64)).toBe('vloxei64.v v1, (a0), v2');
+    expect(decode(0x062550a7, 64)).toBe('vsuxei16.v v1, (a0), v2');
+  });
+
+  test('掩码 / 整寄存器 / 段式访存', () => {
+    expect(decode(0x02b50087, 64)).toBe('vlm.v v1, (a0)');
+    expect(decode(0x02b500a7, 64)).toBe('vsm.v v1, (a0)');
+    expect(decode(0x02850087, 64)).toBe('vl1r.v v1, (a0)'); // eew=8 时省略 re8
+    expect(decode(0x22855087, 64)).toBe('vl2re16.v v1, (a0)');
+    expect(decode(0x62856087, 64)).toBe('vl4re32.v v1, (a0)');
+    expect(decode(0xe2857087, 64)).toBe('vl8re64.v v1, (a0)');
+    expect(decode(0x028500a7, 64)).toBe('vs1r.v v1, (a0)');
+    expect(decode(0xe28500a7, 64)).toBe('vs8r.v v1, (a0)');
+    expect(decode(0x22056087, 64)).toBe('vlseg2e32.v v1, (a0)');
+    expect(decode(0x620550a7, 64)).toBe('vsseg4e16.v v1, (a0)');
+    expect(decode(0x4ab56087, 64)).toBe('vlsseg3e32.v v1, (a0), a1');
+    expect(decode(0x26256087, 64)).toBe('vluxseg2ei32.v v1, (a0), v2');
+  });
+
+  test('整数算术（三操作数与立即数）', () => {
+    expect(decode(0x022180d7, 64)).toBe('vadd.vv v1, v2, v3');
+    expect(decode(0x022540d7, 64)).toBe('vadd.vx v1, v2, a0');
+    expect(decode(0x022fb0d7, 64)).toBe('vadd.vi v1, v2, -1'); // 立即数按 5 位有符号
+    expect(decode(0x0a2180d7, 64)).toBe('vsub.vv v1, v2, v3');
+    expect(decode(0x0e2540d7, 64)).toBe('vrsub.vx v1, v2, a0');
+    expect(decode(0x122180d7, 64)).toBe('vminu.vv v1, v2, v3');
+    expect(decode(0x1e2540d7, 64)).toBe('vmax.vx v1, v2, a0');
+    expect(decode(0x262180d7, 64)).toBe('vand.vv v1, v2, v3');
+    expect(decode(0x2623b0d7, 64)).toBe('vand.vi v1, v2, 7');
+    expect(decode(0x322fb0d7, 64)).toBe('vrgather.vi v1, v2, 31'); // 该立即数按无符号
+    expect(decode(0x3a2180d7, 64)).toBe('vrgatherei16.vv v1, v2, v3');
+    expect(decode(0x3a2540d7, 64)).toBe('vslideup.vx v1, v2, a0');
+    expect(decode(0x3e21b0d7, 64)).toBe('vslidedown.vi v1, v2, 3');
+    expect(decode(0x3a2560d7, 64)).toBe('vslide1up.vx v1, v2, a0');
+    expect(decode(0x8221b0d7, 64)).toBe('vsaddu.vi v1, v2, 3');
+    expect(decode(0x9621b0d7, 64)).toBe('vsll.vi v1, v2, 3');
+    expect(decode(0xae2540d7, 64)).toBe('vssra.vx v1, v2, a0');
+    expect(decode(0xb221b0d7, 64)).toBe('vnsrl.wi v1, v2, 3');
+    expect(decode(0xb62180d7, 64)).toBe('vnsra.wv v1, v2, v3');
+    expect(decode(0xba2540d7, 64)).toBe('vnclipu.wx v1, v2, a0');
+    expect(decode(0x9e2180d7, 64)).toBe('vsmul.vv v1, v2, v3');
+    expect(decode(0x6222b0d7, 64)).toBe('vmseq.vi v1, v2, 5');
+  });
+
+  test('进位 / 合并 / 广播', () => {
+    expect(decode(0x402180d7, 64)).toBe('vadc.vvm v1, v2, v3, v0');
+    expect(decode(0x462180d7, 64)).toBe('vmadc.vv v1, v2, v3');
+    expect(decode(0x5c2540d7, 64)).toBe('vmerge.vxm v1, v2, a0, v0');
+    expect(decode(0x5e0100d7, 64)).toBe('vmv.v.v v1, v2');
+    expect(decode(0x5e0540d7, 64)).toBe('vmv.v.x v1, a0');
+    expect(decode(0x5e01b0d7, 64)).toBe('vmv.v.i v1, 3');
+  });
+
+  test('乘加 / 归约 / 掩码逻辑 / 扩展', () => {
+    expect(decode(0x9621a0d7, 64)).toBe('vmul.vv v1, v2, v3');
+    expect(decode(0x922560d7, 64)).toBe('vmulhu.vx v1, v2, a0');
+    expect(decode(0xb63120d7, 64)).toBe('vmacc.vv v1, v2, v3'); // 源码顺序 vd, vs1, vs2
+    expect(decode(0xb62560d7, 64)).toBe('vmacc.vx v1, a0, v2');
+    expect(decode(0xe22560d7, 64)).toBe('vwmulu.vx v1, v2, a0');
+    expect(decode(0xf62560d7, 64)).toBe('vwmacc.vx v1, a0, v2');
+    expect(decode(0xfa2560d7, 64)).toBe('vwmaccus.vx v1, a0, v2');
+    expect(decode(0xd221a0d7, 64)).toBe('vwaddu.wv v1, v2, v3'); // .w 形式后缀是 .wv/.wx
+    expect(decode(0xde2560d7, 64)).toBe('vwsub.wx v1, v2, a0');
+    expect(decode(0x0221a0d7, 64)).toBe('vredsum.vs v1, v2, v3');
+    expect(decode(0xc62180d7, 64)).toBe('vwredsum.vs v1, v2, v3');
+    expect(decode(0x6621a0d7, 64)).toBe('vmand.mm v1, v2, v3');
+    expect(decode(0x7e21a0d7, 64)).toBe('vmxnor.mm v1, v2, v3');
+    expect(decode(0x5e21a0d7, 64)).toBe('vcompress.vm v1, v2, v3');
+    expect(decode(0x4a2320d7, 64)).toBe('vzext.vf2 v1, v2');
+    expect(decode(0x4a22a0d7, 64)).toBe('vsext.vf4 v1, v2');
+    expect(decode(0x9e2030d7, 64)).toBe('vmv1r.v v1, v2');
+    expect(decode(0x9e23b0d7, 64)).toBe('vmv8r.v v1, v2');
+  });
+
+  test('掩码统计与标量搬移', () => {
+    expect(decode(0x42282557, 64)).toBe('vcpop.m a0, v2');
+    expect(decode(0x4228a557, 64)).toBe('vfirst.m a0, v2');
+    expect(decode(0x522820d7, 64)).toBe('viota.m v1, v2');
+    expect(decode(0x5208a0d7, 64)).toBe('vid.v v1');
+    expect(decode(0x42202557, 64)).toBe('vmv.x.s a0, v2');
+    expect(decode(0x420560d7, 64)).toBe('vmv.s.x v1, a0');
+  });
+
+  test('浮点向量', () => {
+    expect(decode(0x022190d7, 64)).toBe('vfadd.vv v1, v2, v3');
+    expect(decode(0x022550d7, 64)).toBe('vfadd.vf v1, v2, fa0');
+    expect(decode(0x9e2550d7, 64)).toBe('vfrsub.vf v1, v2, fa0');
+    expect(decode(0xe22190d7, 64)).toBe('vfwmul.vv v1, v2, v3');
+    expect(decode(0xd22190d7, 64)).toBe('vfwadd.wv v1, v2, v3');
+    expect(decode(0xa23110d7, 64)).toBe('vfmadd.vv v1, v2, v3'); // 同样 vd, vs1, vs2
+    expect(decode(0xb62550d7, 64)).toBe('vfnmacc.vf v1, fa0, v2');
+    expect(decode(0x4e2010d7, 64)).toBe('vfsqrt.v v1, v2');
+    expect(decode(0x4e2810d7, 64)).toBe('vfclass.v v1, v2');
+    expect(decode(0x4a2010d7, 64)).toBe('vfcvt.xu.f.v v1, v2');
+    expect(decode(0x4a2310d7, 64)).toBe('vfcvt.rtz.xu.f.v v1, v2');
+    expect(decode(0x4a2610d7, 64)).toBe('vfwcvt.f.f.v v1, v2');
+    expect(decode(0x4a2a90d7, 64)).toBe('vfncvt.rod.f.f.w v1, v2');
+    expect(decode(0x622190d7, 64)).toBe('vmfeq.vv v1, v2, v3');
+    expect(decode(0x7e2550d7, 64)).toBe('vmfge.vf v1, v2, fa0');
+    expect(decode(0x5c2550d7, 64)).toBe('vfmerge.vfm v1, v2, fa0, v0');
+    expect(decode(0x5e0550d7, 64)).toBe('vfmv.v.f v1, fa0');
+    expect(decode(0x42201557, 64)).toBe('vfmv.f.s fa0, v2');
+    expect(decode(0x420550d7, 64)).toBe('vfmv.s.f v1, fa0');
+    expect(decode(0x0e2190d7, 64)).toBe('vfredosum.vs v1, v2, v3');
+    expect(decode(0x3a2550d7, 64)).toBe('vfslide1up.vf v1, v2, fa0');
+  });
+
+  test('GNU 别名（编码与正形式相同）', () => {
+    expect(decode(0x0e2040d7, 64)).toBe('vneg.v v1, v2');
+    expect(decode(0x2e2fb0d7, 64)).toBe('vnot.v v1, v2');
+    expect(decode(0xb22040d7, 64)).toBe('vncvt.x.x.w v1, v2');
+    expect(decode(0xc62060d7, 64)).toBe('vwcvt.x.x.v v1, v2');
+    expect(decode(0x262110d7, 64)).toBe('vfneg.v v1, v2');
+    expect(decode(0x2a2110d7, 64)).toBe('vfabs.v v1, v2');
+    expect(decode(0x662120d7, 64)).toBe('vmmv.m v1, v2');
+    expect(decode(0x6e10a0d7, 64)).toBe('vmclr.m v1');
+    expect(decode(0x7e10a0d7, 64)).toBe('vmset.m v1');
+    expect(decode(0x762120d7, 64)).toBe('vmnot.m v1, v2');
+  });
+
+  test('掩码形式与保留编码', () => {
+    expect(decode(0x002180d7, 64)).toBe('vadd.vv v1, v2, v3, v0.t');
+    expect(decode(0x0021a0d7, 64)).toBe('vredsum.vs v1, v2, v3, v0.t');
+    expect(decode(0x5020a0d7, 64)).toBe('vmsbf.m v1, v2, v0.t');
+    // 保留组合给 .word：掩码访存要求 nf=0、整寄存器访存要求 vm=1、vid.v 要求 vs2=0
+    expect(decode(0x62b80007, 64)).toContain('.word');
+    expect(decode(0xe08fd107, 64)).toContain('.word');
+    expect(decode(0x52d8a857, 64)).toContain('.word');
+    expect(decode(0x890ff957, 64)).toContain('.word');
   });
 });
 

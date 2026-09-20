@@ -106,13 +106,50 @@ add(
   'clmul a0, a1, a2', 'clmulr a0, a1, a2', 'clmulh a0, a1, a2',
   'czero.eqz a0, a1, a2', 'czero.nez a0, a1, a2',
 );
+// V（RVV 1.0）
+add(
+  'vsetvli t0, a0, e32, m1, ta, ma', 'vsetvli t0, a0, e8, m2, tu, mu', 'vsetvli t0, a0, e64, mf2, ta, ma',
+  'vsetivli t0, 4, e32, m1, ta, ma', 'vsetvl t0, a0, a1',
+  'vle8.v v1, (a0)', 'vle16.v v1, (a0)', 'vle32.v v1, (a0)', 'vle64.v v1, (a0)',
+  'vse8.v v1, (a0)', 'vse32.v v1, (a0)', 'vle32.v v1, (a0), v0.t',
+  'vle32ff.v v1, (a0)', 'vlseg6e32ff.v v1, (a0)',
+  'vlm.v v1, (a0)', 'vsm.v v1, (a0)',
+  'vl1r.v v1, (a0)', 'vl2re16.v v1, (a0)', 'vl4re32.v v1, (a0)', 'vl8re64.v v1, (a0)',
+  'vs1r.v v1, (a0)', 'vs8r.v v1, (a0)',
+  'vlseg2e32.v v1, (a0)', 'vsseg4e16.v v1, (a0)', 'vlse32.v v1, (a0), a1', 'vlsseg3e32.v v1, (a0), a1',
+  'vluxei32.v v1, (a0), v2', 'vloxei64.v v1, (a0), v2', 'vsuxei16.v v1, (a0), v2', 'vluxseg2ei32.v v1, (a0), v2',
+  'vadd.vv v1, v2, v3', 'vadd.vx v1, v2, a0', 'vadd.vi v1, v2, -1', 'vsub.vv v1, v2, v3', 'vrsub.vx v1, v2, a0',
+  'vminu.vv v1, v2, v3', 'vmax.vx v1, v2, a0', 'vand.vv v1, v2, v3', 'vand.vi v1, v2, 7',
+  'vrgather.vi v1, v2, 31', 'vrgatherei16.vv v1, v2, v3', 'vslideup.vx v1, v2, a0', 'vslidedown.vi v1, v2, 3',
+  'vslide1up.vx v1, v2, a0', 'vslide1down.vx v1, v2, a0',
+  'vadc.vvm v1, v2, v3, v0', 'vmadc.vv v1, v2, v3', 'vmerge.vxm v1, v2, a0, v0',
+  'vmv.v.v v1, v2', 'vmv.v.x v1, a0', 'vmv.v.i v1, 3',
+  'vsaddu.vi v1, v2, 3', 'vsll.vi v1, v2, 3', 'vssra.vx v1, v2, a0',
+  'vnsrl.wi v1, v2, 3', 'vnsra.wv v1, v2, v3', 'vnclipu.wx v1, v2, a0', 'vsmul.vv v1, v2, v3',
+  'vmseq.vi v1, v2, 5',
+  'vmul.vv v1, v2, v3', 'vmulhu.vx v1, v2, a0', 'vmacc.vv v1, v2, v3', 'vmacc.vx v1, a0, v2',
+  'vwmulu.vx v1, v2, a0', 'vwmacc.vx v1, a0, v2', 'vwmaccus.vx v1, a0, v2',
+  'vwaddu.wv v1, v2, v3', 'vwsub.wx v1, v2, a0',
+  'vredsum.vs v1, v2, v3', 'vwredsum.vs v1, v2, v3',
+  'vmand.mm v1, v2, v3', 'vmxnor.mm v1, v2, v3', 'vcompress.vm v1, v2, v3',
+  'vcpop.m a0, v2', 'vfirst.m a0, v2', 'viota.m v1, v2', 'vid.v v1', 'vmv.x.s a0, v2', 'vmv.s.x v1, a0',
+  'vzext.vf2 v1, v2', 'vsext.vf4 v1, v2', 'vmv1r.v v1, v2', 'vmv8r.v v1, v2',
+  'vfadd.vv v1, v2, v3', 'vfadd.vf v1, v2, fa0', 'vfrsub.vf v1, v2, fa0', 'vfwmul.vv v1, v2, v3',
+  'vfwadd.wv v1, v2, v3', 'vfmadd.vv v1, v2, v3', 'vfnmacc.vf v1, fa0, v2', 'vfsqrt.v v1, v2', 'vfclass.v v1, v2',
+  'vfcvt.xu.f.v v1, v2', 'vfcvt.rtz.xu.f.v v1, v2', 'vfwcvt.f.f.v v1, v2', 'vfncvt.rod.f.f.w v1, v2',
+  'vmfeq.vv v1, v2, v3', 'vmfge.vf v1, v2, fa0', 'vfmerge.vfm v1, v2, fa0, v0', 'vfmv.v.f v1, fa0',
+  'vfmv.f.s fa0, v2', 'vfmv.s.f v1, fa0', 'vfredosum.vs v1, v2, v3', 'vfslide1up.vf v1, v2, fa0',
+  'vneg.v v1, v2', 'vnot.v v1, v2', 'vncvt.x.x.w v1, v2', 'vwcvt.x.x.v v1, v2',
+  'vfneg.v v1, v2', 'vfabs.v v1, v2', 'vmmv.m v1, v2', 'vmclr.m v1', 'vmset.m v1', 'vmnot.m v1, v2',
+  'vadd.vv v1, v2, v3, v0.t', 'vredsum.vs v1, v2, v3, v0.t', 'vmsbf.m v1, v2, v0.t',
+);
 
 // ---------------------------------------------------------------- 逐条汇编
 // 一条一行单独汇编：这样"源码行 ↔ 指令字"的对应关系是确定的，
 // 不必去猜 objdump 的输出顺序（伪指令展开 / .option 交互都会打乱顺序）
 
-const MARCH64 = 'rv64gc_zicsr_zifencei_zba_zbb_zbc_zbs_zicond_zihintpause_zfh';
-const MARCH32 = 'rv32gc_zicsr_zifencei_zba_zbb_zbc_zbs_zicond_zihintpause_zfh';
+const MARCH64 = 'rv64gcv_zicsr_zifencei_zba_zbb_zbc_zbs_zicond_zihintpause_zfh';
+const MARCH32 = 'rv32gcv_zicsr_zifencei_zba_zbb_zbc_zbs_zicond_zihintpause_zfh';
 const sources = lines.filter((l) => l !== '#rvc' && l !== '#norvc');
 
 async function assembleOne(line: string, rvc: boolean, xlen: 32 | 64): Promise<number | null> {

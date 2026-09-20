@@ -102,7 +102,7 @@ bun ../../dist/app.js --help
 | `src/app.ts` | 外壳：文件加载（含 gzip）、导航、工具栏、选中总线、详情抽屉、诊断面板 |
 | `src/view.ts` | 视图契约（`View` / `ViewContext` / `Selection`）与格式化 |
 | `src/charts.ts` | 纯 SVG 图表工具（比例尺、刻度、路径、配色、提示、卡片） |
-| `src/rv.ts` | 数值显示格式与 RISC-V 指令译码：**RV64GC**（RV32I/RV64I + M/A/F/D/C，压缩指令按低两位自动识别）＋ **Zicsr**（含 CSR 名表与区间名）、Zifencei、Zba/Zbb/Zbc/Zbs、Zicond、Zfh |
+| `src/rv.ts` | 数值显示格式与 RISC-V 指令译码：**RV64GC**（RV32I/RV64I + M/A/F/D/C，压缩指令按低两位自动识别）＋ **Zicsr**（含 CSR 名表与区间名）、Zifencei、Zba/Zbb/Zbc/Zbs、Zicond、Zfh，以及 **V**（RVV 1.0：配置、整数/定点/浮点算术、掩码/归约/搬移/转换与各类向量访存） |
 | `rv-check.ts` | 译码器交叉校验脚本（**依赖 /opt/riscv 工具链**，不进 `bun test`）：把指令汇编成真编码，与 `rvDecode` 逐条比对，并生成可粘贴的测试用例 |
 | `src/sample.ts` | 内置示例轨迹生成器（单时钟 + 5 级流水 + 异步中断） |
 
