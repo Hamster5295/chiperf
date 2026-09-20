@@ -4,7 +4,8 @@
  * 增量消费事件记录（单遍、内存只与"在飞条目数 + 追踪对象数"相关）。
  * 派生层从不修改数据：所有异常都只产生诊断（spec §10.4）。
  *
- * v1.0 只有一条时间轴：追踪键就是名字本身，不再有 `(域, 名字)`。
+ * v1.0 只有一条时间轴，且每个事件类型各自维护一套轨道：轨道标识是
+ * `(事件类型, 名字)`（键写作 `<类型>:<名字>`），同名不同类型互不干扰。
  */
 import type {
   CounterTrack,
@@ -34,15 +35,12 @@ export class Deriver {
   readonly tracks = new Map<string, TrackInfo>();
   readonly events = new Map<string, EventTrack>();
   readonly messages: EventRecord[] = [];
-  /** 名字 → 用过的语义类型，用于 name_reused */
-  private readonly nameKinds = new Map<string, Set<string>>();
   /** 轨道名 → 该级**当前**持有的设置（值或气泡），用于判断"值变了没有" */
   private readonly pipHeld = new Map<string, { key: string; item: PipelineItem | null }>();
 
   constructor(private readonly ctx: DeriveContext) {}
 
   onRecord(rec: EventRecord): void {
-    this.noteNameKind(rec);
     switch (rec.kind) {
       case 'clk':
         break;
@@ -72,24 +70,12 @@ export class Deriver {
     for (const track of this.tracks.values()) this.finalizeTrack(track);
   }
 
-  private noteNameKind(rec: EventRecord): void {
-    if (rec.kind === 'msg' || rec.kind === 'clk' || rec.kind === 'pip') return;
-    const name = 'name' in rec ? rec.name : '';
-    if (!name) return;
-    const kinds = this.nameKinds.get(name) ?? new Set<string>();
-    if (kinds.size > 0 && !kinds.has(rec.kind)) {
-      this.ctx.diag('name_reused', rec.line, `名字 "${name}" 同时被 ${[...kinds].join('/')} 与 ${rec.kind} 使用`);
-    }
-    kinds.add(rec.kind);
-    this.nameKinds.set(name, kinds);
-  }
-
   private applyCounter(rec: Extract<EventRecord, { kind: 'cnt' }>): void {
     let track = this.counters.get(rec.name);
     if (!track) {
       track = {
         name: rec.name,
-        key: rec.name,
+        key: `cnt:${rec.name}`,
         source: 'cnt',
         total: 0,
         samples: [],
@@ -118,7 +104,7 @@ export class Deriver {
   private applyValue(rec: Extract<EventRecord, { kind: 'val' }>): void {
     let track = this.values.get(rec.name);
     if (!track) {
-      track = { name: rec.name, key: rec.name, samples: [], changes: [] };
+      track = { name: rec.name, key: `val:${rec.name}`, samples: [], changes: [] };
       this.values.set(rec.name, track);
     }
     const prev = track.samples[track.samples.length - 1];
@@ -131,7 +117,7 @@ export class Deriver {
   private applyFsm(rec: Extract<EventRecord, { kind: 'fsm' }>): void {
     let track = this.fsms.get(rec.name);
     if (!track) {
-      track = { name: rec.name, key: rec.name, samples: [], transitions: [], dwellCycles: new Map(), stateSet: [] };
+      track = { name: rec.name, key: `fsm:${rec.name}`, samples: [], transitions: [], dwellCycles: new Map(), stateSet: [] };
       this.fsms.set(rec.name, track);
     }
     const prev = track.samples[track.samples.length - 1];
@@ -150,7 +136,7 @@ export class Deriver {
   private applyEvent(rec: Extract<EventRecord, { kind: 'evt' }>): void {
     let track = this.events.get(rec.name);
     if (!track) {
-      track = { name: rec.name, key: rec.name, samples: [] };
+      track = { name: rec.name, key: `evt:${rec.name}`, samples: [] };
       this.events.set(rec.name, track);
     }
     track.samples.push({ value: rec.payload, pos: rec.pos, async: rec.async, line: rec.line });
@@ -209,6 +195,7 @@ export class Deriver {
     if (!track) {
       track = {
         name,
+        key: `pip:${name}`,
         items: [],
         firstCycle: Number.POSITIVE_INFINITY,
         lastCycle: 0,

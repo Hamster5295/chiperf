@@ -363,7 +363,7 @@ function itemDataset(trace: Trace): Dataset {
     selection: (r) => ({ kind: 'item', track: r.item.track, enterSeq: r.item.enterSeq }),
     titleOf: (r) => `条目 ${r.item.track} #${r.item.enterSeq}`,
     columns: [
-      { key: 'track', label: '轨道', width: 130, mono: true, cell: (r) => ({ t: r.item.track, mono: true, color: colorFor(r.item.track) }) },
+      { key: 'track', label: '轨道', width: 130, mono: true, cell: (r) => ({ t: r.item.track, mono: true, color: colorFor(`pip:${r.item.track}`) }) },
       {
         key: 'value',
         label: '持有值',
@@ -419,7 +419,7 @@ function counterDataset(trace: Trace): Dataset {
   return defineDataset<CounterRow>({
     id: 'counters',
     title: '计数器',
-    hint: '追踪键 = (域, 名字)；abs= 记录只置总量、不贡献增量',
+    hint: '追踪键 = (事件类型, 名字)；abs= 记录只置总量、不贡献增量',
     empty: '这份轨迹没有计数器',
     defaultSort: [{ key: 'name', dir: 1 }],
     rows: () =>
@@ -540,7 +540,7 @@ function fsmDataset(trace: Trace): Dataset {
     selection: (r) => ({ kind: 'fsm', key: r.fsm.key }),
     titleOf: (r) => `跳转 ${r.fsm.name}: ${r.from ?? '(初始)'} → ${r.to}`,
     columns: [
-      { key: 'fsm', label: '状态机', width: 160, mono: true, cell: (r) => ({ t: r.fsm.name, mono: true, color: colorFor(r.fsm.name) }) },
+      { key: 'fsm', label: '状态机', width: 160, mono: true, cell: (r) => ({ t: r.fsm.name, mono: true, color: colorFor(r.fsm.key) }) },
       { key: 'from', label: 'from', width: 130, mono: true, cell: (r) => ({ t: r.from ?? '(初始)', mono: true, sort: r.from }) },
       { key: 'to', label: 'to', width: 130, mono: true, cell: (r) => ({ t: r.to, mono: true, sort: r.to }) },
       { key: 'cycle', label: '周期', width: 92, align: 'right', cell: (r) => numeric(String(r.cycle), r.cycle) },
@@ -587,7 +587,7 @@ function eventDataset(trace: Trace): Dataset {
     selection: (r) => ({ kind: 'record', seq: r.sample.pos.seq }),
     titleOf: (r) => `事件 ${r.track.name} · ${fmtPosition(r.sample.pos)}`,
     columns: [
-      { key: 'name', label: '名字', width: 190, mono: true, cell: (r) => ({ t: r.track.name, mono: true, color: colorFor(r.track.name) }) },
+      { key: 'name', label: '名字', width: 190, mono: true, cell: (r) => ({ t: r.track.name, mono: true, color: colorFor(r.track.key) }) },
       {
         key: 'payload',
         label: '载荷',

@@ -124,7 +124,6 @@ export type DiagnosticCode =
   | 'negative_total'
   | 'redundant_edge'
   | 'duplicate_attribute'
-  | 'name_reused'
   | 'records_after_end'
   | 'eof_without_end_marker'
   | 'invalid_escape'
@@ -177,7 +176,10 @@ export interface Timed<T> {
 /** 计数器（spec §9.2） */
 export interface CounterTrack {
   name: string;
-  /** 稳定的选择/高亮键（= 名字；事件折算轨带 `evt:` 前缀） */
+  /**
+   * 轨道标识 = `(事件类型, 名字)`，写作 `<类型>:<名字>`（如 `cnt:foo`、`evt:foo`）。
+   * 同名不同类型是不同轨道，**不得** 因重名而改写名字。
+   */
   key: string;
   /** 终值 */
   total: number;
@@ -206,6 +208,7 @@ export interface CounterTrack {
 /** 数值轨（spec §9.3）。保持型 */
 export interface ValueTrack {
   name: string;
+  /** 轨道标识 = `(事件类型, 名字)`，写作 `val:<名字>` */
   key: string;
   samples: Timed<ScalarValue>[];
   /** 发生过变化的采样（相邻取值不同，含 未知↔已知） */
@@ -215,6 +218,7 @@ export interface ValueTrack {
 /** 状态机轨（spec §9.5）。保持型 */
 export interface FsmTrack {
   name: string;
+  /** 轨道标识 = `(事件类型, 名字)`，写作 `fsm:<名字>` */
   key: string;
   samples: Timed<ScalarValue>[];
   transitions: { from: string | null; to: string; pos: Position; selfLoop: boolean }[];
@@ -261,9 +265,11 @@ export interface PipelineItem {
   closeLine: number | null;
 }
 
-/** 轨道（spec §7.4 的追踪键 = 轨道名） */
+/** 轨道（spec §7.4 的追踪键 = `(pip, 轨道名)`） */
 export interface TrackInfo {
   name: string;
+  /** 轨道标识 = `(事件类型, 名字)`，写作 `pip:<轨道名>` */
+  key: string;
   items: PipelineItem[];
   /** 该轨道记录覆盖的周期范围 */
   firstCycle: number;
@@ -289,6 +295,7 @@ export interface TrackInfo {
 /** 瞬时事件（spec §7.6） */
 export interface EventTrack {
   name: string;
+  /** 轨道标识 = `(事件类型, 名字)`，写作 `evt:<名字>` */
   key: string;
   samples: Timed<ScalarValue | null>[];
 }

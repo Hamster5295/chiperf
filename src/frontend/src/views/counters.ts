@@ -1,9 +1,9 @@
 /**
  * 计数器视图 —— 累计曲线、每周期增量、终值占比与区间差工具（spec §9.2）
  *
- * 数据来源：`Trace.counters`（追踪键 = (域, 名字)）+ `eventCounters()`：`[evt]` 轨
- * 按"每条 +1"折算成计数器一起展示（显示名带 `[evt]` 前缀，键带 `evt:` 前缀，
- * 所以同名的 `[cnt]`/`[evt]` 是两条独立轨道）。四条必须守住的口径：
+ * 数据来源：`Trace.counters`（轨道标识 = `(事件类型, 名字)`，键为 `cnt:<名字>`）
+ * + `eventCounters()`：`[evt]` 轨按"每条 +1"折算成计数器一起展示（显示名带 `[evt]` 前缀，
+ * 键为 `evt:<名字>`，所以同名的 `[cnt]`/`[evt]` 是两条独立轨道）。四条必须守住的口径：
  *  - `abs=` 回读记录只置总量、不贡献增量（`samples[].delta === null`，spec §9.2）
  *  - 累计值取"该周期末"的取值（`counterTotalAt` 的判据是 position ≤ (cycle, n)）
  *  - `async=1` 的记录不在时钟沿上，必须画在所在周期的区间**内部**（spec §6.5）
@@ -251,7 +251,7 @@ function statsRow(tracks: CounterTrack[], shown: CounterTrack[]): HTMLElement {
     }
   }
   return el('div', { class: 'stat-row' }, [
-    statTile('计数器', countLabel(cntTracks), '每个 (域, 名字) 一条 cnt 轨道'),
+    statTile('计数器', countLabel(cntTracks), '每个 (类型, 名字) 一条 cnt 轨道'),
     statTile('事件计数', countLabel(evtTracks), '每个 [evt] 轨道按"每条 +1"折算（spec §9.1）'),
     statTile('cnt 记录', countLabel(samples), '每条 cnt 记录一次采样'),
     statTile('abs= 回读', countLabel(absCount), '只置总量，不贡献增量（spec §9.2）'),

@@ -55,12 +55,17 @@ describe('§10.4 语义异常', () => {
     expect(legacy.tracks.size).toBe(0);
   });
 
-  test('name_reused：同一名字被不同类型使用', () => {
-    const trace = parseChiperf('[clk] p\n[cnt] "x"\n[val] "x", 1\n[@]\n'.replace('[@]', '[evt] "x"') + '@end\n');
-    expect(trace.diagnosticCounts.get('name_reused')).toBe(2); // cnt→val、val→evt
-    expect(trace.counters.size).toBe(1);
-    expect(trace.values.size).toBe(1);
-    expect(trace.events.size).toBe(1);
+  test('同名不同类型是独立轨道：键带类型前缀，不产生诊断', () => {
+    const trace = parseChiperf('[clk] p\n[cnt] "x"\n[val] "x", 1\n[fsm] "x", A\n[evt] "x"\n[pip] "x", 7\n@end\n');
+    expect([...trace.diagnosticCounts]).toEqual([]);
+    expect(trace.counters.get('x')!.key).toBe('cnt:x');
+    expect(trace.values.get('x')!.key).toBe('val:x');
+    expect(trace.fsms.get('x')!.key).toBe('fsm:x');
+    expect(trace.events.get('x')!.key).toBe('evt:x');
+    expect(trace.tracks.get('x')!.key).toBe('pip:x');
+    // 每个类型各有一条轨道，没有被合并、也没有被改名
+    expect([trace.counters.size, trace.values.size, trace.fsms.size, trace.events.size, trace.tracks.size]).toEqual([1, 1, 1, 1, 1]);
+    expect(trace.values.get('x')!.name).toBe('x');
   });
 
   test('at_clk_conflict：同时写 clk 又用 at=', () => {

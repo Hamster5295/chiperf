@@ -245,9 +245,9 @@ export function ratioBetween(num: CounterTrack, den: CounterTrack, c1: number, c
  * 一条记录 = 一次 +1，累计值 = 到该条为止的事件条数，
  * 每周期增量 = 该周期里的事件条数（同周期多条会累加）。
  *
- * 键带 `evt:` 前缀：`[cnt] foo` 与 `[evt] foo` 可以并存
- * （解析器只对同名不同类型报 `name_reused` 提示），而视图用键做选中与高亮，
- * 不区分就会一起亮。折算结果与原计数器**同构**，因此可以直接当 `CounterTrack` 用。
+ * 键沿用事件轨自己的 `evt:<名字>`：`[cnt] foo` 与 `[evt] foo` 是 `cnt:foo` /
+ * `evt:foo` 两条独立轨道，同名不同类型不会互相干扰。折算结果与原计数器**同构**，
+ * 因此可以直接当 `CounterTrack` 用。
  */
 export function eventCounters(trace: Trace): CounterTrack[] {
   const out: CounterTrack[] = [];
@@ -266,7 +266,7 @@ export function eventCounters(trace: Trace): CounterTrack[] {
     }
     out.push({
       name: track.name,
-      key: `evt:${track.name}`,
+      key: track.key,
       source: 'evt',
       total,
       samples,

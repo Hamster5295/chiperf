@@ -282,7 +282,7 @@ const GROUP_TINT: Record<LaneGroup, string> = {
 interface LaneRow {
   kind: 'lane';
   group: LaneGroup;
-  /** 高亮用的泳道键：`clk:域` / `fsm:key` / `pip:轨道` / `occ:轨道` / `cnt:key` / `evt:key` … */
+  /** 高亮用的泳道键（= 轨道标识 `(事件类型, 名字)`）：`clk:域` / `pip:轨道` / `fsm:名字` / `cnt:名字` / `val:名字` / `evt:名字` */
   key: string;
   domain: string;
   label: string;
@@ -1755,7 +1755,7 @@ function fsmLane(fsm: FsmTrack, ctx: ViewContext): LaneRow {
   return {
     kind: 'lane',
     group: 'fsm',
-    key: `fsm:${fsm.key}`,
+    key: fsm.key,
     domain: CLOCK,
     label: fsm.name,
     color: COLOR.neutral,
@@ -1967,11 +1967,11 @@ function bubbleCyclesIn(ranges: { start: number; end: number }[], from: number, 
 }
 
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
-  const laneColor = colorFor(track.name);
+  const laneColor = colorFor(track.key);
   const prep = pipPrepOf(track);
   return {
     kind: 'lane',
-    key: `pip:${track.name}`,
+    key: track.key,
     group: 'pipeline',
     domain: CLOCK,
     label: track.name,
@@ -2155,7 +2155,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
               x: x + 3,
               y: y + h - 11,
               style: `font-size:10px;font-weight:600;fill:${inkOn(hollow ? null : color, hollow ? 1 : BLOCK_FILL)};pointer-events:none`,
-              text: clip(formatScalarBy(item.value, valueFormatOf(`pip:${track.name}`)), w - 6),
+              text: clip(formatScalarBy(item.value, valueFormatOf(track.key)), w - 6),
             }),
           );
         }
@@ -2178,7 +2178,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
 function pipTip(track: TrackInfo, item: PipelineItem, open: boolean): string {
   const lines = [
     `轨道 ${track.name}`,
-    `持有值 ${item.value ? formatScalarBy(item.value, valueFormatOf(`pip:${track.name}`)) : '（无）'}`,
+    `持有值 ${item.value ? formatScalarBy(item.value, valueFormatOf(track.key)) : '（无）'}`,
   ];
   lines.push(`起始：${formatPosition(item.enter)}${item.async ? ' · 异步（画在区间中点）' : ''}`);
   lines.push(item.close ? `结束：${formatPosition(item.close)}${item.closeAsync ? ' · 异步' : ''}` : '结束：（没有后续记录改掉它）');
@@ -2336,7 +2336,7 @@ function counterWindow(track: CounterTrack, from: number, to: number, max: numbe
 
 /** 采样序列泳道的差异点：几何画法共用，取数与提示各管各的 */
 interface SeriesConfig {
-  /** 行键（也是隐藏/记忆用的键，如 `val:core.ipc` / `cnt:core.retired`） */
+  /** 行键（也是隐藏/记忆用的键）= 轨道标识，如 `val:core.ipc` / `cnt:core.retired` */
   key: string;
   name: string;
   domain: string;
@@ -2562,7 +2562,7 @@ function valueLane(track: ValueTrack, ctx: ViewContext): LaneRow {
   const prep = valuePrepOf(track);
   return seriesLane(
     {
-      key: `val:${track.key}`,
+      key: track.key,
       name: track.name,
       domain: CLOCK,
       group: 'value',
@@ -2601,7 +2601,7 @@ function counterLane(track: CounterTrack, ctx: ViewContext): LaneRow {
   const prep = counterPrepOf(track);
   return seriesLane(
     {
-      key: `cnt:${track.key}`,
+      key: track.key,
       name: track.name,
       domain: CLOCK,
       group: 'counter',
@@ -2697,7 +2697,7 @@ function valueMenu(track: ValueTrack): LaneRow['menu'] {
 function pipelineMenu(track: TrackInfo): LaneRow['menu'] | undefined {
   const values = track.items.map((item) => item.value).filter((value): value is ScalarValue => value !== null);
   if (!isFormattable(values)) return undefined;
-  return { formatKey: `pip:${track.name}`, formatWidth: widthOf(values) };
+  return { formatKey: track.key, formatWidth: widthOf(values) };
 }
 
 // ------------------------------------------------------------------ 右键菜单
@@ -3016,7 +3016,7 @@ function eventLane(
   const color = colorFor(key);
   return {
     kind: 'lane',
-    key: `evt:${key}`,
+    key,
     group: 'event',
     domain,
     label: name,
@@ -3224,9 +3224,9 @@ function laneTargets(sel: Selection): { lanes?: string[]; domain?: string } | nu
     case 'item':
       return { lanes: [`pip:${sel.track}`] };
     case 'fsm':
-      return { lanes: [`fsm:${sel.key}`] };
+      return { lanes: [sel.key] };
     case 'counter':
-      return { lanes: [`cnt:${sel.key}`] };
+      return { lanes: [sel.key] };
     default:
       return null;
   }
