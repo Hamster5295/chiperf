@@ -2068,28 +2068,31 @@ function bubbleShadeIn(ranges: { start: number; end: number }[], from: number, t
 }
 
 /**
- * 低缩放"有值"层专用的配色：只取蓝绿紫青一类冷色，避开红橙色系。
- * 气泡叠加层也是橙色，若流水线取值再用红/橙/黄，两者会糊在一起分不清。
+ * 流水线轨道色：只取蓝绿紫青一类冷色，避开红橙色系。
+ *
+ * 它同时是**行头色标**与**低缩放"有值"层**的颜色 —— 低缩放下整条轨道只有这一种颜色，
+ * 若行头用 `colorFor`（可能落在红/橙/黄）、横条用冷色，两侧色块就会对不上。
+ * 气泡叠加层也是橙色，暖色取值层会与它糊在一起分不清，所以整条轨道统一用冷色。
  */
-const LOD_LANE_PALETTE = [
+const PIP_LANE_PALETTE = [
   '#3b82f6', '#10b981', '#8b5cf6', '#06b6d4', '#6366f1', '#14b8a6',
   '#0ea5e9', '#22c55e', '#0891b2', '#a855f7', '#64748b', '#84cc16',
 ];
-const lodLaneCache = new Map<string, string>();
+const pipLaneCache = new Map<string, string>();
 
 /** 与 `colorFor` 同源（同一个 key 稳定），但只在冷色里选 */
-function lodLaneColor(key: string): string {
-  const cached = lodLaneCache.get(key);
+function pipLaneColor(key: string): string {
+  const cached = pipLaneCache.get(key);
   if (cached !== undefined) return cached;
   let hash = 0;
   for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-  const color = LOD_LANE_PALETTE[hash % LOD_LANE_PALETTE.length]!;
-  lodLaneCache.set(key, color);
+  const color = PIP_LANE_PALETTE[hash % PIP_LANE_PALETTE.length]!;
+  pipLaneCache.set(key, color);
   return color;
 }
 
 function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
-  const laneColor = colorFor(track.key);
+  const laneColor = pipLaneColor(track.key);
   const prep = pipPrepOf(track);
   return {
     kind: 'lane',
@@ -2127,13 +2130,12 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       // 低缩放：只表达两件事 —— 有没有值（按行色，每行不同）与气泡（橙色，按段长决定深浅）。
       // 气泡是**叠加**在行色之上的独立一层：否则"气泡很少但成片出现"的区域会被有值那一层盖掉、
       // 整段看不出橙色。逐条目的取值着色在这一比例下没有意义，不做。
-      // 行色在这里改用冷色系：气泡是橙色，暖色的取值层会与它糊在一起。
+      // 行色（= 行头色标）本身就是冷色系，与气泡的橙色分得开，两侧颜色因此始终一致。
       if (lodOf(effectivePxPerCycle(reg)) === 'coarse') {
         const cols = Math.max(1, Math.min(4000, Math.round(win.x1 - win.x0)));
         const activeFrom = track.firstCycle;
         const activeTo = track.lastCycle + 1;
         const ranges = track.bubbleRanges;
-        const coldColor = lodLaneColor(track.key);
         const valueCols: LodShade[] = [];
         const bubbleCols: LodShade[] = [];
         const blank = (): LodShade => ({ color: null, y0: barY, y1: barY + barH, alpha: 1 });
@@ -2149,7 +2151,7 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
           }
           const active = to - from;
           const bubbles = bubbleCyclesIn(ranges, from, to);
-          valueCols.push(bubbles < active ? { color: coldColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
+          valueCols.push(bubbles < active ? { color: laneColor, y0: barY, y1: barY + barH, alpha: BLOCK_FILL } : blank());
           // 只要这一列有气泡就叠加橙色：
           //  - 淡出分量由列内气泡段的长度决定（短气泡不淡、长空闲段淡到 BUBBLE_FILL）；
           //  - 实际亮度再按该列气泡密度加亮/减暗（沿用改动前的公式），避免短气泡一律全亮、太刺眼。
