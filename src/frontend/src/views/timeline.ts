@@ -2181,11 +2181,13 @@ function pipLane(track: TrackInfo, ctx: ViewContext): LaneRow {
       // 区间的 start 升序，二分找到窗口起点后只走可见的一段。
       const ranges = track.bubbleRanges;
       let bLo = lowerBoundRanges(ranges, win.c0);
-      if (bLo > 0 && ranges[bLo - 1]!.end >= win.c0) bLo--;
+      // 气泡区间是闭区间 [start, end]，占满 [start, end+1)：左边缘只露出一部分（甚至不足 1 周期）
+      // 也要纳入，否则刚被窗口切到的气泡会整个消失。
+      if (bLo > 0 && ranges[bLo - 1]!.end + 1 > win.c0) bLo--;
       let bubblesDrawn = 0;
       for (let bi = bLo; bi < ranges.length && bubblesDrawn < MAX_ITEMS; bi++) {
         const range = ranges[bi]!;
-        if (range.start > win.c1) break;
+        if (range.start >= win.c1) break;
         if (trailing !== null && range.start === trailing.start && range.end === trailing.end) continue;
         bubblesDrawn++;
         bubble(range.start, range.end, false);
