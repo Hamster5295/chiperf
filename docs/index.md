@@ -6,7 +6,7 @@ hero:
   text: 微架构状态可视化格式
   actions:
     - theme: brand
-      text: 立即体验
+      text: 可视化
       link: https://hamster5295.github.io/chiperf/visualize
     - theme: alt
       text: 文档
