@@ -24,6 +24,8 @@
   --text-muted: #6b7280;
   --accent: #6f42c1;
   --accent-soft: #f2ecfc;
+  /* 实心按钮底色：比 --accent 深，白字才看得清 */
+  --accent-strong: #5b21b6;
   --ok: #0f9d58;
   --ok-soft: #e6f6ee;
   --warn: #d97706;
@@ -48,6 +50,8 @@
     --text-muted: #98a1af;
     --accent: #c8abfa;
     --accent-soft: #2d2a41;
+    /* 深色主题下 --accent 更浅，实心按钮改用这一档深紫，白字才看得清 */
+    --accent-strong: #7c3aed;
     --ok: #34d399;
     --ok-soft: #132b23;
     --warn: #fbbf24;
@@ -142,7 +146,7 @@ body.is-dragging::after {
   cursor: pointer;
 }
 .btn:hover { background: var(--surface-2); }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
 .btn-primary:hover { filter: brightness(1.05); }
 .btn-ghost { border-color: transparent; background: transparent; color: var(--text-muted); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
