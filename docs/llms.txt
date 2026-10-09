@@ -103,7 +103,7 @@ rst = "rst" ;                                       (* 无参数 *)
    事件跑到错误的时钟沿。
 2. **边沿模式二选一**：要么只插 `[clk] p`（推荐，周期编号完整），要么 `p`/`n` 都插；
    **不要**在同一份轨迹里混用。
-3. 每条记录写完立刻 `$fflush`（鲁棒性：仿真被杀也能保留已写内容）。
+3. **按周期（或每若干周期）批量 `$fflush`，不要每写一条就 flush 一次。** 每条记录都 flush 会产生大量系统调用、显著拖慢仿真；推荐每周期结束时 flush 一次，周期数很多时也可每 N 周期 flush 一次（N 取 8 / 16 / 64 这类值）。flush 是为了鲁棒性（仿真被杀也能保留已写内容），不是每条记录都必需的。
 4. 结束用 `final` / `$finish` 钩子写 `@end`。对于 `Chisel` 等隐藏了该功能的 DSL, 可以不写 `@end`
 5. 尽可能不影响已有功能模块实现，应当使用额外模块外挂在主模块下，通过 foo.bar.signal 等方式抓取信号，而非额外拉线
 
@@ -147,43 +147,46 @@ module chiperf_logger #(parameter string PATH = "trace.chiperf");
     $fclose(fd);
   endtask
 
-  // 每个 task 都自己换行 + flush，调用方不需要关心格式
-  task automatic log_clk_p();            $fwrite(fd, "[clk] p\n");                      $fflush(fd); endtask
-  task automatic log_clk_n();            $fwrite(fd, "[clk] n\n");                      $fflush(fd); endtask
-  task automatic log_msg(input string s);$fwrite(fd, "[msg] %s\n", s);                 $fflush(fd); endtask
+  // 每个 task 只负责写一行，不各自 flush；由调用方按周期批量 flush（见 §5）
+  task automatic log_clk_p();            $fwrite(fd, "[clk] p\n");                      endtask
+  task automatic log_clk_n();            $fwrite(fd, "[clk] n\n");                      endtask
+  task automatic log_msg(input string s);$fwrite(fd, "[msg] %s\n", s);                 endtask
   task automatic log_cnt(input string name);            // 默认 +1
-    $fwrite(fd, "[cnt] \"%s\"\n", name);                                                $fflush(fd);
+    $fwrite(fd, "[cnt] \"%s\"\n", name);
   endtask
   task automatic log_cnt_delta(input string name, input int delta);
-    $fwrite(fd, "[cnt] \"%s\", %0d\n", name, delta);                                    $fflush(fd);
+    $fwrite(fd, "[cnt] \"%s\", %0d\n", name, delta);
   endtask
   task automatic log_cnt_abs(input string name, input int value);
-    $fwrite(fd, "[cnt] \"%s\", abs=%0d\n", name, value);                                $fflush(fd);
+    $fwrite(fd, "[cnt] \"%s\", abs=%0d\n", name, value);
   endtask
   task automatic log_val_hex(input string name, input logic [63:0] value);
-    $fwrite(fd, "[val] \"%s\", 0x%0h\n", name, value);                                  $fflush(fd);
+    $fwrite(fd, "[val] \"%s\", 0x%0h\n", name, value);
   endtask
   task automatic log_val_str(input string name, input string value);
-    $fwrite(fd, "[val] \"%s\", \"%s\"\n", name, value);                                 $fflush(fd);
+    $fwrite(fd, "[val] \"%s\", \"%s\"\n", name, value);
   endtask
   task automatic log_pip_hex(input string track, input logic [63:0] value);
-    $fwrite(fd, "[pip] \"%s\", 0x%0h\n", track, value);                                 $fflush(fd);
+    $fwrite(fd, "[pip] \"%s\", 0x%0h\n", track, value);
   endtask
   task automatic log_pip_bubble(input string track);
-    $fwrite(fd, "[pip] \"%s\", bubble\n", track);                                       $fflush(fd);
+    $fwrite(fd, "[pip] \"%s\", bubble\n", track);
   endtask
   task automatic log_fsm(input string name, input string state);
-    $fwrite(fd, "[fsm] \"%s\", %s\n", name, state);                                     $fflush(fd);
+    $fwrite(fd, "[fsm] \"%s\", %s\n", name, state);
   endtask
   task automatic log_evt(input string name, input logic [63:0] payload);
-    $fwrite(fd, "[evt] \"%s\", 0x%0h\n", name, payload);                                $fflush(fd);
+    $fwrite(fd, "[evt] \"%s\", 0x%0h\n", name, payload);
   endtask
   task automatic log_evt_async(input string name, input logic [63:0] payload);
-    $fwrite(fd, "[evt] \"%s\", 0x%0h, async=1\n", name, payload);                       $fflush(fd);
+    $fwrite(fd, "[evt] \"%s\", 0x%0h, async=1\n", name, payload);
   endtask
   task automatic log_rst();               // 丢弃此前全部记录（去掉热身段）
-    $fwrite(fd, "[rst]\n");                                                             $fflush(fd);
+    $fwrite(fd, "[rst]\n");
   endtask
+
+  // 把已写内容刷到磁盘：每周期末调用一次；也可每 N 周期调用一次以进一步提速
+  task automatic flush(); $fflush(fd); endtask
 
 endmodule
 
@@ -223,6 +226,10 @@ always @(posedge clk) begin
     if_pc_q    <= if_pc;
     if_valid_q <= if_valid;
   end
+
+  logger.flush();                                      // 本周期记录写完 → 只 flush 这一次
+  // 周期数很多时也可改成每 N 周期 flush 一次，例如：
+  //   if (cycle_count % 16 == 0) logger.flush();
 end
 
 always @(negedge clk) if (trace_both_edges) logger.log_clk_n();
@@ -236,7 +243,8 @@ end
 ```
 
 C++ / DPI testbench 同理：用一个 `chiperfWriter` 类，方法对应上面的 task，
-每次 `fprintf` 后 `fflush`；gzip 输出用 `gzprintf` + `gzflush(Z_SYNC_FLUSH)`，
+写入用 `fprintf`、**按周期（或每 N 周期）统一 `fflush` 一次，不要每次 `fprintf` 后都 flush**；
+gzip 输出用 `gzprintf`，同样按周期调 `gzflush(Z_SYNC_FLUSH)`，
 或先写 `.chiperf` 再离线压缩成 `.chiperf.gz`。
 
 ## 6. 人类易读建议（评审会看）
@@ -267,13 +275,14 @@ C++ / DPI testbench 同理：用一个 `chiperfWriter` 类，方法对应上面�
 - `msg` 带属性：`[msg] a, note=b` 中 `note=b` 只是正文。
 - 同一名字可以出现在不同类型上（如 `[cnt] "x"` 与 `[val] "x", 1`）：它们是不同轨道，不会冲突，也不会被改名。
 - 把运行时对象拼进名字（`core.rob[17]`）⇒ 追踪对象数无界，应改用稳定名字 + 载荷。
-- 忘记 `@end`（⇒ `eof_without_end_marker`）或忘记 flush（崩溃时丢数据）。
+- 忘记 `@end`（⇒ `eof_without_end_marker`）或整份文件从不 flush（崩溃时丢数据）。
+- 反过来，**每写一条就 flush 一次**：合法但会因频繁系统调用显著拖慢仿真，应按周期 / 每 N 周期批量 flush。
 - 同一轨迹里只写 `p` 与 `p`/`n` 混用 ⇒ `redundant_edge` 等诊断。
 
 ## 8. 自检清单（交付前逐条确认）
 
 - [ ] 首行 `chiperf 1.0`，结尾 `@end`。
-- [ ] 每条记录一行、以 `\n` 结尾；每条写完 `flush`。
+- [ ] 每条记录一行、以 `\n` 结尾；按周期（或每 N 周期）batch flush 一次，而非逐条 flush。
 - [ ] 位置非递减：先 `[clk] p`，再写该周期事件。
 - [ ] 没有 `dom=`、`@domain`、单位数值、参数后置。
 - [ ] 名字稳定、层级化；同名不同类型是允许的（轨道按 `(类型, 名字)` 区分）。
