@@ -69,8 +69,14 @@ import { compositeOver, inkOn as inkOnBackdrop, parseCssColor, type Rgb } from '
 
 // ------------------------------------------------------------------ 常量
 
-/** 左侧标签列宽（px） */
-const GUTTER = 178;
+/** 左侧标签列宽（px）：可拖拽调整，这里是初值 / 上下限 */
+const GUTTER_DEFAULT = 178;
+const GUTTER_MIN = 96;
+const GUTTER_MAX = 460;
+/** 行头与波形之间的可拖拽分隔条宽度（px） */
+const DIVIDER = 5;
+/** 当前行头列宽（px）；拖拽分隔条时改它，跨视图切换仍保留（模块级） */
+let gutterWidth = GUTTER_DEFAULT;
 /** 顶部周期轴高度（px） */
 const AXIS_H = 30;
 /** 绘图区左右内边距（px） */
@@ -1056,7 +1062,7 @@ function build(host: HTMLElement, ctx: ViewContext): void {
 
   const gutter = el('div', {
     // padding 让每行的圆角色块与左右两条边线（画布外沿 / 分隔线）留白，不贴着线
-    style: `flex:0 0 ${GUTTER}px;min-width:0;overflow:hidden;background:var(--surface);border-right:1px solid var(--border);padding:0 8px;box-sizing:border-box`,
+    style: `flex:0 0 ${gutterWidth}px;min-width:0;overflow:hidden;background:var(--surface);padding:0 8px;box-sizing:border-box`,
   });
   gutter.append(axisGutterCell(plot));
 
@@ -1094,16 +1100,20 @@ function build(host: HTMLElement, ctx: ViewContext): void {
   overlay.append(reg.hoverCol, reg.hoverCell, reg.hoverBox, reg.selBox, reg.selLine, reg.selLabel, reg.hoverTag);
   svg.append(overlay);
 
+  // 行头与波形之间的分隔条：可左右拖拽调整行头列宽（见 installGutterResize）
+  const divider = el('div', { class: 'tl-divider', title: '拖动可调整行宽' });
+
   // 绘图区：宽度就是可视宽度，不再靠一个超宽画布 + 原生滚动条；平移靠滚轮（见 installWheelZoom）
   const surface = el('div', { class: 'chart-scroll', style: 'max-width:100%;overflow:hidden' });
   const plotWrap = el('div', { style: `position:relative;flex:0 0 auto;width:${plot.width}px;height:${plot.height}px` }, [svg]);
-  surface.append(el('div', { style: 'display:flex;align-items:flex-start' }, [gutter, plotWrap]));
+  surface.append(el('div', { style: 'display:flex;align-items:stretch' }, [gutter, divider, plotWrap]));
   cardNode.body.append(surface);
   host.append(buildBubbleFadeCard());
 
   installWheelZoom(surface);
   installDragZoom(svg);
   installMarkers(svg, reg, ctx);
+  installGutterResize(divider, surface);
   surfaceEl = surface;
   registry = reg;
   lastHostW = host.clientWidth;
@@ -3438,7 +3448,7 @@ function availablePlotWidth(): number {
   if (target === null) return 200;
   const style = getComputedStyle(target);
   const inner = target.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
-  return Math.max(200, inner - GUTTER - SIDE * 2);
+  return Math.max(200, inner - gutterWidth - DIVIDER - SIDE * 2);
 }
 
 /** 清空并重画（结构变化：换文件/选项/行顺序/宽度变化） */
@@ -3650,6 +3660,42 @@ function installDragZoom(svg: SVGSVGElement): void {
 
 /** 拖拽产生的 click 要被吞掉一次（否则松手会顺手选中周期） */
 let swallowDragClick = false;
+
+/**
+ * 行头 / 波形之间的分隔条：按住左右拖动改行头列宽。
+ *
+ * 拖拽期间只改 gutter 的 flex-basis 做视觉预览（波形被推出可视区、由 `surface` 裁掉），
+ * **松手才 `rebuild()`** —— 重建会重算比例尺、重画全部泳道，逐像素重建不现实。
+ */
+function installGutterResize(divider: HTMLElement, surface: HTMLElement): void {
+  divider.addEventListener('mousedown', (event) => {
+    const me = event as MouseEvent;
+    if (me.button !== 0) return;
+    me.preventDefault();
+    me.stopPropagation(); // 别让"拖拽缩放"接手
+    const startX = me.clientX;
+    const startWidth = gutterWidth;
+    const gutter = divider.previousElementSibling as HTMLElement | null;
+    if (gutter === null) return;
+    const maxWidth = Math.max(GUTTER_MIN, surface.clientWidth - DIVIDER - SIDE * 2 - 200);
+    let width = startWidth;
+    document.body.style.cursor = 'col-resize';
+    const onMove = (moveEvent: MouseEvent): void => {
+      width = clamp(startWidth + (moveEvent.clientX - startX), GUTTER_MIN, Math.min(GUTTER_MAX, maxWidth));
+      gutter.style.flexBasis = `${width}px`;
+    };
+    const onUp = (): void => {
+      document.removeEventListener('mousemove', onMove, true);
+      document.removeEventListener('mouseup', onUp, true);
+      document.body.style.cursor = '';
+      if (width === startWidth) return;
+      gutterWidth = width;
+      rebuild();
+    };
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('mouseup', onUp, true);
+  });
+}
 
 function fmtCycleRange(lo: number, hi: number): string {
   const round = (v: number) => Math.round(v);
