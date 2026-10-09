@@ -29,6 +29,7 @@ import {
 } from '../charts.ts';
 import { abortable, runChunked } from '../chunk.ts';
 import { cycleTime, fmtCompact, fmtInt, fmtPosition, fmtValue, type Selection, type View, type ViewContext } from '../view.ts';
+import { VALUE_FORMATS, formatScalarBy, type ValueFormat } from '../rv.ts';
 import { clampWindow, installChartViewport, type CycleWindow } from './viewport.ts';
 
 /** 保持型信号的一个采样点 */
@@ -77,6 +78,31 @@ function modeOf(key: string): ValueMode {
   return valueModeByTrack.get(key) ?? 'wave';
 }
 
+/**
+ * 每张数值卡片的显示格式（dec/hex/oct/bin/rv32/rv64），与时间轴数值行**同一套**格式
+ * （`rv.ts` 的 `VALUE_FORMATS`）。按轨道记忆，默认 hex —— RTL 里绝大多数数值是位向量，
+ * 与时间轴默认一致。`rv32`/`rv64` 只在位宽够时提供。
+ */
+const valueFormatByTrack = new Map<string, ValueFormat>();
+
+function formatOf(key: string): ValueFormat {
+  return valueFormatByTrack.get(key) ?? 'hex';
+}
+
+/** 位宽估计：声明宽度 / 实际位数，取最大值（与时间轴数值行同一口径） */
+function widthOf(values: ScalarValue[]): number {
+  return values.reduce((max, value) => {
+    const declared = value.width ?? 0;
+    const needed = value.big === undefined ? 0 : Math.max(1, value.big < 0n ? (-value.big).toString(2).length + 1 : value.big.toString(2).length);
+    return Math.max(max, declared, needed);
+  }, 0);
+}
+
+/** 全是字符串/符号时没有进制可言，不给格式选择（与时间轴数值行同一口径） */
+function formattable(values: ScalarValue[]): boolean {
+  return values.length > 0 && !values.every((value) => value.kind === 'str' || value.kind === 'sym');
+}
+
 // ------------------------------------------------------------------ 取值
 
 /** 采样值的数值表示：`int`/`real`/`bits`（无 x/z）可坐标化，含 x/z 或字符串则不可 */
@@ -103,9 +129,9 @@ function lineOf(trace: Trace, seq: number): number {
   return lineIndex.lines.get(seq) ?? 0;
 }
 
-/** 值 → 图上用的短文本 */
-function shortText(value: ScalarValue): string {
-  const text = fmtValue(value);
+/** 值 → 图上用的短文本（按当前显示格式格式化后再截断） */
+function shortText(value: ScalarValue, format: ValueFormat): string {
+  const text = formatScalarBy(value, format);
   return text.length > 22 ? `${text.slice(0, 21)}…` : text;
 }
 
@@ -233,6 +259,26 @@ function hexTick(value: number): string {
   return `${sign}0x${Math.abs(rounded).toString(16)}`;
 }
 
+/** 纵坐标刻度按当前显示格式写；rv32/rv64 对着刻度译码没有意义，退回 hex */
+function tickFormat(format: ValueFormat): (value: number) => string {
+  const base = (value: number, radix: number, prefix: string): string => {
+    if (!Number.isFinite(value)) return fmtCompact(value);
+    const rounded = Math.round(value);
+    const sign = rounded < 0 ? '-' : '';
+    return `${sign}${prefix}${Math.abs(rounded).toString(radix)}`;
+  };
+  switch (format) {
+    case 'dec':
+      return (value) => (Number.isFinite(value) ? String(Math.round(value)) : fmtCompact(value));
+    case 'oct':
+      return (value) => base(value, 8, '0o');
+    case 'bin':
+      return (value) => base(value, 2, '0b');
+    default:
+      return hexTick;
+  }
+}
+
 /** 卡片列宽：先放同样数量的占位卡片让 auto-fit 定下真实列数，再量列宽（图表至少占满一列） */
 function columnWidth(grid: HTMLElement, count: number): number {
   const probes = Array.from({ length: Math.max(1, count) }, () => el('div', { class: 'card', style: 'visibility:hidden;height:0;border:0' }));
@@ -291,11 +337,11 @@ function decimateItems(items: Item[], max: number): Item[] {
   return out;
 }
 
-/** 采样点的统一提示文本（未知点、变化点、事件条共用同一口径） */
-function sampleLines(track: ValueTrack, item: Item, prev: Timed<ScalarValue> | null, ctx: ViewContext, note?: string): string {
+/** 采样点的统一提示文本（未知点、变化点、事件条共用同一口径）；值按当前显示格式写 */
+function sampleLines(track: ValueTrack, item: Item, prev: Timed<ScalarValue> | null, ctx: ViewContext, format: ValueFormat, note?: string): string {
   const lines = [cycleTime(item.cycle)];
-  if (prev) lines.push(`${fmtValue(prev.value)} → ${fmtValue(item.sample.value)}`);
-  else lines.push(`值 ${fmtValue(item.sample.value)}（${kindLabel(item.sample.value)}）`);
+  if (prev) lines.push(`${formatScalarBy(prev.value, format)} → ${formatScalarBy(item.sample.value, format)}`);
+  else lines.push(`值 ${formatScalarBy(item.sample.value, format)}（${kindLabel(item.sample.value)}）`);
   if (item.sample.value.hasXZ) lines.push(`含未知位 x/z，不是数字：原始字面量 ${item.sample.value.raw}`);
   if (item.changed) lines.push('取值发生变化（与上一次采样不同）');
   if (note) lines.push(note);
@@ -323,6 +369,21 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
   const unknown = items.filter((item) => item.num === null && item.sample.value.hasXZ);
 
   const isNumeric = numeric.length > 0;
+  const values = sorted.map((sample) => sample.value);
+  const canFormat = formattable(values);
+  const formatWidth = widthOf(values);
+
+  // 格式选择：与时间轴数值行同一套（dec/hex/oct/bin + 位宽够时的 rv32/rv64）
+  const formatSelect = el('select', { style: SELECT_STYLE, title: '显示格式' });
+  if (canFormat) {
+    for (const item of VALUE_FORMATS) {
+      if (item.id === 'rv32' && formatWidth > 32) continue;
+      if (item.id === 'rv64' && formatWidth > 64) continue;
+      formatSelect.append(el('option', { value: item.id, text: item.label }));
+    }
+    formatSelect.value = formatOf(track.key);
+  }
+
   const modeSelect = el('select', { style: SELECT_STYLE, title: '切换这张图的展示方式' });
   const modeOptions: [ValueMode, string][] = [
     ['wave', isNumeric ? '折线图' : '时间事件条'],
@@ -338,7 +399,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
   const node = card(
     track.name,
     `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化 · ${kinds.join(' / ')}`,
-    [modeSelect, detail],
+    canFormat ? [formatSelect, modeSelect, detail] : [modeSelect, detail],
   );
 
   if (sorted.length === 0) {
@@ -373,7 +434,7 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
       prevOf.set(sample, previous);
       previous = sample;
     }
-    // 位向量（整数）轨的纵坐标按 hex 写：RTL 里数值基本是位向量，十进制不便对照
+    // 位向量（整数）轨的纵坐标跟着显示格式走（dec/oct/bin/hex）；非整数轨用默认紧凑刻度
     hexAxis = numeric.every((item) => Number.isInteger(item.num));
   }
 
@@ -385,16 +446,18 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
 
   // 波形 / 事件条：窗口式缩放平移，画布宽度 = 列宽
   const drawWave = (surface: HTMLElement): void => {
+    const format = formatOf(track.key);
     clear(surface);
     surface.append(
       isNumeric
-        ? buildWaveSvg(track, items, full, windowFor(windowKey, full), prevOf, ctx, available, color, min, max, robustMin, robustMax, hexAxis)
-        : buildEventBarSvg(track, items, full, windowFor(windowKey, full), ctx, available, color),
+        ? buildWaveSvg(track, items, full, windowFor(windowKey, full), prevOf, ctx, available, color, min, max, robustMin, robustMax, hexAxis, format)
+        : buildEventBarSvg(track, items, full, windowFor(windowKey, full), ctx, available, color, format),
     );
   };
 
   const mount = (): void => {
     const mode = modeOf(track.key);
+    const format = formatOf(track.key);
     clear(chartBox);
     clear(footBox);
     if (mode === 'wave') {
@@ -419,13 +482,17 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
           ]),
         );
       } else {
-        footBox.append(historyTable(track, items, ctx));
+        footBox.append(historyTable(track, items, ctx, format));
       }
       return;
     }
-    chartBox.append(mode === 'bars' ? buildValueBars(items, available) : buildValuePie(items, available));
+    chartBox.append(mode === 'bars' ? buildValueBars(items, available, format) : buildValuePie(items, available, format));
   };
 
+  formatSelect.addEventListener('change', () => {
+    valueFormatByTrack.set(track.key, formatSelect.value as ValueFormat);
+    mount();
+  });
   modeSelect.addEventListener('change', () => {
     valueModeByTrack.set(track.key, modeSelect.value as ValueMode);
     mount();
@@ -452,6 +519,7 @@ function buildWaveSvg(
   robustMin: number,
   robustMax: number,
   hexAxis: boolean,
+  format: ValueFormat,
 ): SVGSVGElement {
   const height = 168;
   const pad = { left: 58, right: 18, top: 14, bottom: 20 };
@@ -466,7 +534,7 @@ function buildWaveSvg(
   const useRobust = pxPerCycle < LOD_LINE_PX && robustMin < robustMax;
   const axisMin = useRobust ? robustMin : min;
   const axisMax = useRobust ? robustMax : max;
-  numericAxis(svg, { ...plot, min: axisMin, max: axisMax, label: '值', ...(hexAxis ? { format: hexTick } : {}) });
+  numericAxis(svg, { ...plot, min: axisMin, max: axisMax, label: '值', ...(hexAxis ? { format: tickFormat(format) } : {}) });
   const sy = linearScale(axisMin, axisMax, plot.y + plot.height, plot.y);
   const ys = (value: number): number => clamp(sy(value), plot.y, plot.y + plot.height);
   const at = (item: Item): number => clamp(x.px(item.cycle) + (item.async ? 0.5 * x.unit(item.cycle) : 0), plot.x - 24, plot.x + plot.width + 24);
@@ -560,7 +628,7 @@ function buildWaveSvg(
       const y = g.prev ? ys(g.prev.num!) : plot.y + plot.height / 2;
       const marker = unknownMarker(at(item), y);
       const note = g.next ? `未知保持到周期 ${g.next.cycle}` : '未知保持到轨迹末尾';
-      bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, g.prev?.sample ?? null, ctx, note));
+      bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, g.prev?.sample ?? null, ctx, format, note));
       clickable(marker, () => {
         ctx.selection.set({ kind: 'value', key: track.key });
         inspectSample(track, item, g.prev?.sample ?? null, ctx);
@@ -587,7 +655,7 @@ function buildWaveSvg(
           'stroke-dasharray': '2 1.6',
         })
       : svgEl('circle', { cx: at(item), cy: ys(item.num), r: 3, fill: 'var(--warn)', stroke: 'var(--surface)', 'stroke-width': 1 });
-    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx));
+    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx, format));
     clickable(marker, () => {
       ctx.selection.set({ kind: 'value', key: track.key });
       inspectSample(track, item, from, ctx);
@@ -629,6 +697,7 @@ function buildEventBarSvg(
   ctx: ViewContext,
   available: number,
   color: string,
+  format: ValueFormat,
 ): SVGSVGElement {
   const height = 92;
   const pad = { left: 18, right: 18, top: 10, bottom: 22 };
@@ -710,7 +779,7 @@ function buildEventBarSvg(
             stroke: 'var(--surface)',
             'stroke-width': 1,
           });
-    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx));
+    bindHover(marker, ctx, { kind: 'value', key: track.key }, () => sampleLines(track, item, from, ctx, format));
     clickable(marker, () => {
       ctx.selection.set({ kind: 'value', key: track.key });
       inspectSample(track, item, from, ctx);
@@ -724,7 +793,7 @@ function buildEventBarSvg(
           'text-anchor': 'middle',
           class: 'axis-label',
           style: item.sample.value.hasXZ ? 'fill:var(--warn)' : '',
-          text: shortText(item.sample.value),
+          text: shortText(item.sample.value, format),
         }),
       );
     }
@@ -737,8 +806,10 @@ function buildEventBarSvg(
 
 /** 一个取值在采样里的出现次数 */
 interface ValueBin {
-  key: string;
+  /** 轴上用的截断标签 */
   label: string;
+  /** 完整格式化文本（悬停提示用） */
+  full: string;
   color: string;
   count: number;
 }
@@ -751,15 +822,15 @@ function clipLabel(text: string, widthPx: number): string {
 
 /**
  * 取值频率：按 `valueKey` 归并（位宽/进制不同但数值相同算一种），
- * 按出现次数降序取前 `limit` 种，其余合并成 `others`。
+ * 按出现次数降序取前 `limit` 种，其余合并成 `others`。标签按当前显示格式写。
  */
-function valueBins(items: Item[], limit: number): { bins: ValueBin[]; others: number; distinct: number } {
+function valueBins(items: Item[], limit: number, format: ValueFormat): { bins: ValueBin[]; others: number; distinct: number } {
   const map = new Map<string, ValueBin>();
   for (const item of items) {
     const key = valueKey(item.sample.value);
     const found = map.get(key);
     if (found === undefined) {
-      map.set(key, { key, label: shortText(item.sample.value), color: colorFor(`value:${key}`), count: 1 });
+      map.set(key, { label: shortText(item.sample.value, format), full: formatScalarBy(item.sample.value, format), color: colorFor(`value:${key}`), count: 1 });
     } else {
       found.count += 1;
     }
@@ -774,9 +845,9 @@ function valueBins(items: Item[], limit: number): { bins: ValueBin[]; others: nu
 const OTHERS_COLOR = '#94a3b8';
 
 /** 取值频率柱状图（横向）：柱长 = 出现次数 / 最高次数 */
-function buildValueBars(items: Item[], available: number): SVGSVGElement {
+function buildValueBars(items: Item[], available: number, format: ValueFormat): SVGSVGElement {
   const limit = 16;
-  const { bins, others, distinct } = valueBins(items, limit);
+  const { bins, others, distinct } = valueBins(items, limit, format);
   const total = items.length;
   const rowH = 24;
   const left = 132;
@@ -808,7 +879,7 @@ function buildValueBars(items: Item[], available: number): SVGSVGElement {
     );
   };
   bins.forEach((bin, index) =>
-    drawRow(bin.label, bin.count, bin.color, `${bin.key}\n出现 ${fmtInt(bin.count)} 次\n占采样 ${((bin.count / total) * 100).toFixed(1)}%`, index),
+    drawRow(bin.label, bin.count, bin.color, `${bin.full}\n出现 ${fmtInt(bin.count)} 次\n占采样 ${((bin.count / total) * 100).toFixed(1)}%`, index),
   );
   if (others > 0) {
     drawRow('其他', others, OTHERS_COLOR, `其余 ${distinct - bins.length} 种取值\n合计 ${fmtInt(others)} 次\n占采样 ${((others / total) * 100).toFixed(1)}%`, bins.length);
@@ -817,11 +888,11 @@ function buildValueBars(items: Item[], available: number): SVGSVGElement {
 }
 
 /** 取值比例饼图（甜甜圈 + 图例）：占比 = 出现次数 / 总采样数 */
-function buildValuePie(items: Item[], available: number): HTMLElement {
+function buildValuePie(items: Item[], available: number, format: ValueFormat): HTMLElement {
   const limit = 10;
-  const { bins, others, distinct } = valueBins(items, limit);
+  const { bins, others, distinct } = valueBins(items, limit, format);
   const total = items.length;
-  const slices = bins.map((bin) => ({ label: bin.label, color: bin.color, count: bin.count, tip: bin.key }));
+  const slices = bins.map((bin) => ({ label: bin.label, color: bin.color, count: bin.count, tip: bin.full }));
   if (others > 0) slices.push({ label: '其他', color: OTHERS_COLOR, count: others, tip: `其余 ${distinct - bins.length} 种取值` });
 
   const size = clamp(Math.min(200, available - 150), 130, 200);
@@ -874,9 +945,9 @@ function buildValuePie(items: Item[], available: number): HTMLElement {
   ]);
 }
 
-function historyTable(track: ValueTrack, items: Item[], ctx: ViewContext): HTMLElement {
+function historyTable(track: ValueTrack, items: Item[], ctx: ViewContext, format: ValueFormat): HTMLElement {
   const rows = items.slice(-HISTORY_ROWS).map((item) => {
-    const label = el('span', { class: 'mono', text: fmtValue(item.sample.value) });
+    const label = el('span', { class: 'mono', text: formatScalarBy(item.sample.value, format) });
     if (item.sample.value.hasXZ) label.style.color = 'var(--warn)';
     const cycle = el('button', { class: 'btn btn-ghost mono', text: String(item.cycle), style: 'padding:0;font-size:12px' });
     cycle.addEventListener('click', () => {
@@ -1012,6 +1083,7 @@ function render(ctx: ViewContext): void {
     windowTrace = ctx.trace;
     windowByChart.clear();
     valueModeByTrack.clear();
+    valueFormatByTrack.clear();
   }
   const all = [...ctx.trace.values.values()];
   const shown = all.sort((a, b) => a.name.localeCompare(b.name));
