@@ -8,7 +8,7 @@
  *  - 字符串/符号（`str`/`sym`）不做强行坐标化：改成事件条 + 历史列表
  */
 import type { ScalarValue, Timed, Trace, ValueTrack } from '../../../parser/src/index.ts';
-import { comparePosition } from '../../../parser/src/index.ts';
+import { comparePosition, valueKey } from '../../../parser/src/index.ts';
 import {
   card,
   clear,
@@ -59,6 +59,23 @@ const MAX_STEPS = 3000;
  */
 const MAX_MARKERS = 400;
 const HISTORY_ROWS = 200;
+
+/** 下拉框（展示方式 / 区间差）共用样式 */
+const SELECT_STYLE = 'padding:4px 6px;border:1px solid var(--border-strong);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;font-size:12px';
+
+/**
+ * 一张数值卡片的展示方式：
+ *  - `wave`：数值轨画保持型阶梯/折线，字符串轨画时间事件条
+ *  - `bars`：取值频率柱状图
+ *  - `pie`：取值比例饼图
+ * 选择按轨道键记忆（换文件时清空），切回来仍是上次选的那种。
+ */
+type ValueMode = 'wave' | 'bars' | 'pie';
+const valueModeByTrack = new Map<string, ValueMode>();
+
+function modeOf(key: string): ValueMode {
+  return valueModeByTrack.get(key) ?? 'wave';
+}
 
 // ------------------------------------------------------------------ 取值
 
@@ -305,16 +322,23 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
   const numeric = items.filter((item) => item.num !== null);
   const unknown = items.filter((item) => item.num === null && item.sample.value.hasXZ);
 
+  const isNumeric = numeric.length > 0;
+  const modeSelect = el('select', { style: SELECT_STYLE, title: '切换这张图的展示方式' });
+  const modeOptions: [ValueMode, string][] = [
+    ['wave', isNumeric ? '折线图' : '时间事件条'],
+    ['bars', '频率柱状图'],
+    ['pie', '比例饼图'],
+  ];
+  for (const [value, label] of modeOptions) modeSelect.append(el('option', { value, text: label }));
+  modeSelect.value = modeOf(track.key);
+
+  const detail = el('button', { class: 'btn btn-ghost', text: '详情' });
+  detail.addEventListener('click', () => inspectTrack(track, ctx));
+
   const node = card(
     track.name,
     `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化 · ${kinds.join(' / ')}`,
-    [
-      (() => {
-        const btn = el('button', { class: 'btn btn-ghost', text: '详情' });
-        btn.addEventListener('click', () => inspectTrack(track, ctx));
-        return btn;
-      })(),
-    ],
+    [modeSelect, detail],
   );
 
   if (sorted.length === 0) {
@@ -322,74 +346,91 @@ function waveformCard(track: ValueTrack, ctx: ViewContext, available: number): H
     return node.root;
   }
 
-  if (numeric.length === 0) {
-    // 字符串/符号轨：事件条 + 历史列表（窗口式：低缩放退化成密度带）
-    const full = fullWindow(items[0]!.cycle, items[items.length - 1]!.cycle);
-    const key = `bar:${track.key}`;
-    const holder = el('div', { class: 'chart-frame', 'data-key': key });
-    const draw = (): void => {
-      clear(holder);
-      holder.append(buildEventBarSvg(track, items, full, windowFor(key, full), ctx, available, color));
-    };
-    draw();
-    installChartViewport(holder, {
-      full: () => full,
-      get: () => windowFor(key, full),
-      set: (w) => windowByChart.set(key, clampWindow(w, full)),
-      redraw: draw,
-    });
-    node.body.append(holder);
-    node.body.append(historyTable(track, items, ctx));
-    return node.root;
+  // 数值轨的纵轴与"前一条采样"只算一次，缩放 / 切展示方式时复用
+  let min = 0;
+  let max = 0;
+  let robustMin = 0;
+  let robustMax = 0;
+  let hexAxis = false;
+  const prevOf = new Map<Timed<ScalarValue>, Timed<ScalarValue> | null>();
+  if (isNumeric) {
+    min = Infinity;
+    max = -Infinity;
+    for (const item of numeric) {
+      min = Math.min(min, item.num!);
+      max = Math.max(max, item.num!);
+    }
+    if (min === max) {
+      const slack = Math.max(1, Math.abs(max) * 0.05);
+      min -= slack;
+      max += slack;
+    }
+    // 低缩放折线用的稳健上下界（中间 90% 分位）；高缩放仍用全量 min/max
+    [robustMin, robustMax] = robustBounds(numeric.map((item) => item.num!), min, max);
+    // 前一条采样（变化点提示用）：整卡只建一次，缩放重画时不重复扫
+    let previous: Timed<ScalarValue> | null = null;
+    for (const sample of sorted) {
+      prevOf.set(sample, previous);
+      previous = sample;
+    }
+    // 位向量（整数）轨的纵坐标按 hex 写：RTL 里数值基本是位向量，十进制不便对照
+    hexAxis = numeric.every((item) => Number.isInteger(item.num));
   }
 
-  let min = Infinity;
-  let max = -Infinity;
-  for (const item of numeric) {
-    min = Math.min(min, item.num!);
-    max = Math.max(max, item.num!);
-  }
-  if (min === max) {
-    const slack = Math.max(1, Math.abs(max) * 0.05);
-    min -= slack;
-    max += slack;
-  }
-  // 低缩放折线用的稳健上下界（中间 90% 分位）；高缩放仍用全量 min/max
-  const [robustMin, robustMax] = robustBounds(numeric.map((item) => item.num!), min, max);
-  // 前一条采样（变化点提示用）：整卡只建一次，缩放重画时不重复扫
-  const prevOf = new Map<Timed<ScalarValue>, Timed<ScalarValue> | null>();
-  let previous: Timed<ScalarValue> | null = null;
-  for (const sample of sorted) {
-    prevOf.set(sample, previous);
-    previous = sample;
-  }
-  // 位向量（整数）轨的纵坐标按 hex 写：RTL 里数值基本是位向量，十进制不便对照
-  const hexAxis = numeric.every((item) => Number.isInteger(item.num));
   const full = fullWindow(items[0]!.cycle, items[items.length - 1]!.cycle);
-  const key = `wave:${track.key}`;
-  const holder = el('div', { class: 'chart-frame', 'data-key': key });
-  const draw = (): void => {
-    clear(holder);
-    holder.append(buildWaveSvg(track, items, full, windowFor(key, full), prevOf, ctx, available, color, min, max, robustMin, robustMax, hexAxis));
+  const windowKey = `${isNumeric ? 'wave' : 'bar'}:${track.key}`;
+  const chartBox = el('div', {});
+  const footBox = el('div', {});
+  node.body.append(chartBox, footBox);
+
+  // 波形 / 事件条：窗口式缩放平移，画布宽度 = 列宽
+  const drawWave = (surface: HTMLElement): void => {
+    clear(surface);
+    surface.append(
+      isNumeric
+        ? buildWaveSvg(track, items, full, windowFor(windowKey, full), prevOf, ctx, available, color, min, max, robustMin, robustMax, hexAxis)
+        : buildEventBarSvg(track, items, full, windowFor(windowKey, full), ctx, available, color),
+    );
   };
-  draw();
-  installChartViewport(holder, {
-    full: () => full,
-    get: () => windowFor(key, full),
-    set: (w) => windowByChart.set(key, clampWindow(w, full)),
-    redraw: draw,
+
+  const mount = (): void => {
+    const mode = modeOf(track.key);
+    clear(chartBox);
+    clear(footBox);
+    if (mode === 'wave') {
+      const surface = el('div', { class: 'chart-frame', 'data-key': windowKey });
+      drawWave(surface);
+      installChartViewport(surface, {
+        full: () => full,
+        get: () => windowFor(windowKey, full),
+        set: (w) => windowByChart.set(windowKey, clampWindow(w, full)),
+        redraw: () => drawWave(surface),
+      });
+      chartBox.append(surface);
+      if (isNumeric) {
+        footBox.append(
+          el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
+            el('span', { text: `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化` }),
+            el('span', { text: '实线阶梯 = 保持型取值；缩得很小时退化为折线（纵轴取中间 90% 分位，极端值贴边）' }),
+            unknown.length > 0 ? el('span', { text: `◇ 空心斜纹标记 + 斜纹底 = 含未知位 x/z（${fmtInt(unknown.length)} 次）` }) : null,
+            el('span', { text: '● 橙点 = 取值发生变化' }),
+            items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.5）' }) : null,
+            el('span', { text: '横向滚轮平移 · Ctrl/⌘ + 滚轮缩放' }),
+          ]),
+        );
+      } else {
+        footBox.append(historyTable(track, items, ctx));
+      }
+      return;
+    }
+    chartBox.append(mode === 'bars' ? buildValueBars(items, available) : buildValuePie(items, available));
+  };
+
+  modeSelect.addEventListener('change', () => {
+    valueModeByTrack.set(track.key, modeSelect.value as ValueMode);
+    mount();
   });
-  node.body.append(holder);
-  node.body.append(
-    el('div', { class: 'row muted', style: 'font-size:11px;gap:12px' }, [
-      el('span', { text: `${fmtInt(sorted.length)} 条采样 · ${fmtInt(track.changes.length)} 次变化` }),
-      el('span', { text: '实线阶梯 = 保持型取值；缩得很小时退化为折线（纵轴取中间 90% 分位，极端值贴边）' }),
-      unknown.length > 0 ? el('span', { text: `◇ 空心斜纹标记 + 斜纹底 = 含未知位 x/z（${fmtInt(unknown.length)} 次）` }) : null,
-      el('span', { text: '● 橙点 = 取值发生变化' }),
-      items.some((item) => item.async) ? el('span', { text: '虚线空心点 = 异步采样（画在周期区间内部，spec §6.5）' }) : null,
-      el('span', { text: '横向滚轮平移 · Ctrl/⌘ + 滚轮缩放' }),
-    ]),
-  );
+  mount();
   return node.root;
 }
 
@@ -692,6 +733,147 @@ function buildEventBarSvg(
   return svg;
 }
 
+// ------------------------------------------------------------------ 取值频率 / 比例
+
+/** 一个取值在采样里的出现次数 */
+interface ValueBin {
+  key: string;
+  label: string;
+  color: string;
+  count: number;
+}
+
+/** 标签按像素宽度截断（SVG 里没有 CSS ellipsis） */
+function clipLabel(text: string, widthPx: number): string {
+  const max = Math.max(3, Math.floor(widthPx / 6.6));
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1))}…`;
+}
+
+/**
+ * 取值频率：按 `valueKey` 归并（位宽/进制不同但数值相同算一种），
+ * 按出现次数降序取前 `limit` 种，其余合并成 `others`。
+ */
+function valueBins(items: Item[], limit: number): { bins: ValueBin[]; others: number; distinct: number } {
+  const map = new Map<string, ValueBin>();
+  for (const item of items) {
+    const key = valueKey(item.sample.value);
+    const found = map.get(key);
+    if (found === undefined) {
+      map.set(key, { key, label: shortText(item.sample.value), color: colorFor(`value:${key}`), count: 1 });
+    } else {
+      found.count += 1;
+    }
+  }
+  const all = [...map.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const bins = all.slice(0, limit);
+  const others = all.slice(limit).reduce((sum, bin) => sum + bin.count, 0);
+  return { bins, others, distinct: all.length };
+}
+
+/** "其他"合并色；不随取值变化，也不用可能不被 SVG 属性支持的 CSS 变量 */
+const OTHERS_COLOR = '#94a3b8';
+
+/** 取值频率柱状图（横向）：柱长 = 出现次数 / 最高次数 */
+function buildValueBars(items: Item[], available: number): SVGSVGElement {
+  const limit = 16;
+  const { bins, others, distinct } = valueBins(items, limit);
+  const total = items.length;
+  const rowH = 24;
+  const left = 132;
+  const right = 90;
+  const top = 30;
+  const rows = bins.length + (others > 0 ? 1 : 0);
+  const height = Math.max(132, top + 14 + rows * rowH);
+  const width = Math.max(240, available);
+  const svg = svgRoot(width, height);
+  const plotW = Math.max(20, width - left - right);
+  const peak = Math.max(1, ...bins.map((bin) => bin.count), others);
+  svg.append(
+    svgEl('text', {
+      x: left,
+      y: 18,
+      class: 'axis-label',
+      text: `取值频率：${fmtInt(total)} 条采样 · ${fmtInt(distinct)} 种取值${distinct > bins.length ? `（只列前 ${bins.length} 种，其余归入"其他"）` : ''}`,
+    }),
+  );
+  const drawRow = (label: string, count: number, fill: string, tip: string, index: number): void => {
+    const y = top + index * rowH;
+    const barW = Math.max(1, (count / peak) * plotW);
+    const bar = svgEl('rect', { x: left, y: y + 3, width: barW, height: rowH - 9, rx: 2, fill });
+    hoverTarget(bar, () => tip);
+    svg.append(
+      svgEl('text', { x: left - 8, y: y + rowH / 2 + 3.5, 'text-anchor': 'end', class: 'axis-label', text: clipLabel(label, left - 16) }),
+      bar,
+      svgEl('text', { x: left + barW + 6, y: y + rowH / 2 + 3.5, class: 'axis-label', text: `${fmtInt(count)} · ${((count / total) * 100).toFixed(1)}%` }),
+    );
+  };
+  bins.forEach((bin, index) =>
+    drawRow(bin.label, bin.count, bin.color, `${bin.key}\n出现 ${fmtInt(bin.count)} 次\n占采样 ${((bin.count / total) * 100).toFixed(1)}%`, index),
+  );
+  if (others > 0) {
+    drawRow('其他', others, OTHERS_COLOR, `其余 ${distinct - bins.length} 种取值\n合计 ${fmtInt(others)} 次\n占采样 ${((others / total) * 100).toFixed(1)}%`, bins.length);
+  }
+  return svg;
+}
+
+/** 取值比例饼图（甜甜圈 + 图例）：占比 = 出现次数 / 总采样数 */
+function buildValuePie(items: Item[], available: number): HTMLElement {
+  const limit = 10;
+  const { bins, others, distinct } = valueBins(items, limit);
+  const total = items.length;
+  const slices = bins.map((bin) => ({ label: bin.label, color: bin.color, count: bin.count, tip: bin.key }));
+  if (others > 0) slices.push({ label: '其他', color: OTHERS_COLOR, count: others, tip: `其余 ${distinct - bins.length} 种取值` });
+
+  const size = clamp(Math.min(200, available - 150), 130, 200);
+  const thickness = Math.max(16, size * 0.22);
+  const radius = size / 2 - thickness / 2 - 1;
+  const circumference = 2 * Math.PI * radius;
+  const center = size / 2;
+  const svg = svgRoot(size, size);
+  svg.append(svgEl('circle', { cx: center, cy: center, r: radius, fill: 'none', stroke: 'var(--surface-2)', 'stroke-width': thickness }));
+  let offset = 0;
+  for (const slice of slices) {
+    if (slice.count <= 0) continue;
+    const length = (slice.count / total) * circumference;
+    const arc = svgEl('circle', {
+      cx: center,
+      cy: center,
+      r: radius,
+      fill: 'none',
+      stroke: slice.color,
+      'stroke-width': thickness,
+      'stroke-dasharray': `${length.toFixed(2)} ${(circumference - length).toFixed(2)}`,
+      'stroke-dashoffset': (-offset).toFixed(2),
+      transform: `rotate(-90 ${center} ${center})`,
+    });
+    hoverTarget(arc, () => `${slice.tip}\n出现 ${fmtInt(slice.count)} 次\n占比 ${((slice.count / total) * 100).toFixed(1)}%`);
+    svg.append(arc);
+    offset += length;
+  }
+  svg.append(
+    svgEl('text', { x: center, y: center + 2, 'text-anchor': 'middle', style: 'font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;fill:var(--text)', text: fmtInt(total) }),
+    svgEl('text', { x: center, y: center + 17, 'text-anchor': 'middle', class: 'axis-label', text: '采样' }),
+  );
+
+  const legend = el('div', { style: 'display:flex;flex-direction:column;gap:4px;min-width:0;font-size:11.5px' });
+  for (const slice of slices) {
+    legend.append(
+      el('div', { style: 'display:flex;align-items:center;gap:6px;min-width:0' }, [
+        el('i', { style: `flex:0 0 auto;width:9px;height:9px;border-radius:2px;background:${slice.color}` }),
+        el('span', { class: 'mono', style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px', text: slice.label }),
+        el('b', { style: 'margin-left:auto;font-variant-numeric:tabular-nums', text: `${((slice.count / total) * 100).toFixed(1)}%` }),
+      ]),
+    );
+  }
+  return el('div', { style: 'display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:6px 0' }, [
+    svg,
+    el('div', { style: 'min-width:0' }, [
+      el('div', { class: 'muted', style: 'font-size:11px;margin-bottom:6px', text: `${fmtInt(total)} 条采样 · ${fmtInt(distinct)} 种取值${distinct > bins.length ? `（只列前 ${bins.length} 种）` : ''}` }),
+      legend,
+    ]),
+  ]);
+}
+
 function historyTable(track: ValueTrack, items: Item[], ctx: ViewContext): HTMLElement {
   const rows = items.slice(-HISTORY_ROWS).map((item) => {
     const label = el('span', { class: 'mono', text: fmtValue(item.sample.value) });
@@ -829,6 +1011,7 @@ function render(ctx: ViewContext): void {
   if (windowTrace !== ctx.trace) {
     windowTrace = ctx.trace;
     windowByChart.clear();
+    valueModeByTrack.clear();
   }
   const all = [...ctx.trace.values.values()];
   const shown = all.sort((a, b) => a.name.localeCompare(b.name));
